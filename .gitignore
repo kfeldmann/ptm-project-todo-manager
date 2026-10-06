@@ -1,0 +1,22 @@
+# Rust build artifacts
+/target/
+
+# Cargo lock is kept for binaries, but ignored for libraries
+# (this is a binary crate, so Cargo.lock is intentionally tracked)
+
+# Test/development data
+.data/
+
+# __pycache__/ from Python test scripts
+__pycache__/
+
+# Editor and IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS-generated files
+.DS_Store
+Thumbs.db

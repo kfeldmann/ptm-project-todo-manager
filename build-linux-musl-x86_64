@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Builds a ptm workspace binary for linux/amd64 (musl, shared) inside a Docker container.
+# Usage: ./build-linux-musl-x86_64 [ptm|ptm-sync]   (default: ptm)
+# Uses Alpine Linux as the build platform — Alpine's native gcc already targets
+# musl, so no cross-compilation wrappers are needed.
+# RUSTFLAGS=-C target-feature=-crt-static disables the default +crt-static feature
+# of the x86_64-unknown-linux-musl target so musl libc is linked as a shared
+# library (ld-musl-x86_64.so.1) rather than statically bundled.
+# The container runs as the host user's UID:GID so output files are
+# owned by the caller. The Cargo registry is cached in a named Docker
+# volume (ptm-cargo-cache-linux-musl-x86_64) across runs.
+set -euo pipefail
+
+BINARY="${1:-ptm}"
+if [[ "$BINARY" != "ptm" && "$BINARY" != "ptm-sync" && "$BINARY" != "md" ]]; then
+  echo "Error: unknown binary '$BINARY'. Valid options: ptm, ptm-sync, md" >&2
+  exit 1
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+IMAGE="ptm-builder-linux-musl-x86_64"
+CARGO_VOLUME="ptm-cargo-cache-linux-musl-x86_64"
+
+# Always clean build cache
+docker buildx prune -f
+
+echo "==> Building Docker image ($IMAGE)..."
+docker build --platform linux/amd64 -t "$IMAGE" -f "$SCRIPT_DIR/Dockerfile.linux-musl-x86_64" "$SCRIPT_DIR"
+
+echo "==> Running tests inside container..."
+docker run --rm \
+  --platform linux/amd64 \
+  --user "$(id -u):$(id -g)" \
+  --volume "$SCRIPT_DIR:/workspace" \
+  --volume "$CARGO_VOLUME:/cargo-cache" \
+  --env RUSTFLAGS="-C target-feature=-crt-static" \
+  "$IMAGE" \
+  cargo test --target x86_64-unknown-linux-musl --bin "$BINARY"
+
+echo "==> Building $BINARY (release, musl shared) inside container..."
+docker run --rm \
+  --platform linux/amd64 \
+  --user "$(id -u):$(id -g)" \
+  --volume "$SCRIPT_DIR:/workspace" \
+  --volume "$CARGO_VOLUME:/cargo-cache" \
+  --env RUSTFLAGS="-C target-feature=-crt-static" \
+  "$IMAGE" \
+  cargo build --release --target x86_64-unknown-linux-musl --bin "$BINARY"
+
+echo "==> Done: $SCRIPT_DIR/target/x86_64-unknown-linux-musl/release/$BINARY"

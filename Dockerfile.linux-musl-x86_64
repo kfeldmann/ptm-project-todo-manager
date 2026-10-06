@@ -1,0 +1,13 @@
+FROM --platform=linux/amd64 rust:1.98-alpine
+
+# C toolchain required by rusqlite's "bundled" feature (compiles SQLite from source).
+# On Alpine, gcc already targets musl natively — no wrapper needed.
+RUN apk add --no-cache build-base
+
+# Pre-create the Cargo cache dir with open permissions so any host UID can write
+# when the container is run as the host user (--user uid:gid).
+RUN mkdir -p /cargo-cache && chmod 777 /cargo-cache
+ENV CARGO_HOME=/cargo-cache
+ENV XDG_DATA_HOME=/workspace/.data
+
+WORKDIR /workspace

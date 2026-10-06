@@ -1,0 +1,29 @@
+FROM --platform=linux/amd64 rust:1.98-slim-trixie
+
+# Dependencies: curl + xz-utils to fetch/unpack the Zig tarball
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       curl xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Zig 0.16.0 (latest stable; Zig has not yet reached 1.0)
+ARG ZIG_VERSION=0.16.0
+RUN curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+    | tar -xJ -C /usr/local/lib \
+    && ln -s "/usr/local/lib/zig-x86_64-linux-${ZIG_VERSION}/zig" /usr/local/bin/zig
+
+# Install cargo-zigbuild into the system Rust installation (not /cargo-cache).
+# This bakes the binary into the image so it is always available at run time,
+# regardless of which CARGO_HOME volume is mounted.
+RUN cargo install --locked cargo-zigbuild@0.23.4
+
+# Add the macOS Apple Silicon cross-compilation target
+RUN rustup target add aarch64-apple-darwin
+
+# Per-build Cargo registry cache — mounted as a named Docker volume at run time
+RUN mkdir -p /cargo-cache && chmod 777 /cargo-cache
+ENV CARGO_HOME=/cargo-cache
+ENV XDG_CACHE_HOME=/cargo-cache/.cache
+ENV XDG_DATA_HOME=/workspace/.data
+
+WORKDIR /workspace

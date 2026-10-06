@@ -1,0 +1,37 @@
+[package]
+name = "ptm"
+version = "0.1.0"
+edition = "2021"
+description = "Project & Task Management TUI"
+
+[[bin]]
+name = "ptm"
+path = "src/main.rs"
+
+[[bin]]
+name = "ptm-sync"
+path = "src/bin/ptm_sync/main.rs"
+
+[[bin]]
+name = "md"
+path = "src/bin/md/main.rs"
+
+[dependencies]
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache"] }
+crossterm = "0.29.0"
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+uuid = { version = "1.26.0", features = ["v4"] }
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive"] }
+rust-s3 = { version = "0.37", default-features = false, features = ["sync-rustls-tls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std"] }
+zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+aes-gcm = { version = "0.11", features = ["getrandom"] }
+sha2 = { version = "0.11", default-features = false, features = ["alloc"] }
+pulldown-cmark = { version = "0.13.4", default-features = false }
+unicode-width = "0.2"
+spellbook = "0.4.2"
+
+[dev-dependencies]
+tempfile = "3"

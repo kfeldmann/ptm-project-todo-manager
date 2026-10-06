@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Cross-compiles a ptm workspace binary for macOS Apple Silicon (aarch64-apple-darwin)
+# inside a Docker container using zig-cc as the C/linker toolchain.
+# Usage: ./build-macos-arm [ptm|ptm-sync]   (default: ptm)
+# The container runs as the host user's UID:GID so output files are
+# owned by the caller. The Cargo registry is cached in a named Docker
+# volume (ptm-cargo-cache-macos-arm) across runs.
+set -euo pipefail
+
+BINARY="${1:-ptm}"
+if [[ "$BINARY" != "ptm" && "$BINARY" != "ptm-sync" && "$BINARY" != "md" ]]; then
+  echo "Error: unknown binary '$BINARY'. Valid options: ptm, ptm-sync, md" >&2
+  exit 1
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+IMAGE="ptm-builder-macos-arm"
+CARGO_VOLUME="ptm-cargo-cache-macos-arm"
+
+# Always clean build cache
+docker buildx prune -f
+
+echo "==> Building Docker image ($IMAGE)..."
+docker build --platform linux/amd64 -t "$IMAGE" -f "$SCRIPT_DIR/Dockerfile.macos-arm" "$SCRIPT_DIR"
+
+#echo "==> Running tests (linux/amd64 host target) inside container..."
+#docker run --rm \
+#  --platform linux/amd64 \
+#  --user "$(id -u):$(id -g)" \
+#  --volume "$SCRIPT_DIR:/workspace" \
+#  --volume "$CARGO_VOLUME:/cargo-cache" \
+#  "$IMAGE" \
+#  cargo test
+
+echo "==> Cross-compiling $BINARY (release) for aarch64-apple-darwin inside container..."
+docker run --rm \
+  --platform linux/amd64 \
+  --user "$(id -u):$(id -g)" \
+  --volume "$SCRIPT_DIR:/workspace" \
+  --volume "$CARGO_VOLUME:/cargo-cache" \
+  "$IMAGE" \
+  cargo zigbuild --release --target aarch64-apple-darwin --bin "$BINARY"
+
+echo "==> Done: $SCRIPT_DIR/target/aarch64-apple-darwin/release/$BINARY"

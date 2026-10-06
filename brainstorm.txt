@@ -1,0 +1,68 @@
+Track projects. One of the attributes in projects is a todo list. You can
+work with the todo items for that project inside the project. Outside
+of any project, you can also see a view of _all_ todos across _all_ (or filtered)
+projects. Have categories/tags on the projects.
+Then you can view all the todos across the whole tag
+or across the entire universe. So you can prioritize your time across multiple
+projects. Maybe you can sort (rank) them for prioritization and they keep a
+sort value that is effectively a priority. This can be used to sort the items
+inside each project too. Sorting of items outside of a project should be done
+based on a sort key that includes the project's priority and the item's priority.
+(Maybe you can't sort a task up into the next project. Limit it to it's own project)
+If you move a project up in priority, all of its todo items will then sort higher
+in the global view.
+
+- Quickly create tasks. They go into an inbox (maybe that's a default project), unless you are inside a project.
+  Maybe there's a hot-key to make an inbox item from anywhere. For example, you're
+  working inside a project and don't want to navigate away to capture a quick
+  todo for another project, etc.
+
+- Reference materials. These aren't project notes or todos. These are information
+  to keep forever for future reference. Need to be able to search them, read them,
+  and edit them. Can link to them from anywhere in the system (project updates, todos)
+
+- Hot key for today's date
+
+- Able to store images or other files, even though this will be a
+  terminal app. Projects and References will have an attachments array. Depending on
+  platform, could open appropriate handler program to view an attachment.
+
+Views:
+- Project list
+  - keys: search titles, filter by tags, drag selected (enter to drop), open, show/hide archived
+- Project detail
+  - keys: (keys to jump to most of the attributes), close/return-to-list (esc?), archive
+  - attributes:
+    - title
+    - description
+    - [updates]
+    - [todo items]
+    - [tags]
+    - [attachments]
+    - sort value (not shown directly)
+    - archived
+- Global todo list
+  - keys: search, filter by tags, drag selected (enter to drop), status (new, in progress, canceled, complete), edit, add a new item, show/hide completed
+  - todo attributes:
+    - title, status, reminder (date), sort order, project (tags are associated to the project, and todos are associated to the project)
+- Reference list
+  - keys: search titles, filter by tags, drag selected (enter to drop), open
+- Reference detail
+  - keys: (keys to jump to most of the attributes), close (esc?)
+  - attributes
+    - title
+    - body
+    - [tags]
+    - [attachments]
+    - sort value (not shown directly)
+
+Mock ups:
+- Project list line:
+
+ Project title here           [reminder date with soonest date (if there is one)]
+
+- Todo item line:
+
+<status> Todo text here       [reminder date if there is one]
+
+Status indicators are single characters, similar to '-' for new, 'o' for in-progress, 'x' for canceled, and 'v' (checkmark) for done
