@@ -17,7 +17,8 @@ if [[ "$BINARY" != "ptm" && "$BINARY" != "ptm-sync" && "$BINARY" != "md" ]]; the
   exit 1
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BUILD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJ_DIR="$(cd "${BUILD_DIR}/.." && pwd)"
 IMAGE="ptm-builder-linux-musl-x86_64"
 CARGO_VOLUME="ptm-cargo-cache-linux-musl-x86_64"
 
@@ -25,13 +26,13 @@ CARGO_VOLUME="ptm-cargo-cache-linux-musl-x86_64"
 docker buildx prune -f
 
 echo "==> Building Docker image ($IMAGE)..."
-docker build --platform linux/amd64 -t "$IMAGE" -f "$SCRIPT_DIR/Dockerfile.linux-musl-x86_64" "$SCRIPT_DIR"
+docker build --platform linux/amd64 -t "$IMAGE" -f "$BUILD_DIR/Dockerfile.linux-musl-x86_64" "$BUILD_DIR"
 
 echo "==> Running tests inside container..."
 docker run --rm \
   --platform linux/amd64 \
   --user "$(id -u):$(id -g)" \
-  --volume "$SCRIPT_DIR:/workspace" \
+  --volume "$PROJ_DIR:/workspace" \
   --volume "$CARGO_VOLUME:/cargo-cache" \
   --env RUSTFLAGS="-C target-feature=-crt-static" \
   "$IMAGE" \
@@ -41,10 +42,10 @@ echo "==> Building $BINARY (release, musl shared) inside container..."
 docker run --rm \
   --platform linux/amd64 \
   --user "$(id -u):$(id -g)" \
-  --volume "$SCRIPT_DIR:/workspace" \
+  --volume "$PROJ_DIR:/workspace" \
   --volume "$CARGO_VOLUME:/cargo-cache" \
   --env RUSTFLAGS="-C target-feature=-crt-static" \
   "$IMAGE" \
   cargo build --release --target x86_64-unknown-linux-musl --bin "$BINARY"
 
-echo "==> Done: $SCRIPT_DIR/target/x86_64-unknown-linux-musl/release/$BINARY"
+echo "==> Done: $PROJ_DIR/target/x86_64-unknown-linux-musl/release/$BINARY"

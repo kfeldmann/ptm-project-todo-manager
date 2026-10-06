@@ -1,3 +1,0 @@
-#!/bin/sh
-
-docker run -it --rm --user "$(id -u):$(id -g)" --volume "$(pwd):/workspace" ptm-builder:latest

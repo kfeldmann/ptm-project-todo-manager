@@ -12,8 +12,8 @@ in SQLite via rusqlite.
 cargo build            # debug build  → target/debug/ptm  target/debug/ptm-sync
 cargo build --release  # release build → target/release/ptm  target/release/ptm-sync
 cargo run              # build + run debug binary
-./build                # for the user only. Build via Docker
-./run                  # for the user only. Run the build container interactively
+./build/build-*        # for the user only. Build via Docker
+./build/run            # for the user only. Run the build container interactively
 ```
 
 No configuration is required on first launch. The database is created

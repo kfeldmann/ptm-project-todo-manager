@@ -13,7 +13,8 @@ if [[ "$BINARY" != "ptm" && "$BINARY" != "ptm-sync" && "$BINARY" != "md" ]]; the
   exit 1
 fi
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BUILD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJ_DIR="$(cd "${BUILD_DIR}/.." && pwd)"
 IMAGE="ptm-builder-macos-arm"
 CARGO_VOLUME="ptm-cargo-cache-macos-arm"
 
@@ -21,13 +22,13 @@ CARGO_VOLUME="ptm-cargo-cache-macos-arm"
 docker buildx prune -f
 
 echo "==> Building Docker image ($IMAGE)..."
-docker build --platform linux/amd64 -t "$IMAGE" -f "$SCRIPT_DIR/Dockerfile.macos-arm" "$SCRIPT_DIR"
+docker build --platform linux/amd64 -t "$IMAGE" -f "$BUILD_DIR/Dockerfile.macos-arm" "$BUILD_DIR"
 
 #echo "==> Running tests (linux/amd64 host target) inside container..."
 #docker run --rm \
 #  --platform linux/amd64 \
 #  --user "$(id -u):$(id -g)" \
-#  --volume "$SCRIPT_DIR:/workspace" \
+#  --volume "$PROJ_DIR:/workspace" \
 #  --volume "$CARGO_VOLUME:/cargo-cache" \
 #  "$IMAGE" \
 #  cargo test
@@ -36,9 +37,9 @@ echo "==> Cross-compiling $BINARY (release) for aarch64-apple-darwin inside cont
 docker run --rm \
   --platform linux/amd64 \
   --user "$(id -u):$(id -g)" \
-  --volume "$SCRIPT_DIR:/workspace" \
+  --volume "$PROJ_DIR:/workspace" \
   --volume "$CARGO_VOLUME:/cargo-cache" \
   "$IMAGE" \
   cargo zigbuild --release --target aarch64-apple-darwin --bin "$BINARY"
 
-echo "==> Done: $SCRIPT_DIR/target/aarch64-apple-darwin/release/$BINARY"
+echo "==> Done: $PROJ_DIR/target/aarch64-apple-darwin/release/$BINARY"
