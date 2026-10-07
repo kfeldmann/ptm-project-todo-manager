@@ -1,5 +1,6 @@
 # Rust build artifacts
 /target/
+/.clanky
 
 # Cargo lock is kept for binaries, but ignored for libraries
 # (this is a binary crate, so Cargo.lock is intentionally tracked)
