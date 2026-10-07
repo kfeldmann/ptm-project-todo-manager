@@ -8,6 +8,7 @@
 mod archive;
 mod crypto;
 mod db;
+mod merge;
 mod ops;
 mod s3client;
 
@@ -25,7 +26,7 @@ use std::path::{Path, PathBuf};
 #[command(
     name = "ptm-sync",
     about = "Sync ptm data to/from S3",
-    group(ArgGroup::new("mode").required(true).args(["start", "end"])),
+    group(ArgGroup::new("mode").required(true).args(["start", "end", "merge"])),
     group(ArgGroup::new("master").args(["local_is_master", "remote_is_master"])),
 )]
 pub struct Args {
@@ -37,13 +38,13 @@ pub struct Args {
     #[arg(long, group = "mode")]
     pub end: bool,
 
-    /// S3 bucket name.
+    /// S3 bucket name (required for --start/--end; unused by --merge).
     #[arg(long)]
-    pub bucket_name: String,
+    pub bucket_name: Option<String>,
 
-    /// S3 key prefix (e.g. "ptm-backups").
+    /// S3 key prefix (e.g. "ptm-backups"; required for --start/--end; unused by --merge).
     #[arg(long)]
-    pub prefix: String,
+    pub prefix: Option<String>,
 
     /// Path to the 32-byte raw AES-256 key file.
     #[arg(long, default_value = "~/.encryption_key")]
@@ -64,6 +65,27 @@ pub struct Args {
     /// Abort launch if another ptm process has the database open (default: allow concurrency).
     #[arg(long)]
     pub block_concurrent: bool,
+
+    /// Merge another ptm data directory into the local one, then exit.
+    /// Requires --from.  Does not contact S3.
+    #[arg(long, group = "mode")]
+    pub merge: bool,
+
+    /// Source data directory for --merge (must contain ptm.db).
+    #[arg(long, requires = "merge")]
+    pub from: Option<String>,
+}
+
+/// Expand a leading `~` to `$HOME` (shared by key path and --from).
+pub fn expand_tilde(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        PathBuf::from(home).join(rest)
+    } else if path == "~" {
+        PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+    } else {
+        PathBuf::from(path)
+    }
 }
 
 impl Args {
@@ -262,7 +284,17 @@ fn main() {
         std::process::exit(1);
     }
 
-    let result = if args.start {
+    let result = if args.merge {
+        let from = match args.from.as_deref() {
+            Some(f) => f,
+            None => {
+                eprintln!("Error: --merge requires --from <data-dir>");
+                std::process::exit(1);
+            }
+        };
+        let from_dir = expand_tilde(from);
+        merge::run_merge(&paths, &from_dir, args.dry_run)
+    } else if args.start {
         ops::run_start(&args, &paths)
     } else {
         ops::run_end(&args, &paths)
@@ -486,13 +518,15 @@ mod tests {
         Args {
             start: true,
             end: false,
-            bucket_name: "bucket".into(),
-            prefix: "prefix".into(),
+            bucket_name: Some("bucket".into()),
+            prefix: Some("prefix".into()),
             encryption_key: encryption_key.into(),
             dry_run: false,
             local_is_master: false,
             remote_is_master: false,
             block_concurrent: false,
+            merge: false,
+            from: None,
         }
     }
 

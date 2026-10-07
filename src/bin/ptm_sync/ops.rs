@@ -8,9 +8,22 @@ use crate::{
 };
 use crate::s3client::S3Client;
 
+/// Bail out unless both S3 connection arguments are present.
+/// Only --merge may omit them.
+fn require_s3_args(args: &Args) -> Result<()> {
+    match (&args.bucket_name, &args.prefix) {
+        (Some(b), Some(p)) if !b.trim().is_empty() && !p.trim().is_empty() => Ok(()),
+        (None, None) => anyhow::bail!("--bucket-name and --prefix are required for --start/--end"),
+        (Some(_), None) => anyhow::bail!("--prefix is required for --start/--end"),
+        (None, Some(_)) => anyhow::bail!("--bucket-name is required for --start/--end"),
+        _ => anyhow::bail!("--bucket-name and --prefix must be non-empty for --start/--end"),
+    }
+}
+
 // ── --start ───────────────────────────────────────────────────────────────────
 
 pub fn run_start(args: &Args, paths: &Paths) -> Result<()> {
+    require_s3_args(args)?;
     let key_path = args.key_path();
     check_key_permissions(&key_path)?;
 
@@ -130,7 +143,9 @@ fn evaluate_and_maybe_pull(args: &Args, paths: &Paths) -> Result<bool> {
     }
 
     // ── Connect to S3 and fetch remote ETag ───────────────────────────────
-    let s3 = match S3Client::new(&args.bucket_name, &args.prefix) {
+    let bucket = args.bucket_name.as_deref().unwrap_or_default();
+    let prefix = args.prefix.as_deref().unwrap_or_default();
+    let s3 = match S3Client::new(bucket, prefix) {
         Ok(s) => s,
         Err(e) => {
             prompt_continue_without_pull(paths, &e.to_string())?;
@@ -273,6 +288,7 @@ fn do_pull(args: &Args, paths: &Paths, s3: &S3Client, remote_etag: &str) -> Resu
 // ── --end ─────────────────────────────────────────────────────────────────────
 
 pub fn run_end(args: &Args, paths: &Paths) -> Result<()> {
+    require_s3_args(args)?;
     // The database must exist — there is nothing meaningful to back up otherwise.
     if !paths.db.exists() {
         anyhow::bail!(
@@ -328,7 +344,9 @@ pub fn run_end(args: &Args, paths: &Paths) -> Result<()> {
     log_entry(paths, "Changes detected; preparing upload");
 
     // ── Check remote ETag before deciding to push ─────────────────────────
-    let s3 = S3Client::new(&args.bucket_name, &args.prefix)
+    let bucket = args.bucket_name.as_deref().unwrap_or_default();
+    let prefix = args.prefix.as_deref().unwrap_or_default();
+    let s3 = S3Client::new(bucket, prefix)
         .context("Failed to connect to S3")?;
 
     let remote_etag = s3.head_etag().context("Failed to check remote backup")?;

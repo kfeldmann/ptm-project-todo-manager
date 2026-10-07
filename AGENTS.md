@@ -52,6 +52,7 @@ src/
         ├── archive.rs  — zip pack/unpack, local-backup creation and rotation
         ├── crypto.rs   — AES-256-GCM encrypt/decrypt (compatible with encrypt.py)
         ├── db.rs       — WAL detection and TRUNCATE checkpoint via rusqlite
+        ├── merge.rs    — diverged-database merge (--merge --from <dir>)
         └── s3client.rs — thin S3 wrapper (HEAD / GET / PUT via rust-s3)
 ```
 
@@ -76,15 +77,50 @@ ptm
 |------|-------|--------------|
 | `--start` | pre-launch | Pull the latest S3 backup (if needed), then store a startup hash |
 | `--end` | post-exit | Hash-check the data; push a new backup to S3 if anything changed |
+| `--merge` | standalone | Merge another ptm data directory (see `--from`) into the local one; no S3 access |
 
-Only one of `--start` / `--end` may be given per invocation.
+Exactly one mode may be given per invocation.
+
+#### Merge mode (`--merge --from <data-dir>`)
+
+Merges a diverged ptm data directory into the local one.  Implemented in
+`src/bin/ptm_sync/merge.rs`.  Semantics:
+
+- **Row identity is UUID-based**: identical IDs on both sides are the same
+  row; rows present on only one side are inserted into the other.
+- **Last-writer-wins** on shared rows via `updated_at` (ISO 8601 UTC):
+  `projects`, `todos`, `updates`, `references_table`.  Ties keep the local
+  version.
+- **Tags**: tags new by both id and name are inserted; a name collision
+  (different UUIDs, same name) maps the incoming memberships onto the local
+  tag — mirroring the app's case-insensitive rename checks.  Orphaned tags
+  are garbage-collected after membership insertion.
+- **Tag membership tables** (`project_tags`, `reference_tags`) are unioned
+  with `INSERT OR IGNORE`.
+- **`sort_order`**: shared rows keep the local ranking; foreign-only rows
+  are appended after the local rows of their ordering group; every group is
+  then re-spaced to 1.0, 2.0, … with `ROW_NUMBER()`.
+- **Schema drift**: both databases are brought up to date before the merge
+  (guarded `ALTER TABLE` migrations mirroring `src/data/db.rs`; the source
+  copy is snapshotted with `VACUUM INTO` and migrated in a temp dir).
+- **Safety**: local WAL is checkpointed first (abort if another process has
+  the db open); a `VACUUM INTO` snapshot is written to
+  `local-backups/ptm-premerge-<ts>.db` (5 kept) before any change; the
+  merge runs in a single `BEGIN IMMEDIATE` transaction and rolls back on
+  any error.
+- **`user_words.txt`** is union-merged (dedup + sort), like a pull.
+- **`.db_hash` is deleted** so the next `--end` pushes the merged state.
+- **Known limitation**: deletions are not propagated — a row deleted on one
+  side is resurrected by the other side's surviving copy (tombstones would
+  be needed for true delete propagation).
 
 ### CLI Flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--bucket-name` | *(required)* | S3 bucket name |
-| `--prefix` | *(required)* | S3 key prefix (e.g. `ptm-backups`) |
+| `--bucket-name` | *(required for `--start`/`--end`)* | S3 bucket name |
+| `--prefix` | *(required for `--start`/`--end`)* | S3 key prefix (e.g. `ptm-backups`) |
+| `--from` | *(required for `--merge`)* | Source ptm data directory to merge from (must contain `ptm.db`) |
 | `--encryption-key` | `~/.encryption_key` | Path to the 32-byte raw AES-256 key file |
 | `--dry-run` | off | Perform all logic but make no changes to local files or S3 |
 | `--local-is-master` | off | Treat local data as authoritative: skip pull on `--start`; force overwrite on `--end` |
@@ -141,7 +177,7 @@ All files live alongside `ptm.db` in `$XDG_DATA_HOME/ptm/` (default
 | `.last_pulled_etag` | ETag of the last object we downloaded |
 | `.db_hash` | SHA-256 of `ptm.db ∥ user_words.txt` at the last successful push or pull; updated by `--end` on a successful push and by `do_pull` on a successful pull; seeded by `--start` only when absent (first launch) |
 | `ptm-sync.log` | Append-only sync activity log |
-| `local-backups/` | Rolling local zip snapshots created before each pull (up to 5 kept) |
+| `local-backups/` | Rolling local zip snapshots created before each pull (up to 5 kept); also holds `ptm-premerge-*.db` snapshots created before each merge (up to 5 kept) |
 
 ### WAL Handling
 
