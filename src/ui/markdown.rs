@@ -10,7 +10,8 @@
 //! • Paragraphs; single newline → line break, double newline → paragraph gap
 //! • **Bold**, *italic*, ~~strikethrough~~, `inline code`
 //! • Fenced and indented code blocks (leading spaces preserved)
-//! • > Blockquotes  (│ prefix, dark-gray text)
+//! • > Blockquotes  (│ prefix, dark-gray text; lists, headings, code
+//!   blocks and rules inside a blockquote keep the bar)
 //! • Unordered lists  (• bullet, indented per nesting level)
 //! • Ordered lists    (1. 2. …, indented per nesting level)
 //! • Tables           (box-drawing borders, auto column widths; repeat the
@@ -442,16 +443,25 @@ impl Ctx {
         match event {
             // ── Headings ─────────────────────────────────────────────────────
             Event::Start(Tag::Heading { level, .. }) => {
-                if self.pending_blank { self.push_blank(); self.pending_blank = false; }
+                if self.pending_blank { self.push_blank_in_context(); self.pending_blank = false; }
                 self.flush();
+                self.blockquote_just_opened = false;
                 let (pfx, style) = match level {
                     HeadingLevel::H1 => ("  ", self.h1_style),
                     HeadingLevel::H2 => ("  ", self.h2_style),
                     HeadingLevel::H3 => ("  ", self.h3_style),
                     _                => ("    ", self.h_lower_style),
                 };
-                self.first_pfx  = pfx.to_string();
-                self.cont_pfx   = pfx.to_string();
+                // Inside a blockquote the heading keeps its colour/bold but
+                // sits behind the │ bar (bar style is the base, so the
+                // heading's own colour wins when explicitly set).
+                let (pfx, style) = if self.blockquote_depth > 0 {
+                    (self.bq_prefix(), self.blockquote_style.patch(style))
+                } else {
+                    (pfx.to_string(), style)
+                };
+                self.first_pfx  = pfx.clone();
+                self.cont_pfx   = pfx;
                 self.line_style = style;
             }
             Event::End(TagEnd::Heading(_)) => {
@@ -513,7 +523,8 @@ impl Ctx {
 
             // ── Lists ────────────────────────────────────────────────────────
             Event::Start(Tag::List(start_num)) => {
-                if self.pending_blank { self.push_blank(); self.pending_blank = false; }
+                if self.pending_blank { self.push_blank_in_context(); self.pending_blank = false; }
+                self.blockquote_just_opened = false;
                 self.list_stack.push(ListCtx {
                     ordered:  start_num.is_some(),
                     next_num: start_num.unwrap_or(1),
@@ -529,8 +540,10 @@ impl Ctx {
                 self.flush();
                 // Nesting depth: 1 = top-level list.  Each extra level indents
                 // 2 additional spaces so nested items visually step in.
+                // Inside a blockquote the 2-space margin becomes the │ bar
+                // prefix so list items stay inside the quote.
                 let depth      = self.list_stack.len(); // ≥ 1
-                let base       = "  ";                  // 2-space left margin
+                let base       = if self.blockquote_depth > 0 { self.bq_prefix() } else { "  ".to_string() };
                 let extra      = "  ".repeat(depth.saturating_sub(1));
                 let (first, cont) = if let Some(lc) = self.list_stack.last_mut() {
                     if lc.ordered {
@@ -549,7 +562,7 @@ impl Ctx {
                         )
                     }
                 } else {
-                    ("  • ".to_string(), "    ".to_string())
+                    (format!("{}• ", base), format!("{}  ", base))
                 };
                 self.item_first_pfx       = first.clone();
                 self.item_cont_pfx        = cont.clone();
@@ -557,6 +570,11 @@ impl Ctx {
                 self.cont_pfx             = cont;
                 self.in_item              = true;
                 self.item_paragraph_count = 0;
+                self.line_style = if self.blockquote_depth > 0 {
+                    self.blockquote_style
+                } else {
+                    Style::default()
+                };
             }
             Event::End(TagEnd::Item) => {
                 // Tight list items put their text directly in the item (no
@@ -567,21 +585,25 @@ impl Ctx {
 
             // ── Code blocks ──────────────────────────────────────────────────
             Event::Start(Tag::CodeBlock(_)) => {
-                if self.pending_blank { self.push_blank(); self.pending_blank = false; }
-                else { self.push_blank(); }
+                if self.pending_blank { self.push_blank_in_context(); self.pending_blank = false; }
+                else { self.push_blank_in_context(); }
+                self.blockquote_just_opened = false;
                 self.in_code_block = true;
                 self.code_buffer.clear();
             }
             Event::End(TagEnd::CodeBlock) => {
                 self.in_code_block = false;
                 let code  = std::mem::take(&mut self.code_buffer);
-                // Reserve space for "  ┃ " (4 chars) + at least 1 for content.
-                let max_w = self.width.saturating_sub(5).max(1);
+                // Left edge: the │ bar inside a blockquote, plain indent otherwise.
+                let pfx   = if self.blockquote_depth > 0 { self.bq_prefix() } else { "  ".to_string() };
+                // Reserve space for prefix + "┃ " + at least 1 char of content.
+                let max_w = self.width.saturating_sub(display_width(&pfx) + 3).max(1);
                 let cs    = self.code_style;
+                let bs    = self.blockquote_style;
                 for raw_line in code.lines() {
                     for chunk in char_wrap_line(raw_line, max_w) {
                         self.output.push(Line::from(vec![
-                            Span::raw("  "),
+                            Span::styled(pfx.clone(), bs),
                             Span::styled("┃ ", Style::default().fg(Color::Yellow)),
                             Span::styled(chunk, cs),
                         ]));
@@ -589,7 +611,7 @@ impl Ctx {
                 }
                 // An empty code block produces no output; in either case close
                 // with a blank so the next block has breathing room.
-                self.push_blank();
+                self.push_blank_in_context();
                 self.pending_blank = false;
             }
 
@@ -645,10 +667,12 @@ impl Ctx {
 
             // ── Horizontal rule ──────────────────────────────────────────────
             Event::Rule => {
-                if self.pending_blank { self.push_blank(); self.pending_blank = false; }
-                let rule_w = self.width.saturating_sub(4).max(1);
+                if self.pending_blank { self.push_blank_in_context(); self.pending_blank = false; }
+                self.blockquote_just_opened = false;
+                let bar = if self.blockquote_depth > 0 { self.bq_prefix() } else { "  ".to_string() };
+                let rule_w = self.width.saturating_sub(display_width(&bar) + 2).max(1);
                 self.output.push(Line::from(Span::styled(
-                    format!("  {}", "─".repeat(rule_w)),
+                    format!("{}{}", bar, "─".repeat(rule_w)),
                     self.rule_style,
                 )));
                 self.pending_blank = true;
@@ -1320,6 +1344,100 @@ mod tests {
         let full = all_text(&lines);
         assert!(full.contains("Paragraph 1"), "got: {:?}", full);
         assert!(full.contains("Paragraph 2"), "got: {:?}", full);
+    }
+
+    #[test]
+    fn rm_blockquote_contains_list() {
+        // Lists inside a blockquote must stay behind the │ bar.
+        let md = "> Para\n>\n> - uno\n> - dos\n>\n> 1. one\n> 2. two";
+        let lines = render_markdown(md, 80, &theme());
+        for line in &lines {
+            if line.spans.is_empty() { continue; }
+            let text = line_text(line);
+            assert!(text.contains('│'), "line missing │ bar: {:?}", text);
+        }
+        let full = all_text(&lines);
+        assert!(full.contains("•"),  "no bullet: {:?}", full);
+        assert!(full.contains("uno"), "got: {:?}", full);
+        assert!(full.contains("dos"), "got: {:?}", full);
+        assert!(full.contains("1."), "got: {:?}", full);
+        assert!(full.contains("two"), "got: {:?}", full);
+        // List words carry the blockquote style.
+        let span = lines.iter().flat_map(|l| &l.spans)
+            .find(|s| s.content.contains("uno")).unwrap();
+        assert_eq!(span.style.fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn rm_blockquote_contains_heading() {
+        // A heading inside a blockquote keeps its colour but sits behind the
+        // bar and doesn't break out of the quote.
+        let md = "> Para\n>\n> # Head 1\n>\n> More";
+        let lines = render_markdown(md, 80, &theme());
+        for line in &lines {
+            if line.spans.is_empty() { continue; }
+            let text = line_text(line);
+            assert!(text.contains('│'), "line missing │ bar: {:?}", text);
+        }
+        let span = lines.iter().flat_map(|l| &l.spans)
+            .find(|s| s.content.contains("Head")).unwrap();
+        // Heading colour (H1 navy) survives; bar prefix is a separate span.
+        assert_eq!(span.style.fg, Some(Color::Indexed(20)));
+        assert!(span.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn rm_blockquote_contains_code_block() {
+        // A fenced code block inside a blockquote keeps the │ bar on every
+        // line (including the ┃ gutter lines).
+        let md = "> Para\n>\n> ```\n> pre line\n> ```\n>\n> After";
+        let lines = render_markdown(md, 80, &theme());
+        for line in &lines {
+            if line.spans.is_empty() { continue; }
+            let text = line_text(line);
+            assert!(text.contains('│'), "line missing │ bar: {:?}", text);
+        }
+        let full = all_text(&lines);
+        assert!(full.contains("pre line"), "got: {:?}", full);
+        assert!(full.contains("After"),    "got: {:?}", full);
+        assert!(full.contains("┃"),        "no ┃ gutter: {:?}", full);
+    }
+
+    #[test]
+    fn rm_blockquote_sample_document_end_to_end() {
+        // The full sample document: mixed content inside one contiguous quote.
+        let md = concat!(
+            "> Hello\n",
+            ">\n",
+            "> - unordered\n",
+            "> - list\n",
+            ">\n",
+            "> 1. ordered\n",
+            "> 2. list\n",
+            ">\n",
+            "> **bold**\n",
+            "> _italic_\n",
+            "> # heading 1\n",
+            ">\n",
+            "> `code`\n",
+            ">\n",
+            "> ```\n",
+            "> pre\n",
+            "> ```\n",
+            ">\n",
+            "> Closing",
+        );
+        let lines = render_markdown(md, 80, &theme());
+        for line in &lines {
+            if line.spans.is_empty() { continue; }
+            let text = line_text(line);
+            assert!(text.contains('│'),
+                "blockquote broken (line without bar): {:?}", text);
+        }
+        let full = all_text(&lines);
+        for needle in ["Hello", "unordered", "1.", "bold", "heading", "`code`", "pre", "Closing"] {
+            assert!(full.contains(needle), "missing {:?}: {:?}", needle, full);
+        }
     }
 
     #[test]
