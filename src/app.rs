@@ -1,5 +1,5 @@
 use anyhow::Result;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rusqlite::Connection;
 use std::path::PathBuf;
 
@@ -173,12 +173,16 @@ pub struct App {
     pub pd_desc_scroll: u16,
     /// Max scroll for the Description tab; set by render so the key handler can clamp.
     pub pd_desc_max_scroll: std::cell::Cell<u16>,
+    /// Visible height of the Description tab content; set by render for half-page scroll.
+    pub pd_desc_view_height: std::cell::Cell<u16>,
     /// ID of the update currently open in full-screen viewer (`None` = list view).
     pub pd_open_update: Option<String>,
     /// Scroll offset for the open update viewer.
     pub pd_update_view_scroll: u16,
     /// Max scroll for the open update viewer; set by render so the key handler can clamp.
     pub pd_update_view_max_scroll: std::cell::Cell<u16>,
+    /// Visible height of the update viewer content; set by render for half-page scroll.
+    pub pd_update_view_height: std::cell::Cell<u16>,
     /// Max scroll for the Key Help overlay; set by render so the key handler can clamp.
     pub key_help_max_scroll: std::cell::Cell<u16>,
     /// `Some(state)` when adding a todo inline.
@@ -265,9 +269,11 @@ impl App {
             pd_update_cursor: 0,
             pd_desc_scroll: 0,
             pd_desc_max_scroll: std::cell::Cell::new(0),
+            pd_desc_view_height: std::cell::Cell::new(0),
             pd_open_update: None,
             pd_update_view_scroll: 0,
             pd_update_view_max_scroll: std::cell::Cell::new(0),
+            pd_update_view_height: std::cell::Cell::new(0),
             key_help_max_scroll: std::cell::Cell::new(0),
             pd_adding_todo: None,
             pd_editing_title: None,
@@ -1060,6 +1066,11 @@ impl App {
 
     // ─── Project Detail – Description tab ──────────────────────────────────
 
+    /// Scroll the given scroll field down by `n` lines, clamped to `max`.
+    fn scroll_field_down(field: &mut u16, n: u16, max: u16) {
+        *field = (*field).saturating_add(n).min(max.max(0));
+    }
+
     fn handle_key_pd_description(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
             KeyCode::Char('e') | KeyCode::Char('n') => {
@@ -1086,6 +1097,28 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => {
                 self.pd_desc_scroll = self.pd_desc_scroll.saturating_sub(1);
             }
+            // Half-page via Ctrl+F / Ctrl+B (vi style).
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let half = (self.pd_desc_view_height.get() / 2).max(1);
+                let max = self.pd_desc_max_scroll.get();
+                Self::scroll_field_down(&mut self.pd_desc_scroll, half, max);
+            }
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let half = (self.pd_desc_view_height.get() / 2).max(1);
+                self.pd_desc_scroll = self.pd_desc_scroll.saturating_sub(half);
+            }
+            KeyCode::PageDown => {
+                let half = (self.pd_desc_view_height.get() / 2).max(1);
+                let max = self.pd_desc_max_scroll.get();
+                Self::scroll_field_down(&mut self.pd_desc_scroll, half, max);
+            }
+            KeyCode::PageUp => {
+                let half = (self.pd_desc_view_height.get() / 2).max(1);
+                self.pd_desc_scroll = self.pd_desc_scroll.saturating_sub(half);
+            }
+            // Go to top / bottom.
+            KeyCode::Char('g') | KeyCode::Home => self.pd_desc_scroll = 0,
+            KeyCode::Char('G') | KeyCode::End => self.pd_desc_scroll = self.pd_desc_max_scroll.get(),
             _ => {}
         }
         Ok(())
@@ -1113,6 +1146,27 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => {
                 self.pd_update_view_scroll = self.pd_update_view_scroll.saturating_sub(1);
             }
+            // Half-page via Ctrl+F / Ctrl+B (vi style).
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let half = (self.pd_update_view_height.get() / 2).max(1);
+                let max = self.pd_update_view_max_scroll.get();
+                Self::scroll_field_down(&mut self.pd_update_view_scroll, half, max);
+            }
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let half = (self.pd_update_view_height.get() / 2).max(1);
+                self.pd_update_view_scroll = self.pd_update_view_scroll.saturating_sub(half);
+            }
+            KeyCode::PageDown => {
+                let half = (self.pd_update_view_height.get() / 2).max(1);
+                let max = self.pd_update_view_max_scroll.get();
+                Self::scroll_field_down(&mut self.pd_update_view_scroll, half, max);
+            }
+            KeyCode::PageUp => {
+                let half = (self.pd_update_view_height.get() / 2).max(1);
+                self.pd_update_view_scroll = self.pd_update_view_scroll.saturating_sub(half);
+            }
+            KeyCode::Char('g') | KeyCode::Home => self.pd_update_view_scroll = 0,
+            KeyCode::Char('G') | KeyCode::End => self.pd_update_view_scroll = self.pd_update_view_max_scroll.get(),
             KeyCode::Char('e') => {
                 let open_id = self.pd_open_update.clone();
                 if let Some(ref id) = open_id {

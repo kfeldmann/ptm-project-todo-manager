@@ -303,6 +303,7 @@ fn render_description_tab(frame: &mut Frame, area: Rect, app: &App, theme: &Them
     // Publish max_scroll so the key handler can clamp immediately and avoid
     // the overshoot-freeze (needing many k-presses to recover after j at bottom).
     app.pd_desc_max_scroll.set(max_scroll as u16);
+    app.pd_desc_view_height.set(view_height as u16);
 
     let scroll = (app.pd_desc_scroll as usize).min(max_scroll);
     let has_above = scroll > 0;
@@ -323,9 +324,9 @@ fn render_description_tab(frame: &mut Frame, area: Rect, app: &App, theme: &Them
         frame.render_widget(Paragraph::new(visible), sub[0]);
 
         let indicator = match (has_above, has_below) {
-            (true,  true)  => format!("  ↑↓ {}/{} lines  j/k:scroll", scroll, max_scroll),
-            (true,  false) => format!("  ↑ bottom reached  ({} lines)  j/k:scroll", total_lines),
-            (false, true)  => format!("  ↓ {} more lines  j/k:scroll", total_lines - end),
+            (true,  true)  => format!("  ↑↓ {}/{} lines  j/k:^f/^b:g:G:scroll", scroll, max_scroll),
+            (true,  false) => format!("  ↑ bottom reached  ({} lines)  j/k:^f/^b:g:G:scroll", total_lines),
+            (false, true)  => format!("  ↓ {} more lines  j/k:^f/^b:g:G:scroll", total_lines - end),
             (false, false) => String::new(),
         };
         frame.render_widget(
@@ -584,6 +585,7 @@ fn render_update_viewer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme,
     let max_scroll = total_lines.saturating_sub(view_height);
 
     app.pd_update_view_max_scroll.set(max_scroll as u16);
+    app.pd_update_view_height.set(view_height as u16);
 
     let scroll = (app.pd_update_view_scroll as usize).min(max_scroll);
     let has_above = scroll > 0;
@@ -601,9 +603,9 @@ fn render_update_viewer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme,
         frame.render_widget(Paragraph::new(visible), sub[0]);
 
         let indicator = match (has_above, has_below) {
-            (true,  true)  => format!("  \u{2191}\u{2193} {}/{} lines  j/k:scroll", scroll, max_scroll),
-            (true,  false) => format!("  \u{2191} bottom reached  ({} lines)  j/k:scroll", total_lines),
-            (false, true)  => format!("  \u{2193} {} more lines  j/k:scroll", total_lines - end),
+            (true,  true)  => format!("  \u{2191}\u{2193} {}/{} lines  j/k:^f/^b:g:G:scroll", scroll, max_scroll),
+            (true,  false) => format!("  \u{2191} bottom reached  ({} lines)  j/k:^f/^b:g:G:scroll", total_lines),
+            (false, true)  => format!("  \u{2193} {} more lines  j/k:^f/^b:g:G:scroll", total_lines - end),
             (false, false) => String::new(),
         };
         frame.render_widget(

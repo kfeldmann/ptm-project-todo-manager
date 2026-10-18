@@ -16,6 +16,8 @@ cargo run              # build + run debug binary
 ./build/run            # for the user only. Run the build container interactively
 ```
 
+There are some warnings when building `md` because it reuses code from `ptm` so some variables are unused. Ignore these.
+
 No configuration is required on first launch. The database is created
 automatically at `~/.local/share/ptm/ptm.db` (or `$XDG_DATA_HOME/ptm/ptm.db`).
 

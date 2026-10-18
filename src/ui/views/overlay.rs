@@ -465,6 +465,8 @@ fn key_help_lines(desc_width: usize) -> Vec<Line<'static>> {
     out.push(Line::raw(""));
     section!(" PROJECT DETAIL");
     row!("j / k",   "Move cursor (Todos/Updates tabs) or scroll (Description/Update viewer)");
+    row!("^f / ^b", "Half-page scroll (Description / Update viewer); PgDn / PgUp too");
+    row!("g / G",   "Top / bottom (Description / Update viewer); Home / End too");
     row!("J / K",   "Reorder todo / update");
     row!("Enter",   "Open update in viewer (Updates tab)");
     row!("t/d/u/f", "Switch tabs");
