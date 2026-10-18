@@ -11,6 +11,7 @@
 //!   /               Begin incremental search (highlight matches)
 //!   Enter           Confirm search and return to normal mode
 //!   ESC             Cancel search / clear active search
+//!   n / N           Jump to next / previous match (wraps at ends)
 //!   e               Edit file in $EDITOR, reload on return
 //!   S               Spell-check file, write corrections back
 //!   ?               Show key-binding help
@@ -51,6 +52,16 @@ use ratatui::{
 
 use ui::theme::Theme;
 
+/// One search match: its wrapped output line plus the ordinal of the matched
+/// occurrence within that line (a line may contain several matches).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SearchMark {
+    /// Line index into the rendered (wrapped) output.
+    line:   usize,
+    /// Which occurrence within the line (0-based).
+    occ:    usize,
+}
+
 // ─── Overlay ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -79,7 +90,7 @@ struct App {
     should_quit:  bool,
 
     // Scroll position (line index into the rendered output).
-    scroll:       usize,
+    scroll:       std::cell::Cell<usize>,
     /// Published by `render`; read by `handle_key` to clamp scroll.
     max_scroll:   std::cell::Cell<usize>,
     /// Published by `render`; used by half-page scroll calculations.
@@ -88,6 +99,17 @@ struct App {
     // Incremental search.
     search:       String,
     searching:    bool,
+    /// Index into `match_lines` of the current match; `None` when computed as
+    /// no matches / no search active.  Pointed at the first match after a new
+    /// query (or after the query grows during typing).
+    ///
+    /// Committing to `usize` here works because we reset it to the first match
+    /// whenever the query changes.
+    match_idx:    std::cell::Cell<usize>,
+    /// Published by `render`: flat line indices of all matches after wrapping,
+    /// ordered by position (with an interior `.0` pointing at the wrapped match
+    /// so callers can map a query position back to the right match).
+    match_marks:  std::cell::RefCell<Vec<SearchMark>>,
 
     // Overlays.
     overlay:      Option<Overlay>,
@@ -109,11 +131,13 @@ impl App {
             filepath,
             content,
             should_quit: false,
-            scroll: 0,
+            scroll: std::cell::Cell::new(0),
             max_scroll:  std::cell::Cell::new(0),
             view_height: std::cell::Cell::new(24),
             search:    String::new(),
             searching: false,
+            match_idx: std::cell::Cell::new(0),
+            match_marks: std::cell::RefCell::new(Vec::new()),
             overlay:   None,
             pending_editor: false,
             spell,
@@ -127,13 +151,19 @@ impl App {
         }
     }
 
-    fn scroll_down(&mut self, n: usize) {
+    fn scroll_down(&self, n: usize) {
         let max = self.max_scroll.get();
-        self.scroll = (self.scroll + n).min(max);
+        self.scroll.set((self.scroll.get() + n).min(max));
     }
 
-    fn scroll_up(&mut self, n: usize) {
-        self.scroll = self.scroll.saturating_sub(n);
+    fn scroll_up(&self, n: usize) {
+        self.scroll.set(self.scroll.get().saturating_sub(n));
+    }
+
+    /// Drop stale match positions (query changed or cleared).  Marks are
+    /// recomputed by `render` on the next draw.
+    fn clear_match_marks(&self) {
+        self.match_marks.borrow_mut().clear();
     }
 }
 
@@ -200,7 +230,7 @@ fn run(
             app.reload_file();
             // Clamp scroll to the new document length.
             let max = app.max_scroll.get();
-            app.scroll = app.scroll.min(max);
+            app.scroll.set(app.scroll.get().min(max));
             continue;
         }
 
@@ -257,11 +287,16 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<()> {
             }
             KeyCode::Backspace => {
                 app.search.pop();
+                app.match_idx.set(0);
+                app.clear_match_marks();
             }
             KeyCode::Char(c)
                 if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 app.search.push(c);
+                // Query changed: the current match resets to the first match.
+                app.match_idx.set(0);
+                app.clear_match_marks();
             }
             _ => {}
         }
@@ -274,7 +309,11 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<()> {
         KeyCode::Char('Q') => app.should_quit = true,
 
         // ── Clear search ──────────────────────────────────────────────────
-        KeyCode::Esc if !app.search.is_empty() => app.search.clear(),
+        KeyCode::Esc if !app.search.is_empty() => {
+            app.search.clear();
+            app.match_idx.set(0);
+            app.clear_match_marks();
+        }
 
         // ── Scrolling ─────────────────────────────────────────────────────
         KeyCode::Char('j') | KeyCode::Down  => app.scroll_down(1),
@@ -303,14 +342,20 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<()> {
         }
 
         // Go to top / bottom.
-        KeyCode::Char('g') | KeyCode::Home => app.scroll = 0,
-        KeyCode::Char('G') | KeyCode::End  => app.scroll = app.max_scroll.get(),
+        KeyCode::Char('g') | KeyCode::Home => app.scroll.set(0),
+        KeyCode::Char('G') | KeyCode::End  => app.scroll.set(app.max_scroll.get()),
 
         // ── Search ────────────────────────────────────────────────────────
         KeyCode::Char('/') => {
             app.searching = true;
             app.search.clear();
+            app.match_idx.set(0);
+            app.clear_match_marks();
         }
+
+        // ── Next / previous search match (wrap at ends) ───────────────────
+        KeyCode::Char('n') => next_match(app),
+        KeyCode::Char('N') => prev_match(app),
 
         // ── Editor ────────────────────────────────────────────────────────
         KeyCode::Char('e') => app.pending_editor = true,
@@ -505,9 +550,15 @@ fn render(frame: &mut Frame, app: &App) {
     let hints: String = if app.searching {
         format!("  /{}_   Enter:confirm  ESC:cancel", app.search)
     } else if !app.search.is_empty() {
+        let marks = app.match_marks.borrow();
+        let pos = if marks.is_empty() {
+            "no matches".to_string()
+        } else {
+            format!("match {}/{}", app.match_idx.get() + 1, marks.len())
+        };
         format!(
-            "  [/{}]  j/k:scroll  e:edit  S:spell  /:search  ?:help  Q:quit",
-            app.search
+            "  [/{}]  {}  n/N:next/prev  j/k:scroll  e:edit  S:spell  ?:help  Q:quit",
+            app.search, pos
         )
     } else {
         "  j/k:scroll  Ctrl-F/B:½page  e:edit  S:spell  /:search  ?:help  Q:quit".to_string()
@@ -538,9 +589,32 @@ fn render(frame: &mut Frame, app: &App) {
     let render_width = content_area.width as usize;
     let raw_lines    = ui::markdown::render_markdown(&app.content, render_width, &theme);
 
-    // Apply search highlight.
+    // Apply search highlight.  The "current" match (index `match_idx`)
+    // is yellow; all other matches are dim gray.  Match positions are computed
+    // fresh each frame so the navigation state stays in sync with the text.
     let lower_query: Vec<char> = app.search.to_lowercase().chars().collect();
-    let md_lines = apply_search_highlight(raw_lines, &lower_query, search_hl_style());
+    let (md_lines, cur_match_line) = compute_search_matches(raw_lines, &lower_query);
+    {
+        let mut marks = app.match_marks.borrow_mut();
+        marks.clear();
+        *marks = cur_match_line.clone();
+    }
+    // Clamp the current-match index to the number of matches (e.g. the query
+    // just changed and now matches fewer places).
+    let n_marks = cur_match_line.len();
+    if n_marks == 0 {
+        app.match_idx.set(0);
+    } else if app.match_idx.get() >= n_marks {
+        app.match_idx.set(n_marks - 1);
+    }
+    let hl_current = search_hl_style();
+    let md_lines = highlight_lines_with_current(
+        md_lines,
+        &lower_query,
+        &cur_match_line,
+        app.match_idx.get(),
+        hl_current,
+    );
 
     let total_lines    = md_lines.len();
     let content_height = content_area.height as usize;
@@ -552,7 +626,20 @@ fn render(frame: &mut Frame, app: &App) {
     let max_scroll   = total_lines.saturating_sub(view_height);
     app.max_scroll.set(max_scroll);
 
-    let scroll    = app.scroll.min(max_scroll);
+    // Keep the current search match visible: after a query change or n/N the
+    // match may sit outside the viewport, so scroll to bring it in.
+    if !cur_match_line.is_empty() {
+        let cur_scroll = app.scroll.get().min(max_scroll);
+        let ci = app.match_idx.get().min(cur_match_line.len() - 1);
+        let mline = cur_match_line[ci].line;
+        if mline < cur_scroll {
+            app.scroll.set(mline);
+        } else if mline >= cur_scroll + view_height {
+            app.scroll.set(mline + 1 - view_height);
+        }
+    }
+
+    let scroll    = app.scroll.get().min(max_scroll);
     let has_above = scroll > 0;
     let has_below = scroll + view_height < total_lines;
 
@@ -886,6 +973,7 @@ fn render_key_help(frame: &mut Frame, area: Rect, scroll: u16) {
         Line::from(Span::styled(" SEARCH", hdr)),
         row!("/",             "Begin incremental search"),
         row!("Enter",         "Confirm search, return to normal mode"),
+        row!("n / N",         "Next / previous match (wraps)"),
         row!("ESC",           "Cancel / clear search"),
         Line::raw(""),
         Line::from(Span::styled(" EDITING", hdr)),
@@ -922,22 +1010,86 @@ fn render_key_help(frame: &mut Frame, area: Rect, scroll: u16) {
     );
 }
 
-// ─── Search-highlight helpers ─────────────────────────────────────────────────
+// ─── Search-match navigation ─────────────────────────────────────────────────
 
-fn search_hl_style() -> Style {
-    Style::default()
-        .bg(Color::Yellow)
-        .fg(Color::Black)
-        .add_modifier(Modifier::BOLD)
+/// Advance to the next match (wrapping at the end) and scroll it into view.
+fn next_match(app: &mut App) {
+    jump_match(app, 1);
 }
 
-/// Split a `Span<'static>` into multiple spans, wrapping every case-insensitive
-/// match of `lower_query` with `hl_style`.
-fn split_span(span: Span<'static>, lower_query: &[char], hl_style: Style) -> Vec<Span<'static>> {
+/// Move to the previous match (wrapping at the start) and scroll it into view.
+fn prev_match(app: &mut App) {
+    jump_match(app, -1);
+}
+
+fn jump_match(app: &mut App, delta: isize) {
+    let marks = app.match_marks.borrow();
+    if marks.is_empty() {
+        return;
+    }
+    let n = marks.len() as isize;
+    let cur = app.match_idx.get() as isize;
+    let next = ((cur + delta) % n + n) % n;
+    drop(marks);
+    app.match_idx.set(next as usize);
+
+    // Scroll so the target match line is visible, using the view height
+    // published by the last render (1 fewer than the full content area when a
+    // scroll indicator row is reserved).
+    let vh = app.view_height.get().max(1);
+    let line = app.match_marks.borrow()[next as usize].line;
+    let max = app.max_scroll.get();
+    let cur = app.scroll.get();
+    if line < cur {
+        app.scroll.set(line.min(max));
+    } else if line >= cur + vh {
+        app.scroll.set((line + 1 - vh).min(max));
+    }
+}
+
+// ─── Search-highlight helpers ─────────────────────────────────────────────────
+
+/// Locate all case-insensitive matches of `lower_query` in rendered output,
+/// recording each match's line and occurrence-within-line.  Every match span
+/// is tagged with a neutral marker style (`other_match_style()`); the caller
+/// restyles the current match via `highlight_lines_with_current`.
+fn compute_search_matches(
+    lines: Vec<Line<'static>>,
+    lower_query: &[char],
+) -> (Vec<Line<'static>>, Vec<SearchMark>) {
+    if lower_query.is_empty() {
+        return (lines, Vec::new());
+    }
+    let mut positions: Vec<SearchMark> = Vec::new();
+    let lines: Vec<Line<'static>> = lines
+        .into_iter()
+        .enumerate()
+        .map(|(li, line)| {
+            let mut occ = 0usize;
+            let spans: Vec<Span<'static>> = line
+                .spans
+                .into_iter()
+                .flat_map(|s| {
+                    let (spans, hit) = split_span_hits(s, lower_query);
+                    if hit {
+                        positions.push(SearchMark { line: li, occ });
+                        occ += 1;
+                    }
+                    spans
+                })
+                .collect();
+            Line::from(spans)
+        })
+        .collect();
+    (lines, positions)
+}
+
+/// Variant of `split_span` that also reports whether the span contained a match.
+fn split_span_hits(span: Span<'static>, lower_query: &[char]) -> (Vec<Span<'static>>, bool) {
     let base = span.style;
     let text = span.content.into_owned();
     if text.is_empty() || lower_query.is_empty() {
-        return vec![Span::styled(text, base)];
+        return (vec![Span::styled(text, base)], false);
     }
     let text_chars:  Vec<char> = text.chars().collect();
     let lower_chars: Vec<char> = text.to_lowercase().chars().collect();
@@ -945,15 +1097,19 @@ fn split_span(span: Span<'static>, lower_query: &[char], hl_style: Style) -> Vec
     let tlen = text_chars.len();
 
     let mut out: Vec<Span<'static>> = Vec::new();
-    let mut i   = 0usize;
     let mut seg = 0usize;
+    let mut i   = 0usize;
+    let mut hit = false;
 
     while i + qlen <= tlen {
         if lower_chars[i..i + qlen] == *lower_query {
             if i > seg {
                 out.push(Span::styled(text_chars[seg..i].iter().collect::<String>(), base));
             }
-            out.push(Span::styled(text_chars[i..i + qlen].iter().collect::<String>(), hl_style));
+            // Placeholder style for the match segment; the current-match pass
+            // (highlight_lines_with_current) fixes this up afterwards.
+            out.push(Span::styled(text_chars[i..i + qlen].iter().collect::<String>(), other_match_style()));
+            hit = true;
             seg = i + qlen;
             i   = seg;
         } else {
@@ -966,29 +1122,64 @@ fn split_span(span: Span<'static>, lower_query: &[char], hl_style: Style) -> Vec
     if out.is_empty() {
         out.push(Span::styled(text_chars.iter().collect::<String>(), base));
     }
-    out
+    (out, hit)
 }
 
-/// Apply search highlights to every span in every rendered line.
-fn apply_search_highlight(
-    lines:       Vec<Line<'static>>,
+/// Style for non-current search matches (dim gray background).
+fn other_match_style() -> Style {
+    Style::default()
+        .bg(Color::DarkGray)
+        .fg(Color::White)
+}
+
+/// Restyle match segments: the match at `current` gets `hl_current` (yellow),
+/// every other match keeps the dim `other_match_style()`.  Match segments are
+/// identified by their marker background colour set in `split_span_hits`.
+fn highlight_lines_with_current(
+    lines: Vec<Line<'static>>,
     lower_query: &[char],
-    hl_style:    Style,
+    marks: &[SearchMark],
+    current_idx: usize,
+    hl_current: Style,
 ) -> Vec<Line<'static>> {
     if lower_query.is_empty() {
         return lines;
     }
+    let current: Option<SearchMark> =
+        if marks.is_empty() { None } else { Some(marks[current_idx.min(marks.len() - 1)]) };
+
+    let mut occ = 0usize;
     lines
         .into_iter()
-        .map(|line| {
-            let spans: Vec<Span<'static>> = line
-                .spans
-                .into_iter()
-                .flat_map(|s| split_span(s, lower_query, hl_style))
-                .collect();
-            Line::from(spans)
+        .enumerate()
+        .map(|(li, line)| {
+            occ = 0;
+            Line::from(
+                line.spans
+                    .into_iter()
+                    .map(|span| {
+                        if span.style.bg == other_match_style().bg {
+                            let is_cur = current == Some(SearchMark { line: li, occ });
+                            if is_cur {
+                                occ += 1;
+                            }
+                            let style = if is_cur { hl_current } else { other_match_style() };
+                            Span::styled(span.content.into_owned(), style)
+                        } else {
+                            span
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )
         })
         .collect()
+}
+
+fn search_hl_style() -> Style {
+    Style::default()
+        .bg(Color::Yellow)
+        .fg(Color::Black)
+        .add_modifier(Modifier::BOLD)
 }
 
 // ─── Hint-bar height helper ───────────────────────────────────────────────────

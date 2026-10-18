@@ -374,7 +374,8 @@ The overlay intercepts **all** key events until dismissed.
 | `D` (Shift) | delete selected item (always with a confirm dialog) |
 | `Q` (Shift) | quit (Project List, Todo List) |
 | `n` | new item in context (project inline in PL, todo inline in PD/TL, update in `$EDITOR` in Updates tab, quick-capture in Todo List) |
-| `e` | edit selected item (project title inline in PL; todo title inline in PD/TL; selected update in `$EDITOR` in Updates tab) |
+| `n` / `N` | next / previous search match (Project Detail Description tab and update viewer; wraps like vim) |
+| `e` | edit selected item (project title inline in PL; todo title inline in PD/TL; description in `$EDITOR` in PD Description tab; selected update in `$EDITOR` in Updates tab) |
 | `E` (Shift) | edit project title inline (Project Detail) |
 | `d` / `u` / `t` / `f` | switch Project Detail tab (Description / Updates / Todos / Files) |
 | `t` | go to Todo List (from Project List); switch to Todos tab (from Project Detail) |

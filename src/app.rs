@@ -197,6 +197,14 @@ pub struct App {
     pub pd_search: String,
     /// `true` while the user is actively typing the PD search query.
     pub pd_searching: bool,
+    /// Index of the "current" search match within `pd_match_marks` (n/N
+    /// navigation).  Marks are recomputed by the renderers each frame.
+    pub pd_match_idx: usize,
+    /// Published by the PD renderers each frame: flat positions of all
+    /// matches (rendered line index + occurrence within line), in document
+    /// order.  Empty between frames if the query has no matches.  A `RefCell`
+    /// so renderers (which take `&App`) can publish while key handlers read.
+    pub pd_match_marks: std::cell::RefCell<Vec<(usize, usize)>>,
 
     // ── Global Todo List state ───────────────────────────────────────────────
     pub tl_groups: Vec<TodoGroup>,
@@ -281,6 +289,8 @@ impl App {
             hide_done: false,
             pd_search: String::new(),
             pd_searching: false,
+            pd_match_idx: 0,
+            pd_match_marks: std::cell::RefCell::new(Vec::new()),
 
             tl_groups: Vec::new(),
             tl_cursor: 0,
@@ -994,15 +1004,18 @@ impl App {
                 KeyCode::Esc => {
                     self.pd_searching = false;
                     self.pd_search.clear();
+                    self.pd_match_idx = 0;
                 }
                 KeyCode::Enter => {
                     self.pd_searching = false;
                 }
                 KeyCode::Char(c) => {
                     self.pd_search.push(c);
+                    self.pd_match_idx = 0;
                 }
                 KeyCode::Backspace => {
                     self.pd_search.pop();
+                    self.pd_match_idx = 0;
                 }
                 _ => {}
             }
@@ -1021,6 +1034,7 @@ impl App {
                 self.pd_project = None;
                 self.pd_search.clear();
                 self.pd_searching = false;
+                self.pd_match_idx = 0;
                 self.reload_project_list()?;
                 return Ok(());
             }
@@ -1045,8 +1059,20 @@ impl App {
             }
             KeyCode::Char('/') => {
                 self.pd_searching = true;
+                self.pd_search.clear();
+                self.pd_match_idx = 0;
                 return Ok(());
             }
+            KeyCode::Char('n') if self.pd_open_update.is_some()
+                           || matches!(self.pd_tab, PdTab::Description) =>
+            {
+                // Where a search buffer exists (Description tab, update
+                // viewer), n navigates matches.  In other tabs it falls
+                // through to the tab handler (new update / new todo).
+                self.jump_pd_match(1);
+                return Ok(());
+            }
+            KeyCode::Char('N') => { self.jump_pd_match(-1); return Ok(()); }
             // Tab switching
             KeyCode::Char('d') => { self.pd_tab = PdTab::Description; self.pd_desc_scroll = 0; return Ok(()); }
             KeyCode::Char('u') => { self.pd_tab = PdTab::Updates;       return Ok(()); }
@@ -1064,7 +1090,68 @@ impl App {
         }
     }
 
-    // ─── Project Detail – Description tab ──────────────────────────────────
+    // ─── Project Detail – search-match navigation ────────────────────────
+
+    /// Infallible current-match location, or `None` when the current query
+    /// has no matches.  Marks are published each frame by the active PD
+    /// renderer into `pd_match_marks`.
+    /// Move the current-match pointer by `delta` (wrapping) and scroll the
+    /// active PD sub-view (Description tab or update viewer) so the match is
+    /// visible.
+    fn current_marker(&self) -> Option<(usize, usize)> {
+        self.pd_match_marks
+            .borrow()
+            .get(self.pd_match_idx)
+            .copied()
+    }
+
+    fn jump_pd_match(&mut self, delta: isize) {
+        let n = self.pd_match_marks.borrow().len();
+        if n == 0 {
+            return;
+        }
+        let n  = n as isize;
+        let cur = self.pd_match_idx as isize;
+        self.pd_match_idx = ((((cur + delta) % n) + n) % n) as usize;
+        self.scroll_pd_to_match();
+    }
+
+    /// Scroll whichever PD scroll buffer is active so the current match line
+    /// (`pd_match_marks[pd_match_idx].0`) is inside the viewport.
+    fn scroll_pd_to_match(&mut self) {
+        let Some((line, _)) = self.current_marker() else {
+            return;
+        };
+        // Which buffer is showing the search results? The update viewer is a
+        // single scrolling buffer regardless of tab; otherwise the match
+        // marks come from the Description tab renderer.
+        if self.pd_open_update.is_some() {
+            let (max, view_h) =
+                (self.pd_update_view_max_scroll.get(), self.pd_update_view_height.get());
+            let mut field = self.pd_update_view_scroll;
+            Self::nudge_scroll_into_view(line, max, view_h, &mut field);
+            self.pd_update_view_scroll = field;
+        } else {
+            let (max, view_h) =
+                (self.pd_desc_max_scroll.get(), self.pd_desc_view_height.get());
+            let mut field = self.pd_desc_scroll;
+            Self::nudge_scroll_into_view(line, max, view_h, &mut field);
+            self.pd_desc_scroll = field;
+        }
+    }
+
+    /// Nudge `field` so rendered line `line` (0-based) falls inside a
+    /// viewport of `view_h` rows.  `max_scroll` and `view_h` were published
+    /// by the matching renderer on the previous frame.
+    fn nudge_scroll_into_view(line: usize, max_scroll: u16, view_h: u16, field: &mut u16) {
+        let vh = (view_h as usize).max(1);
+        let cur = *field as usize;
+        if line < cur {
+            *field = (line as u16).min(max_scroll);
+        } else if line >= cur + vh {
+            *field = ((line + 1 - vh) as u16).min(max_scroll);
+        }
+    }
 
     /// Scroll the given scroll field down by `n` lines, clamped to `max`.
     fn scroll_field_down(field: &mut u16, n: u16, max: u16) {
@@ -1073,7 +1160,7 @@ impl App {
 
     fn handle_key_pd_description(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
-            KeyCode::Char('e') | KeyCode::Char('n') => {
+            KeyCode::Char('e') => {
                 if let Some(ref p) = self.pd_project {
                     self.pending_editor = Some(PendingEditor {
                         content: p.description.clone(),
@@ -1136,6 +1223,8 @@ impl App {
             }
             KeyCode::Char('/') => {
                 self.pd_searching = true;
+                self.pd_search.clear();
+                self.pd_match_idx = 0;
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 let max = self.pd_update_view_max_scroll.get();
@@ -1713,6 +1802,7 @@ impl App {
         self.pd_editing_todo = None;
         self.pd_search.clear();
         self.pd_searching   = false;
+        self.pd_match_idx = 0;
         self.pd_archived_todo_count = repo::count_archived_todos(&self.conn, Some(project_id))?;
         self.pd_done_count = repo::count_done_todos(&self.conn, Some(project_id))?;
         self.screen = Screen::ProjectDetail;
