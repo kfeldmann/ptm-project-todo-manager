@@ -223,7 +223,8 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     // at the next item's first line.
     let area_height = inner.height as usize;
     let item_heights: Vec<usize> = items.iter().map(|lines| lines.len()).collect();
-    let footer_count = if app.tl_show_archived || app.tl_archived_count == 0 { 0 } else { 1 };
+    let footer_count = if !app.tl_show_archived && app.tl_archived_count > 0 { 1 } else { 0 }
+        + if app.hide_done && app.tl_done_count > 0 { 1 } else { 0 };
     let core_count = items.len() - footer_count;
     // The footer is not selectable: anchor the window on the core selection.
     let selected_rel = selected_item.map(|s| s.min(core_count.saturating_sub(1)));
