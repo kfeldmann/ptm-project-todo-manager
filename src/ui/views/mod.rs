@@ -119,6 +119,64 @@ pub fn list_window(
     (start, end, rows_used)
 }
 
+/// Like [`list_window`], but with rows **reserved** for trailing footer
+/// items (e.g. the "[N archived — A to show]" hint).
+///
+/// `core_count` is the number of leading items in `item_heights` that make
+/// up the scrollable content; the remaining `item_heights.len() -
+/// core_count` items are footers.  The core window is computed against
+/// `area_height - total footer height` so the footers can never be pushed
+/// off the bottom.
+///
+/// The returned [`FooterPlan`] describes how to render: the `start..end`
+/// window indexes **core items only** (render as one `List` into the first
+/// `core_rows` rows of the area), and `kept_footers` footer items starting
+/// at index `core_count` (render into a strip covering the last
+/// `footer_rows` rows of the area).  Footers are dropped from the end of
+/// the footer block only when the area is too short to show them alongside
+/// any core content.
+pub struct FooterPlan {
+    /// First core item in the window (index into the full item list).
+    pub start: usize,
+    /// One past the last core item in the window (never beyond `core_count`).
+    pub end: usize,
+    /// Number of footer items (from index `core_count` on) to render.
+    pub kept_footers: usize,
+    /// Rows the core `List` occupies.
+    pub core_rows: usize,
+    /// Rows the footer strip occupies (all kept footer items fit fully).
+    pub footer_rows: usize,
+}
+
+pub fn list_window_reserved(
+    item_heights: &[usize],
+    area_height: usize,
+    selected: Option<usize>,
+    core_count: usize,
+) -> FooterPlan {
+    let n = item_heights.len();
+    let core_count = core_count.min(n);
+    let n_footers = n - core_count;
+
+    // Shrink the available area by the height of the kept footers.
+    let mut kept_footers = n_footers;
+    let mut footer_rows: usize = item_heights[core_count..].iter().sum();
+    while kept_footers > 0 && footer_rows >= area_height {
+        // No room for both core content and the footers: core wins.
+        kept_footers -= 1;
+        footer_rows -= item_heights[core_count + kept_footers];
+    }
+    if kept_footers == 0 {
+        let (start, end, core_rows) = list_window(item_heights, area_height, selected);
+        return FooterPlan { start, end, kept_footers: 0, core_rows, footer_rows: 0 };
+    }
+
+    let budget = area_height - footer_rows; // >= 1 by the loop above
+    let (start, end, core_rows) =
+        list_window(&item_heights[..core_count], budget, selected);
+    FooterPlan { start, end, kept_footers, core_rows, footer_rows }
+}
+
 // ─── Text wrapping helpers (shared by multiple views) ────────────────────────
 
 /// Hard-wrap `text` at `width` characters per line.
@@ -247,7 +305,7 @@ pub fn word_wrap(text: &str, width: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{char_wrap, hint_height, list_window, word_wrap};
+    use super::{char_wrap, hint_height, list_window, list_window_reserved, word_wrap};
 
     // ── word_wrap ─────────────────────────────────────────────────────────────
 
@@ -455,5 +513,78 @@ mod tests {
         let (start, end, _used) = list_window(&heights, 4, Some(0));
         assert_eq!(end, 4); // footer included
         assert_eq!(start, 0);
+    }
+
+    // ── list_window_reserved ─────────────────────────────────────────────
+
+    #[test]
+    fn reserved_footer_fully_visible_at_every_height() {
+        // Regression: with a footer item (height 1) and 6 single-row core
+        // items, the footer must be kept for ANY area height, including
+        // the awkward off-by-one sizes where plain `list_window` filled
+        // the area to the bottom and sliced the footer away.
+        let heights = vec![1, 1, 1, 1, 1, 1, 1]; // 6 core + 1 footer
+        for area in 2..=12 {
+            let plan = list_window_reserved(&heights, area, Some(0), 6);
+            assert_eq!(plan.kept_footers, 1, "footer dropped at area {area}");
+            assert_eq!(plan.footer_rows, 1);
+            assert!(plan.core_rows + plan.footer_rows <= area);
+            assert!(plan.end <= 6);
+        }
+    }
+
+    #[test]
+    fn reserved_footer_no_footers_matches_list_window() {
+        let heights = vec![1, 1, 5];
+        for area in [1usize, 2, 5, 6, 7, 10] {
+            for sel in [None, Some(0), Some(2)] {
+                let plan = list_window_reserved(&heights, area, sel, 3);
+                let (start, end, used) = list_window(&heights, area, sel);
+                assert_eq!((plan.start, plan.end, plan.core_rows), (start, end, used));
+                assert_eq!(plan.kept_footers, 0, "area {area}, sel {sel:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn reserved_footer_selection_stays_visible() {
+        // 8 core items + 1 footer row in an area of 5: window anchored on
+        // the selection, footer always present.
+        let heights = vec![1; 9];
+        let plan = list_window_reserved(&heights, 5, Some(7), 8);
+        assert_eq!(plan.kept_footers, 1);
+        assert_eq!(plan.core_rows + plan.footer_rows, 5);
+        assert!((plan.start..plan.end).contains(&7));
+        assert!(plan.end <= 8);
+    }
+
+    #[test]
+    fn reserved_footer_tiny_area_drops_footer_not_content() {
+        // Area of 1 with a footer: the footer cannot coexist with core
+        // content, so it is dropped and the plain window is used.
+        let heights = vec![1, 1, 1, 1]; // 3 core + 1 footer
+        let plan = list_window_reserved(&heights, 1, None, 3);
+        assert_eq!(plan.kept_footers, 0);
+        assert_eq!((plan.start, plan.end, plan.core_rows), (0, 1, 1));
+    }
+
+    #[test]
+    fn reserved_footer_tiny_area_keeps_selection() {
+        // Area of 2 with one footer row and the selection on core item 5:
+        // the footer still fits and the selection is visible.
+        let heights = vec![1; 7]; // 6 core + 1 footer
+        let plan = list_window_reserved(&heights, 2, Some(5), 6);
+        assert_eq!(plan.kept_footers, 1);
+        assert_eq!(plan.footer_rows, 1);
+        assert_eq!(plan.core_rows, 1);
+        assert!((plan.start..plan.end).contains(&5));
+    }
+
+    #[test]
+    fn reserved_footer_area_too_small_for_anything() {
+        // Degenerate: area 0.
+        let plan = list_window_reserved(&[1, 1, 1], 0, None, 2);
+        assert_eq!((plan.start, plan.end, plan.core_rows), (0, 0, 0));
+        assert_eq!(plan.kept_footers, 0);
     }
 }

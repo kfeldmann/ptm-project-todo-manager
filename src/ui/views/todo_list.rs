@@ -217,14 +217,32 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         ])]);
     }
 
-    // Pagination: slice the items to the window that fully fits, so footer
-    // rows are never pushed off the bottom and no space is left under a
-    // dropped multi-row item.  Leftover rows are used to peek at the next
-    // item's first line.
+    // Pagination: slice the items to the window that fits, reserving rows
+    // for the footer so it is never pushed off the bottom, and leaving no
+    // space under a dropped multi-row item.  Leftover rows are used to peek
+    // at the next item's first line.
     let area_height = inner.height as usize;
     let item_heights: Vec<usize> = items.iter().map(|lines| lines.len()).collect();
-    let selected_rel = selected_item.map(|s| s.min(items.len().saturating_sub(1)));
-    let (start, end, rows_used) = super::list_window(&item_heights, area_height, selected_rel);
+    let footer_count = if app.tl_show_archived || app.tl_archived_count == 0 { 0 } else { 1 };
+    let core_count = items.len() - footer_count;
+    // The footer is not selectable: anchor the window on the core selection.
+    let selected_rel = selected_item.map(|s| s.min(core_count.saturating_sub(1)));
+    let plan = super::list_window_reserved(&item_heights, area_height, selected_rel, core_count);
+    let (start, end) = (plan.start, plan.end);
+
+    // Render the kept footers as a fixed strip pinned to the bottom of the
+    // area; the core list is windowed into the rows above.
+    let footer_area_height = plan.footer_rows.min(area_height) as u16;
+    let footer_y = inner.y + (area_height - footer_area_height as usize) as u16;
+    let footer_lines: Vec<Line> = items[core_count..core_count + plan.kept_footers]
+        .iter()
+        .flatten()
+        .cloned()
+        .collect();
+    frame.render_widget(
+        Paragraph::new(footer_lines),
+        Rect { y: footer_y, height: footer_area_height, ..inner },
+    );
 
     let list_items: Vec<ListItem> = items[start..end]
         .iter()
@@ -238,14 +256,17 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         .highlight_style(Style::default())
         .highlight_symbol("");
 
-    let list_area = Rect { height: rows_used.min(area_height) as u16, ..inner };
+    let list_area = Rect { height: plan.core_rows.min(area_height) as u16, ..inner };
     frame.render_stateful_widget(list, list_area, &mut list_state);
 
-    // Peek: fill leftover rows with the first lines of the next item.
-    let remaining_rows = area_height.saturating_sub(rows_used);
-    if remaining_rows > 0 && end < items.len() {
+    // Peek: fill leftover rows above the footer strip with the first lines
+    // of the next core item (only when footers are pinned below; when they
+    // were dropped, `end` already points at the real next item).
+    let rows_for_core = area_height.saturating_sub(plan.footer_rows);
+    let remaining_rows = rows_for_core.saturating_sub(plan.core_rows);
+    if remaining_rows > 0 && end < core_count {
         let peek_area = Rect {
-            y:      inner.y + rows_used as u16,
+            y:      inner.y + plan.core_rows as u16,
             height: remaining_rows as u16,
             ..inner
         };
