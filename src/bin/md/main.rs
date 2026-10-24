@@ -106,6 +106,11 @@ struct App {
     /// Committing to `usize` here works because we reset it to the first match
     /// whenever the query changes.
     match_idx:    std::cell::Cell<usize>,
+    /// Whether the current match still needs to be scrolled into view.  Set
+    /// when `match_idx` changes (query edit, n/N); cleared by `render` once
+    /// the match is visible.  Free scrolling (j/k/g/G) is never fought by
+    /// render — only an explicit match change re-centers the view.
+    match_dirty:  std::cell::Cell<bool>,
     /// Published by `render`: flat line indices of all matches after wrapping,
     /// ordered by position (with an interior `.0` pointing at the wrapped match
     /// so callers can map a query position back to the right match).
@@ -137,6 +142,7 @@ impl App {
             search:    String::new(),
             searching: false,
             match_idx: std::cell::Cell::new(0),
+            match_dirty: std::cell::Cell::new(false),
             match_marks: std::cell::RefCell::new(Vec::new()),
             overlay:   None,
             pending_editor: false,
@@ -288,6 +294,7 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<()> {
             KeyCode::Backspace => {
                 app.search.pop();
                 app.match_idx.set(0);
+                app.match_dirty.set(true);
                 app.clear_match_marks();
             }
             KeyCode::Char(c)
@@ -296,6 +303,7 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<()> {
                 app.search.push(c);
                 // Query changed: the current match resets to the first match.
                 app.match_idx.set(0);
+                app.match_dirty.set(true);
                 app.clear_match_marks();
             }
             _ => {}
@@ -350,6 +358,7 @@ fn handle_key(app: &mut App, key: crossterm::event::KeyEvent) -> Result<()> {
             app.searching = true;
             app.search.clear();
             app.match_idx.set(0);
+            app.match_dirty.set(true);
             app.clear_match_marks();
         }
 
@@ -626,9 +635,11 @@ fn render(frame: &mut Frame, app: &App) {
     let max_scroll   = total_lines.saturating_sub(view_height);
     app.max_scroll.set(max_scroll);
 
-    // Keep the current search match visible: after a query change or n/N the
-    // match may sit outside the viewport, so scroll to bring it in.
-    if !cur_match_line.is_empty() {
+    // Keep the current search match visible — but only when the current match
+    // has just changed (query edit or n/N).  This leaves free scrolling
+    // (j/k/g/G) untouched, even when that moves the match off-screen; a
+    // subsequent n/N scrolls the match back into view.
+    if !cur_match_line.is_empty() && app.match_dirty.get() {
         let cur_scroll = app.scroll.get().min(max_scroll);
         let ci = app.match_idx.get().min(cur_match_line.len() - 1);
         let mline = cur_match_line[ci].line;
@@ -637,6 +648,7 @@ fn render(frame: &mut Frame, app: &App) {
         } else if mline >= cur_scroll + view_height {
             app.scroll.set(mline + 1 - view_height);
         }
+        app.match_dirty.set(false);
     }
 
     let scroll    = app.scroll.get().min(max_scroll);
@@ -1032,6 +1044,8 @@ fn jump_match(app: &mut App, delta: isize) {
     let next = ((cur + delta) % n + n) % n;
     drop(marks);
     app.match_idx.set(next as usize);
+    // Ask render to scroll the new current match into view on the next draw.
+    app.match_dirty.set(true);
 
     // Scroll so the target match line is visible, using the view height
     // published by the last render (1 fewer than the full content area when a

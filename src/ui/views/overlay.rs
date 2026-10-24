@@ -28,6 +28,9 @@ pub fn render_overlay(frame: &mut Frame, area: Rect, app: &App) {
         Some(Overlay::ConfirmDelete { message, .. }) => {
             render_confirm_delete(frame, area, message);
         }
+        Some(Overlay::ConfirmArchive { message, .. }) => {
+            render_confirm_archive(frame, area, message);
+        }
         Some(Overlay::ReminderInput { input, error, .. }) => {
             render_reminder_input(frame, area, input, error.as_deref());
         }
@@ -310,6 +313,34 @@ fn render_confirm_delete(frame: &mut Frame, area: Rect, message: &str) {
     frame.render_widget(content, inner);
 }
 
+// ─── Confirm Archive ──────────────────────────────────────────────────────────
+
+fn render_confirm_archive(frame: &mut Frame, area: Rect, message: &str) {
+    let theme = Theme::default();
+    let popup = centered_rect(58, 6, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(" Confirm Archive ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let content = Paragraph::new(vec![
+        Line::raw(""),
+        Line::from(vec![Span::raw(format!("  {}", message))]),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(
+                "  y/Enter:confirm   n/ESC:cancel",
+                Style::default().fg(theme.hint_fg),
+            ),
+        ]),
+    ]);
+    frame.render_widget(content, inner);
+}
+
 // ─── Key Help ──────────────────────────────────────────────────────────────────
 
 fn render_key_help(frame: &mut Frame, area: Rect, scroll: u16, app: &App) {
@@ -456,7 +487,7 @@ fn key_help_lines(desc_width: usize) -> Vec<Line<'static>> {
     row!("n",       "New project");
     row!("e",       "Edit project title inline");
     row!("/",       "Search");
-    row!("a",       "Toggle archive");
+    row!("a",       "Toggle archive (confirm)");
     row!("A",       "Show / hide archived");
     row!("D",       "Delete project");
     row!("T",       "Tag filter");
@@ -476,7 +507,7 @@ fn key_help_lines(desc_width: usize) -> Vec<Line<'static>> {
     row!("S",       "Spell check selected item (todo / update / description)");
     row!("r",       "Set / clear reminder");
     row!("m",       "Move todo to project");
-    row!("a",       "Toggle archive (Todos tab)");
+    row!("a",       "Toggle archive (Todos tab, confirm)");
     row!("A",       "Show / hide archived todos (Todos tab)");
     row!("E",       "Edit project title");
     row!("C",       "Toggle hide done / canceled (Todos tab)");
@@ -495,7 +526,7 @@ fn key_help_lines(desc_width: usize) -> Vec<Line<'static>> {
     row!("n",       "New todo");
     row!("m",       "Move to project");
     row!("/",       "Search");
-    row!("a",       "Toggle archive");
+    row!("a",       "Toggle archive (confirm)");
     row!("A",       "Show / hide archived");
     row!("C",       "Toggle hide done / canceled");
     row!("T",       "Tag filter");

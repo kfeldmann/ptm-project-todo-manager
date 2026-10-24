@@ -69,6 +69,10 @@ pub enum Overlay {
         message: String,
         target: DeleteTarget,
     },
+    ConfirmArchive {
+        message: String,
+        target: ArchiveTarget,
+    },
     /// Inline reminder date entry (YYYY-MM-DD).
     ReminderInput {
         input: InputState,
@@ -118,6 +122,12 @@ pub enum Overlay {
 pub enum DeleteTarget {
     Project(String),
     Update(String),
+    Todo(String),
+}
+
+#[derive(Debug, Clone)]
+pub enum ArchiveTarget {
+    Project(String),
     Todo(String),
 }
 
@@ -355,6 +365,9 @@ impl App {
             }
             Overlay::ConfirmDelete { message, target } => {
                 self.overlay = self.handle_confirm_delete(key, message, target)?;
+            }
+            Overlay::ConfirmArchive { message, target } => {
+                self.overlay = self.handle_confirm_archive(key, message, target)?;
             }
             Overlay::ReminderInput { input, todo_id, .. } => {
                 self.overlay = self.handle_reminder_input(key, input, todo_id)?;
@@ -724,6 +737,50 @@ impl App {
         }
     }
 
+    // ─── Confirm Archive ──────────────────────────────────────────────────
+
+    fn handle_confirm_archive(
+        &mut self,
+        key: KeyEvent,
+        message: String,
+        target: ArchiveTarget,
+    ) -> Result<Option<Overlay>> {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                match &target {
+                    ArchiveTarget::Project(id) => {
+                        let id = id.clone();
+                        repo::toggle_archive_project(&self.conn, &id)?;
+                        self.reload_project_list()?;
+                        self.pl_cursor = self.pl_cursor.min(self.pl_projects.len().saturating_sub(1));
+                    }
+                    ArchiveTarget::Todo(id) => {
+                        let id = id.clone();
+                        repo::toggle_archive_todo(&self.conn, &id)?;
+                        match self.screen {
+                            Screen::ProjectDetail => {
+                                self.reload_project_detail()?;
+                                let max = self.pd_todos.len().saturating_sub(1);
+                                if self.pd_todo_cursor > max { self.pd_todo_cursor = max; }
+                            }
+                            Screen::TodoList => {
+                                self.reload_todo_list()?;
+                                let total = self.flat_todo_count();
+                                if total > 0 && self.tl_cursor >= total {
+                                    self.tl_cursor = total - 1;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Ok(None)
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Ok(None),
+            _ => Ok(Some(Overlay::ConfirmArchive { message, target })),
+        }
+    }
+
     // ─── Reminder Input ───────────────────────────────────────────────────
 
     fn handle_reminder_input(
@@ -904,9 +961,14 @@ impl App {
 
             KeyCode::Char('a') => {
                 if let Some(id) = self.pl_selected_id() {
-                    repo::toggle_archive_project(&self.conn, &id)?;
-                    self.reload_project_list()?;
-                    self.pl_cursor = self.pl_cursor.min(self.pl_projects.len().saturating_sub(1));
+                    let (title, archived) = self.pl_projects.get(self.pl_cursor)
+                        .map(|p| (p.title.clone(), p.archived))
+                        .unwrap_or_default();
+                    let verb = if archived { "Unarchive" } else { "Archive" };
+                    self.overlay = Some(Overlay::ConfirmArchive {
+                        message: format!("{} '{}'?", verb, title),
+                        target: ArchiveTarget::Project(id),
+                    });
                 }
             }
 
@@ -1503,10 +1565,15 @@ impl App {
 
             KeyCode::Char('a') => {
                 if let Some(id) = self.pd_selected_todo_id() {
-                    repo::toggle_archive_todo(&self.conn, &id)?;
-                    self.reload_project_detail()?;
-                    let max = self.pd_todos.len().saturating_sub(1);
-                    if self.pd_todo_cursor > max { self.pd_todo_cursor = max; }
+                    let (title, archived) = self.pd_todos.iter()
+                        .find(|t| t.id == id)
+                        .map(|t| (t.title.clone(), t.archived))
+                        .unwrap_or_default();
+                    let verb = if archived { "Unarchive" } else { "Archive" };
+                    self.overlay = Some(Overlay::ConfirmArchive {
+                        message: format!("{} todo '{}'?", verb, title),
+                        target: ArchiveTarget::Todo(id),
+                    });
                 }
             }
 
@@ -1665,13 +1732,14 @@ impl App {
 
             KeyCode::Char('a') => {
                 if let Some(id) = self.tl_current_todo_id() {
-                    repo::toggle_archive_todo(&self.conn, &id)?;
-                    self.reload_todo_list()?;
-                    // Clamp cursor after a potential removal.
-                    let total = self.flat_todo_count();
-                    if total > 0 && self.tl_cursor >= total {
-                        self.tl_cursor = total - 1;
-                    }
+                    let (title, archived) = self.tl_current_todo()
+                        .map(|t| (t.title.clone(), t.archived))
+                        .unwrap_or_default();
+                    let verb = if archived { "Unarchive" } else { "Archive" };
+                    self.overlay = Some(Overlay::ConfirmArchive {
+                        message: format!("{} todo '{}'?", verb, title),
+                        target: ArchiveTarget::Todo(id),
+                    });
                 }
             }
 
