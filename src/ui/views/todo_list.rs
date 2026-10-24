@@ -2,7 +2,7 @@ use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span, Text},
+    text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 
@@ -76,8 +76,9 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         result
     };
 
-    // Build a flat list of items (group headers + todo rows).
-    let mut items: Vec<ListItem> = Vec::new();
+    // Build a flat list of item lines (group headers + todo rows).
+    // Height of each item == number of lines.
+    let mut items: Vec<Vec<Line>> = Vec::new();
     let mut current_item_idx = 0usize;
 
     for group in &app.tl_groups {
@@ -86,12 +87,12 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
             (inner.width as usize)
                 .saturating_sub(group.project_title.len() + 5)
         );
-        items.push(ListItem::new(Line::from(vec![
+        items.push(vec![Line::from(vec![
             Span::styled(
                 format!(" ── {} {}", group.project_title, sep),
                 Style::default().fg(theme.header_fg),
             ),
-        ])));
+        ])]);
         current_item_idx += 1;
 
         for todo in &group.todos {
@@ -138,14 +139,14 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
                     .saturating_sub(4 + reminder_cols) // 4 = "  X "
                     .max(1);
                 let (before, cur_ch, after) = state.display(avail);
-                ListItem::new(Line::from(vec![
+                vec![Line::from(vec![
                     Span::styled(format!("  {} ", sc), sc_style.patch(hl)),
                     Span::styled(before,             hl),
                     Span::styled(cur_ch.to_string(), hl.add_modifier(Modifier::REVERSED)),
                     Span::styled(after,              hl),
                     Span::styled(if reminder.is_empty() { "" } else { "  " }, hl),
                     Span::styled(reminder,           eff_reminder_style),
-                ]))
+                ])]
             } else {
                 // Word-wrap the title to fit the available width, reserving space
                 // for the "  X " prefix (4 cols) and the reminder suffix.
@@ -188,7 +189,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
                     })
                     .collect();
 
-                ListItem::new(Text::from(lines))
+                lines
             };
 
             items.push(item);
@@ -198,32 +199,59 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
 
     // Done count footer.
     if app.hide_done && app.tl_done_count > 0 {
-        items.push(ListItem::new(Line::from(vec![
+        items.push(vec![Line::from(vec![
             Span::styled(
                 format!("  [{} done — C to show]", app.tl_done_count),
                 Style::default().fg(Color::DarkGray),
             ),
-        ])));
+        ])]);
     }
 
     // Archived count footer (added before the list widget is built).
     if !app.tl_show_archived && app.tl_archived_count > 0 {
-        items.push(ListItem::new(Line::from(vec![
+        items.push(vec![Line::from(vec![
             Span::styled(
                 format!("  [{} archived — A to show]", app.tl_archived_count),
                 Style::default().fg(Color::DarkGray),
             ),
-        ])));
+        ])]);
     }
 
-    let mut list_state = ListState::default();
-    list_state.select(selected_item);
+    // Pagination: slice the items to the window that fully fits, so footer
+    // rows are never pushed off the bottom and no space is left under a
+    // dropped multi-row item.  Leftover rows are used to peek at the next
+    // item's first line.
+    let area_height = inner.height as usize;
+    let item_heights: Vec<usize> = items.iter().map(|lines| lines.len()).collect();
+    let selected_rel = selected_item.map(|s| s.min(items.len().saturating_sub(1)));
+    let (start, end, rows_used) = super::list_window(&item_heights, area_height, selected_rel);
 
-    let list = List::new(items)
+    let list_items: Vec<ListItem> = items[start..end]
+        .iter()
+        .map(|lines| ListItem::new(lines.clone()))
+        .collect();
+
+    let mut list_state = ListState::default();
+    list_state.select(selected_rel.map(|s| s - start));
+
+    let list = List::new(list_items)
         .highlight_style(Style::default())
         .highlight_symbol("");
 
-    frame.render_stateful_widget(list, inner, &mut list_state);
+    let list_area = Rect { height: rows_used.min(area_height) as u16, ..inner };
+    frame.render_stateful_widget(list, list_area, &mut list_state);
+
+    // Peek: fill leftover rows with the first lines of the next item.
+    let remaining_rows = area_height.saturating_sub(rows_used);
+    if remaining_rows > 0 && end < items.len() {
+        let peek_area = Rect {
+            y:      inner.y + rows_used as u16,
+            height: remaining_rows as u16,
+            ..inner
+        };
+        let peek_lines: Vec<Line> = items[end][..remaining_rows.min(items[end].len())].to_vec();
+        frame.render_widget(Paragraph::new(peek_lines), peek_area);
+    }
 
     // Hint bar.
     frame.render_widget(

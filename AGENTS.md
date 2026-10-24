@@ -509,3 +509,14 @@ tail -f ~/.local/share/ptm/ptm.log
   SQLite's grammar for `ALTER TABLE`). Instead, guard the migration with a
   `SELECT COUNT(*) FROM pragma_table_info('<table>') WHERE name = '<col>'`
   check and only run the `ALTER TABLE ... ADD COLUMN` when the count is 0.
+- **List pagination** — ratatui's `List` scrolls by whole items: a multi-row
+  item that overflows the bottom is dropped entirely (leaving a blank gap),
+  and footer rows appended after the items (e.g. the "N archived — A to
+  show" hint) can be pushed past the bottom edge. All list views therefore
+  paginate themselves: build the items as `Vec<Vec<Line>>`, compute the
+  visible window with `views::list_window(&heights, area_height,
+  selected)`, render the `List` into exactly `rows_used` rows, and fill any
+  leftover rows with a "peek" at the next item's first lines (see
+  `project_list.rs`, `todo_list.rs`, and `render_todos_tab` /
+  `render_updates_tab` in `project_detail.rs`). Don't render a list widget
+  straight into the full content area with raw `ListItem`s.

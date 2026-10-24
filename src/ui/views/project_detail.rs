@@ -2,7 +2,7 @@ use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span, Text},
+    text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 
@@ -766,7 +766,7 @@ fn render_todos_tab(frame: &mut Frame, area: Rect, app: &App, theme: &Theme, low
         .fg(theme.highlight_fg)
         .add_modifier(Modifier::BOLD);
 
-    let mut todo_items: Vec<ListItem> = app.pd_todos.iter().enumerate().map(|(i, t)| {
+    let mut todo_items: Vec<Vec<Line>> = app.pd_todos.iter().enumerate().map(|(i, t)| {
         let is_selected = selection == Some(i);
 
         let is_editing = app
@@ -779,12 +779,12 @@ fn render_todos_tab(frame: &mut Frame, area: Rect, app: &App, theme: &Theme, low
             let state = app.pd_editing_todo.as_ref().map(|(_, s)| s).unwrap();
             let avail = (content_area.width as usize).saturating_sub(4).max(1); // 4 = "  > "
             let (before, cur_ch, after) = state.display(avail);
-            ListItem::new(Line::from(vec![
+            vec![Line::from(vec![
                 Span::styled("  > ",           sel_hl),
                 Span::styled(before,           sel_hl),
                 Span::styled(cur_ch.to_string(), sel_hl.add_modifier(Modifier::REVERSED)),
                 Span::styled(after,            sel_hl),
-            ]))
+            ])]
         } else {
             let sc          = t.status.char_repr();
             // Dim archived todos when not selected so they are visually distinct.
@@ -877,7 +877,7 @@ fn render_todos_tab(frame: &mut Frame, area: Rect, app: &App, theme: &Theme, low
                 })
                 .collect();
 
-            ListItem::new(Text::from(lines))
+            lines
         }
     }).collect();
 
@@ -885,42 +885,69 @@ fn render_todos_tab(frame: &mut Frame, area: Rect, app: &App, theme: &Theme, low
     if let Some(ref state) = app.pd_adding_todo {
         let avail = (content_area.width as usize).saturating_sub(4).max(1); // 4 = "  + "
         let (before, cur_ch, after) = state.display(avail);
-        todo_items.push(ListItem::new(Line::from(vec![
+        todo_items.push(vec![Line::from(vec![
             Span::styled("  + ",           sel_hl),
             Span::styled(before,           sel_hl),
             Span::styled(cur_ch.to_string(), sel_hl.add_modifier(Modifier::REVERSED)),
             Span::styled(after,            sel_hl),
-        ])));
+        ])]);
     }
 
     // Done count footer.
     if app.hide_done && app.pd_done_count > 0 {
-        todo_items.push(ListItem::new(Line::from(vec![
+        todo_items.push(vec![Line::from(vec![
             Span::styled(
                 format!("  [{} done — C to show]", app.pd_done_count),
                 Style::default().fg(Color::DarkGray),
             ),
-        ])));
+        ])]);
     }
 
     // Archived count footer.
     if !app.pd_show_archived_todos && app.pd_archived_todo_count > 0 {
-        todo_items.push(ListItem::new(Line::from(vec![
+        todo_items.push(vec![Line::from(vec![
             Span::styled(
                 format!("  [{} archived — A to show]", app.pd_archived_todo_count),
                 Style::default().fg(Color::DarkGray),
             ),
-        ])));
+        ])]);
     }
 
-    let mut list_state = ListState::default();
-    list_state.select(selection);
+    // Pagination: slice the items to the window that fully fits, so footer
+    // rows are never pushed off the bottom and no space is left under a
+    // dropped multi-row item.  Leftover rows are used to peek at the next
+    // item's first line.
+    let area_height = content_area.height as usize;
+    let item_heights: Vec<usize> = todo_items.iter().map(|lines| lines.len()).collect();
+    let selection_rel = selection.map(|s| s.min(todo_items.len().saturating_sub(1)));
+    let (start, end, rows_used) = super::list_window(&item_heights, area_height, selection_rel);
 
-    let todo_list = List::new(todo_items)
+    let list_items: Vec<ListItem> = todo_items[start..end]
+        .iter()
+        .map(|lines| ListItem::new(lines.clone()))
+        .collect();
+
+    let mut list_state = ListState::default();
+    list_state.select(selection_rel.map(|s| s - start));
+
+    let todo_list = List::new(list_items)
         .highlight_style(Style::default())
         .highlight_symbol("");
 
-    frame.render_stateful_widget(todo_list, content_area, &mut list_state);
+    let list_area = Rect { height: rows_used.min(area_height) as u16, ..content_area };
+    frame.render_stateful_widget(todo_list, list_area, &mut list_state);
+
+    // Peek: fill leftover rows with the first lines of the next item.
+    let remaining_rows = area_height.saturating_sub(rows_used);
+    if remaining_rows > 0 && end < todo_items.len() {
+        let peek_area = Rect {
+            y:      content_area.y + rows_used as u16,
+            height: remaining_rows as u16,
+            ..content_area
+        };
+        let peek_lines: Vec<Line> = todo_items[end][..remaining_rows.min(todo_items[end].len())].to_vec();
+        frame.render_widget(Paragraph::new(peek_lines), peek_area);
+    }
 }
 
 // ─── Files tab─────────────────────────────────────────────────────────────────

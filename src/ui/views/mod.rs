@@ -53,6 +53,72 @@ pub fn hint_height(text: &str, width: u16) -> u16 {
     (len.div_ceil(w).max(1) as u16).min(3)
 }
 
+// ─── List pagination helper (shared by multiple list views) ──────────────────
+
+/// Compute the window of item indexes that fully fits into `area_height`
+/// rows, keeping `selected` (if any) visible.
+///
+/// ratatui's `List` scrolls by whole items: when a multi-row item would
+/// overflow the bottom it is dropped entirely, leaving a gap, and footer
+/// rows appended after the items (e.g. the "N archived" hint) can be
+/// pushed past the bottom edge.  Each view therefore slices its items to
+/// the window returned here, renders the `List` widget into exactly
+/// `rows_used` rows, and paints any leftover rows itself (peek rows).
+///
+/// Returns `(start, end, rows_used)` where `end` is exclusive and
+/// `end - start >= 1` (on very short areas the first item is force-fit
+/// and will simply be truncated).  When a selection is supplied it is
+/// guaranteed to lie inside the window.
+pub fn list_window(
+    item_heights: &[usize],
+    area_height: usize,
+    selected: Option<usize>,
+) -> (usize, usize, usize) {
+    let n = item_heights.len();
+    if n == 0 || area_height == 0 {
+        return (0, 0, 0);
+    }
+
+    // Anchor the window on the selected item so it is always on screen.
+    let mut start = selected.map(|s| s.min(n - 1)).unwrap_or(0);
+    let anchor_h = item_heights[start];
+
+    // Walk backwards from the anchor, admitting items until the anchor
+    // item no longer fits.
+    let mut rows = 0;
+    while start > 0 {
+        let h = item_heights[start - 1];
+        if rows + h + anchor_h <= area_height {
+            rows += h;
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+
+    // Admit following items while they fit fully.
+    let mut end = start;
+    let mut rows_used = 0;
+    while end < n {
+        let h = item_heights[end];
+        if rows_used + h <= area_height {
+            rows_used += h;
+            end += 1;
+        } else {
+            break;
+        }
+    }
+
+    // Edge case: even the anchor item doesn't fit — force-fit it so it is
+    // not lost entirely.
+    if rows_used == 0 {
+        rows_used = item_heights[start].min(area_height);
+        end = (start + 1).min(n);
+    }
+
+    (start, end, rows_used)
+}
+
 // ─── Text wrapping helpers (shared by multiple views) ────────────────────────
 
 /// Hard-wrap `text` at `width` characters per line.
@@ -181,7 +247,7 @@ pub fn word_wrap(text: &str, width: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{char_wrap, hint_height, word_wrap};
+    use super::{char_wrap, hint_height, list_window, word_wrap};
 
     // ── word_wrap ─────────────────────────────────────────────────────────────
 
@@ -322,5 +388,72 @@ mod tests {
     #[test]
     fn word_wrap_single_word_never_wraps() {
         assert_eq!(word_wrap("hello", 10), vec!["hello"]);
+    }
+
+    // ── list_window ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn list_window_all_items_fit() {
+        let heights = vec![1, 1, 1, 1];
+        assert_eq!(list_window(&heights, 10, None), (0, 4, 4));
+        assert_eq!(list_window(&heights, 10, Some(2)), (0, 4, 4));
+    }
+
+    #[test]
+    fn list_window_drops_item_that_does_not_fit() {
+        // Heights 1,1,5: with an area of 7 the 5-row item fits (1+1+5=7),
+        // but with an area of 6 it doesn't — it should be dropped entirely
+        // rather than leaving a gap under a partially rendered item.
+        let heights = vec![1, 1, 5];
+        assert_eq!(list_window(&heights, 7, None), (0, 3, 7));
+        assert_eq!(list_window(&heights, 6, None), (0, 2, 2));
+    }
+
+    #[test]
+    fn list_window_keeps_selected_visible() {
+        // Five single-row items in an area of 3, cursor on item 3:
+        // window must contain the selection.
+        let heights = vec![1, 1, 1, 1, 1];
+        assert_eq!(list_window(&heights, 3, Some(3)), (1, 4, 3));
+        assert_eq!(list_window(&heights, 3, Some(0)), (0, 3, 3));
+        assert_eq!(list_window(&heights, 3, Some(4)), (2, 5, 3));
+    }
+
+    #[test]
+    fn list_window_anchor_multi_row_item_not_split() {
+        // A 3-row selected item in an area of 4: it must be the window's
+        // anchor and fully visible; items above are admitted only while
+        // everything still fits.
+        let heights = vec![1, 1, 3, 1, 1];
+        let (start, end, used) = list_window(&heights, 4, Some(2));
+        assert!(start <= 2 && 3 <= end);
+        assert!((start..end).contains(&2));
+        assert_eq!(used, 4);
+    }
+
+    #[test]
+    fn list_window_tiny_area_force_fits_anchor() {
+        // Area of 2 with a 3-row selected item: the item is force-fit and
+        // will be truncated by the area height.
+        let heights = vec![3, 1];
+        assert_eq!(list_window(&heights, 2, Some(0)), (0, 1, 2));
+    }
+
+    #[test]
+    fn list_window_empty_and_degenerate_inputs() {
+        assert_eq!(list_window(&[], 5, None), (0, 0, 0));
+        assert_eq!(list_window(&[1, 1], 0, None), (0, 0, 0));
+        // Selection out of bounds is clamped to the last item.
+        assert_eq!(list_window(&[1, 1], 5, Some(99)), (0, 2, 2));
+    }
+
+    #[test]
+    fn list_window_footer_row_stays_visible() {
+        // Regression: the "N archived" footer row (last item) must remain
+        // visible when the list fills the area exactly.
+        let heights = vec![1, 1, 1, 1]; // 3 todos + 1 footer row
+        let (start, end, _used) = list_window(&heights, 4, Some(0));
+        assert_eq!(end, 4); // footer included
+        assert_eq!(start, 0);
     }
 }
