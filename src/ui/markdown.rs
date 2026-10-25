@@ -14,9 +14,11 @@
 //!   blocks and rules inside a blockquote keep the bar)
 //! • Unordered lists  (• bullet, indented per nesting level)
 //! • Ordered lists    (1. 2. …, indented per nesting level)
-//! • Tables           (box-drawing borders, auto column widths; repeat the
-//!                    delimiter row between data rows to draw a lighter
-//!                    horizontal divider between those rows)
+//! • Tables           (box-drawing borders between *every* row, auto column
+//!                    widths; cells may contain inline styles, and `<br>`-
+//!                    separated cell lines may start with `#`, `>`, `-`/`*`/
+//!                    `+`, `1.`, a `---` rule or a ``` fence to get the
+//!                    corresponding block formatting inside the cell)
 //! • Horizontal rules (─── separator line)
 
 use pulldown_cmark::{Alignment, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
@@ -83,6 +85,43 @@ struct ListCtx {
     next_num: u64,
 }
 
+// ─── Table cell model ─────────────────────────────────────────────────────────
+
+/// A run of identically-styled text inside a table cell.
+#[derive(Clone, Debug, PartialEq)]
+struct CellRun {
+    text:  String,
+    style: Style,
+}
+
+/// One logical line inside a table cell, before wrapping to the column width.
+///
+/// `first_pfx` is placed in front of the first display line of the cell line,
+/// `cont_pfx` in front of every wrapped continuation line.  They carry the
+/// block-level decoration (`• `, `1. `, `│ `, `┃ `) and are already styled.
+#[derive(Clone, Debug, Default)]
+struct CellLine {
+    first_pfx: Vec<CellRun>,
+    cont_pfx:  Vec<CellRun>,
+    runs:      Vec<CellRun>,
+    /// Pre-formatted content: preserve whitespace and char-wrap instead of
+    /// word-wrapping (used inside `<pre>…</pre>` and `~~~` fences).
+    pre:       bool,
+    /// A horizontal rule that fills the cell width.
+    rule:      bool,
+}
+
+/// A raw logical line of a table cell, exactly as it came out of the event
+/// stream (one `<br>`-separated chunk).
+#[derive(Clone, Debug, Default)]
+struct RawCellLine {
+    runs: Vec<CellRun>,
+    pre:  bool,
+}
+
+/// A table cell: a sequence of logical lines.
+type Cell = Vec<CellLine>;
+
 // ─── Renderer state ───────────────────────────────────────────────────────────
 
 struct Ctx {
@@ -132,13 +171,23 @@ struct Ctx {
     in_table:             bool,
     in_table_cell:        bool,
     table_alignments:     Vec<Alignment>,
-    table_head_rows:      Vec<Vec<String>>,
-    table_body_rows:      Vec<Vec<String>>,
-    /// Parallel to `table_body_rows`; `true` means draw a mid-gray horizontal
-    /// rule after that row (triggered by a repeated delimiter row in the source).
-    table_body_sep_after: Vec<bool>,
-    current_row:          Vec<String>,
-    current_cell:         String,
+    table_head_rows:      Vec<Vec<Cell>>,
+    table_body_rows:      Vec<Vec<Cell>>,
+    current_row:          Vec<Cell>,
+    /// Logical lines of the cell currently being parsed (raw, before block
+    /// markers such as `#`, `>`, `- ` or ``` ``` ``` are interpreted).
+    cell_lines:           Vec<RawCellLine>,
+    /// The logical line of the current cell that is still being built.
+    cell_line:            Vec<CellRun>,
+    /// Nesting depth of `<pre>…</pre>` inside the current cell.
+    cell_pre:             usize,
+    /// Whether the current cell line started inside a `<pre>` block.
+    cell_line_pre:        bool,
+    // HTML inline-style toggles inside table cells (`<b>`, `<i>`, `<code>`, …).
+    cell_html_bold:       bool,
+    cell_html_italic:     bool,
+    cell_html_strike:     bool,
+    cell_html_code:       bool,
 
     // Pre-computed styles.
     h1_style:             Style,
@@ -150,8 +199,6 @@ struct Ctx {
     rule_style:           Style,
     table_border_style:   Style,
     table_head_style:     Style,
-    /// Lighter gray for optional horizontal lines between body rows.
-    table_body_sep_style: Style,
     width: usize,
 }
 
@@ -182,9 +229,15 @@ impl Ctx {
             table_alignments:     vec![],
             table_head_rows:      vec![],
             table_body_rows:      vec![],
-            table_body_sep_after: vec![],
             current_row:          vec![],
-            current_cell:         String::new(),
+            cell_lines:           vec![],
+            cell_line:            vec![],
+            cell_pre:             0,
+            cell_line_pre:        false,
+            cell_html_bold:       false,
+            cell_html_italic:     false,
+            cell_html_strike:     false,
+            cell_html_code:       false,
             // Heading colours: 20 navy → 26 cobalt → 62 slate → bold (no colour)
             h1_style:      Style::default().fg(Color::Indexed(20)).add_modifier(Modifier::BOLD),
             h2_style:      Style::default().fg(Color::Indexed(26)).add_modifier(Modifier::BOLD),
@@ -198,8 +251,6 @@ impl Ctx {
             rule_style:         Style::default().fg(Color::DarkGray),
             table_border_style:   Style::default().fg(Color::DarkGray),
             table_head_style:     Style::default().add_modifier(Modifier::BOLD),
-            // Body-row separator: mid-gray, visually lighter than the dark-gray border.
-            table_body_sep_style: Style::default().fg(Color::Indexed(244)),
             // Reserve 1 column on the right so text never touches the border.
             width: width.saturating_sub(1).max(1),
         }
@@ -272,10 +323,9 @@ impl Ctx {
 
     fn render_table(&mut self) {
         // Take ownership so we can push to self.output while iterating.
-        let head_rows      = std::mem::take(&mut self.table_head_rows);
-        let body_rows      = std::mem::take(&mut self.table_body_rows);
-        let alignments     = std::mem::take(&mut self.table_alignments);
-        let body_sep_after = std::mem::take(&mut self.table_body_sep_after);
+        let head_rows  = std::mem::take(&mut self.table_head_rows);
+        let body_rows  = std::mem::take(&mut self.table_body_rows);
+        let alignments = std::mem::take(&mut self.table_alignments);
 
         let indent = "  ";
 
@@ -285,14 +335,16 @@ impl Ctx {
             .unwrap_or(0);
         if col_count == 0 { return; }
 
-        // Per-column minimum width = longest whitespace-delimited token in any
-        // cell.  A column scaled below this value will char-wrap at least one
-        // word; we use it as a floor during proportional shrinking.
+        // Per-column minimum width = the widest word (or, for pre-formatted
+        // lines, the widest unbreakable chunk) in any cell of that column.
+        // A column scaled below this value will have to break at least one
+        // word, so it acts as a floor during proportional shrinking.
         let max_word_w: Vec<usize> = (0..col_count).map(|ci| {
             head_rows.iter().chain(body_rows.iter())
                 .filter_map(|row| row.get(ci))
-                .flat_map(|cell| cell.split_whitespace())
-                .map(|w| display_width(w))
+                .flat_map(|cell| cell.iter())
+                .flat_map(cell_line_chunks)
+                .map(|chunk| display_width(&chunk))
                 .max()
                 .unwrap_or(1)
                 .max(1)
@@ -303,7 +355,7 @@ impl Ctx {
         for row in head_rows.iter().chain(body_rows.iter()) {
             for (i, cell) in row.iter().enumerate() {
                 if i < col_count {
-                    col_w[i] = col_w[i].max(display_width(cell));
+                    col_w[i] = col_w[i].max(natural_cell_width(cell));
                 }
             }
         }
@@ -316,7 +368,7 @@ impl Ctx {
 
             if sum_min >= avail {
                 // Even at per-word floors the table overflows; scale
-                // proportionally from the floors, accepting char-wrapping.
+                // proportionally from the floors, accepting word breaks.
                 for (i, w) in col_w.iter_mut().enumerate() {
                     let mw = max_word_w[i];
                     *w = if sum_min == 0 { 1 }
@@ -325,7 +377,7 @@ impl Ctx {
             } else {
                 // Give every column its per-word floor first, then distribute
                 // the remaining budget proportionally to each column's natural
-                // slack (natural_width − floor).  This prevents char-wrapping
+                // slack (natural_width − floor).  This prevents word breaks
                 // while still filling as much of the available width as possible.
                 let sum_slack: usize = col_w.iter().enumerate()
                     .map(|(i, &nw)| nw.saturating_sub(max_word_w[i]))
@@ -355,27 +407,27 @@ impl Ctx {
         let mid = make_rule('├', '┼', '┤');
         let bot = make_rule('└', '┴', '┘');
 
-        let bdr_s      = self.table_border_style;
-        let head_s     = self.table_head_style;
-        let body_sep_s = self.table_body_sep_style;
-        let head_count = head_rows.len();
+        let bdr_s = self.table_border_style;
+        let head_s = self.table_head_style;
 
         self.output.push(Line::from(Span::styled(top, bdr_s)));
 
-        let all_rows: Vec<(Vec<String>, bool)> = head_rows.into_iter().map(|r| (r, true))
+        let all_rows: Vec<(Vec<Cell>, bool)> = head_rows.into_iter().map(|r| (r, true))
             .chain(body_rows.into_iter().map(|r| (r, false)))
             .collect();
 
         for (row_idx, (row, is_head)) in all_rows.iter().enumerate() {
-            let cell_s = if *is_head { head_s } else { Style::default() };
+            // A header row gets the bold base style patched under every cell
+            // run, so bold/italic/code inside a header cell compose with it.
+            let cell_base = if *is_head { head_s } else { Style::default() };
 
-            // Word-wrap each cell to its column width.
-            let wrapped: Vec<Vec<String>> = col_w.iter().enumerate().map(|(ci, &w)| {
-                let text = row.get(ci).map(String::as_str).unwrap_or("");
-                word_wrap_cell(text, w)
+            // Lay each cell out to its column width.
+            let laid_out: Vec<Vec<Vec<Span<'static>>>> = col_w.iter().enumerate().map(|(ci, &w)| {
+                let cell = row.get(ci);
+                layout_cell(cell, w, cell_base, self.rule_style)
             }).collect();
 
-            let row_height = wrapped.iter().map(|v| v.len()).max().unwrap_or(1);
+            let row_height = laid_out.iter().map(Vec::len).max().unwrap_or(1);
 
             for line_idx in 0..row_height {
                 let mut spans: Vec<Span<'static>> = vec![
@@ -383,59 +435,198 @@ impl Ctx {
                     Span::styled("│".to_string(), bdr_s),
                 ];
                 for (ci, &w) in col_w.iter().enumerate() {
-                    let text = wrapped[ci].get(line_idx).map(String::as_str).unwrap_or("");
-                    let tlen = display_width(text);
-                    let pad = w.saturating_sub(tlen);
-                    let cell_str = match alignments.get(ci).copied().unwrap_or(Alignment::None) {
-                        Alignment::Right => format!(" {}{} ", " ".repeat(pad), text),
-                        Alignment::Center => {
-                            let lpad = pad / 2;
-                            let rpad = pad - lpad;
-                            format!(" {}{}{} ", " ".repeat(lpad), text, " ".repeat(rpad))
-                        }
-                        _ => format!(" {}{} ", text, " ".repeat(pad)),
+                    let cell_spans = laid_out[ci].get(line_idx);
+                    let align = alignments.get(ci).copied().unwrap_or(Alignment::None);
+
+                    // One space of padding on each side, plus any slack needed
+                    // to satisfy the column alignment.
+                    let content_w = cell_spans
+                        .map(|s| s.iter().map(|sp| display_width(sp.content.as_ref())).sum::<usize>())
+                        .unwrap_or(0);
+                    let pad = w.saturating_sub(content_w);
+                    let (lpad, rpad) = match align {
+                        Alignment::Right  => (pad, 0),
+                        Alignment::Center => (pad / 2, pad - pad / 2),
+                        _                 => (0, pad),
                     };
-                    spans.push(Span::styled(cell_str, cell_s));
+
+                    spans.push(Span::raw(" ".repeat(lpad + 1)));
+                    if let Some(cell_spans) = cell_spans {
+                        spans.extend(cell_spans.iter().cloned());
+                    }
+                    spans.push(Span::raw(" ".repeat(rpad + 1)));
                     spans.push(Span::styled("│".to_string(), bdr_s));
                 }
                 self.output.push(Line::from(spans));
             }
 
-            // Separator lines between sections.
-            let is_last_row = row_idx + 1 == all_rows.len();
-            if *is_head && row_idx + 1 == head_count && !is_last_row {
-                // Header/body divider — dark gray, same weight as the border.
+            // Every row is followed by a rule in the border colour — except
+            // the last one, which is closed by the bottom border.
+            if row_idx + 1 < all_rows.len() {
                 self.output.push(Line::from(Span::styled(mid.clone(), bdr_s)));
-            } else if !*is_head && !is_last_row {
-                // Optional body-row divider — mid-gray, lighter than the border.
-                let body_idx = row_idx.saturating_sub(head_count);
-                if body_sep_after.get(body_idx).copied().unwrap_or(false) {
-                    self.output.push(Line::from(Span::styled(mid.clone(), body_sep_s)));
-                }
             }
         }
 
         self.output.push(Line::from(Span::styled(bot, bdr_s)));
     }
 
+    // ── Table cell parsing ────────────────────────────────────────────────────
+
+    /// Combined style for a run of text inside a table cell: the Markdown
+    /// inline toggles (Strong / Emphasis / Strikethrough) merged with the
+    /// HTML-style toggles (`<b>`, `<i>`, `<s>`, `<code>`).
+    fn cell_style(&self) -> Style {
+        let mut s = Style::default();
+        if self.bold || self.cell_html_bold {
+            s = s.add_modifier(Modifier::BOLD);
+        }
+        if self.italic || self.cell_html_italic {
+            s = s.add_modifier(Modifier::ITALIC);
+        }
+        if self.strikethrough || self.cell_html_strike {
+            s = s.add_modifier(Modifier::CROSSED_OUT);
+        }
+        if self.cell_html_code {
+            s = s.patch(self.code_style);
+        }
+        s
+    }
+
+    /// Append `text` to the cell line currently being built.
+    fn cell_push(&mut self, text: &str) {
+        if text.is_empty() { return; }
+        let style = self.cell_style();
+        self.cell_line.push(CellRun { text: text.to_string(), style });
+    }
+
+    /// Start a new logical line inside the current cell (a `<br>`).
+    fn cell_break(&mut self) {
+        let pre = self.cell_line_pre || self.cell_pre > 0;
+        let runs = std::mem::take(&mut self.cell_line);
+        self.cell_lines.push(RawCellLine { runs, pre });
+        self.cell_line_pre = self.cell_pre > 0;
+    }
+
+    /// Unfold a code span that pulldown-cmark produced from a ``` fence
+    /// inside a table cell into pre-formatted lines.  The span text looks
+    /// like `<br>  x = 1<br>  y = 2<br>`.
+    fn cell_code_block(&mut self, code: &str) {
+        let style = self.code_style;
+        // The span wraps the content in <br> markers: "<br>  x = 1<br>".
+        // Leading/trailing empty pieces are artifacts of the fences, so drop
+        // them rather than rendering blank lines at the top and bottom.
+        let pieces: Vec<&str> = code.split("<br>").collect();
+        let start = pieces.iter().position(|p| !p.trim().is_empty()).unwrap_or(pieces.len());
+        let end   = pieces.iter().rposition(|p| !p.trim().is_empty()).map_or(start, |i| i + 1);
+
+        for (i, piece) in pieces[start..end].iter().enumerate() {
+            if i > 0 {
+                self.cell_break();
+            }
+            self.cell_line_pre = true;
+            self.cell_line.push(CellRun { text: (*piece).to_string(), style });
+        }
+    }
+
+    /// Handle an inline HTML tag inside a table cell.
+    ///
+    /// `pulldown-cmark` does not parse HTML inside table cells, so the tags
+    /// arrive verbatim.  We support the ones that are useful in a table:
+    /// `<br>` (a line break) and the style tags `<b>`/`<strong>`,
+    /// `<i>`/`<em>`, `<s>`/`<del>`, `<code>`, `<pre>`, plus their closers.
+    /// Any other tag is dropped.
+    fn cell_inline_html(&mut self, tag: &str) {
+        let t = tag.trim();
+        let (closing, name) = match t.strip_prefix("</") {
+            Some(rest) => (true, rest),
+            None => (false, t.strip_prefix('<').unwrap_or(t)),
+        };
+        let name: String = name
+            .trim_end_matches('>')
+            .trim_end_matches('/')
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        match name.as_str() {
+            "br" => self.cell_break(),
+            "b" | "strong" => self.cell_html_bold = !closing,
+            "i" | "em" => self.cell_html_italic = !closing,
+            "s" | "del" | "strike" => self.cell_html_strike = !closing,
+            "code" => self.cell_html_code = !closing,
+            "pre" => {
+                if closing {
+                    self.cell_pre = self.cell_pre.saturating_sub(1);
+                } else {
+                    self.cell_pre += 1;
+                    // Content after `<pre>` starts a fresh pre-formatted line.
+                    self.cell_line_pre = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Finish the current cell: split its raw lines on block markers, compute
+    /// list numbering, and stash the result in `current_row`.
+    fn cell_finish(&mut self) {
+        // Flush a trailing partial line.
+        let pre = self.cell_line_pre || self.cell_pre > 0;
+        let runs = std::mem::take(&mut self.cell_line);
+        self.cell_lines.push(RawCellLine { runs, pre });
+        self.cell_line_pre = false;
+
+        let raw = std::mem::take(&mut self.cell_lines);
+        let cell = build_cell(&raw, self.blockquote_style);
+        self.current_row.push(cell);
+    }
+
     // ── Event handler ─────────────────────────────────────────────────────────
 
     #[allow(clippy::match_same_arms)]
     fn push(&mut self, event: Event<'_>) {
-        // While inside a table cell, only text-producing events are collected;
-        // structural and inline-style events are routed to the main match below.
+        // While inside a table cell, inline events are collected into the
+        // cell's run list; only structural events (cell/row/table ends) fall
+        // through to the main match below.
         if self.in_table_cell {
             match &event {
-                Event::Text(s)                     => { self.current_cell.push_str(s); return; }
-                Event::Code(s)                     => { self.current_cell.push_str(s); return; }
-                Event::SoftBreak | Event::HardBreak => { self.current_cell.push(' '); return; }
-                // Suppress inline-style markers inside cells (plain text only).
-                Event::Start(Tag::Strong)
-                | Event::End(TagEnd::Strong)
-                | Event::Start(Tag::Emphasis)
-                | Event::End(TagEnd::Emphasis)
-                | Event::Start(Tag::Strikethrough)
-                | Event::End(TagEnd::Strikethrough) => { return; }
+                Event::Text(s) => {
+                    self.cell_push(s);
+                    return;
+                }
+                Event::Code(s) => {
+                    // pulldown-cmark parses a ```-fenced cell block as a code
+                    // span whose text still contains the literal `<br>` tags.
+                    // Unfold it into pre-formatted lines so a fence works
+                    // inside a table cell.
+                    if s.contains("<br>") || s.contains("<br/>") {
+                        self.cell_code_block(s);
+                    } else {
+                        // Inline code keeps its backticks, as in body text.
+                        let style = self.cell_style().patch(self.code_style);
+                        self.cell_line.push(CellRun { text: format!("`{}`", s), style });
+                    }
+                    return;
+                }
+                Event::InlineHtml(s) => {
+                    self.cell_inline_html(s);
+                    return;
+                }
+                Event::SoftBreak | Event::HardBreak => {
+                    self.cell_push(" ");
+                    return;
+                }
+                // Inline-style markers toggle the shared flags; `cell_style`
+                // merges them with the HTML-style flags.
+                Event::Start(Tag::Strong)         => { self.bold = true;          return; }
+                Event::End(TagEnd::Strong)        => { self.bold = false;         return; }
+                Event::Start(Tag::Emphasis)       => { self.italic = true;        return; }
+                Event::End(TagEnd::Emphasis)      => { self.italic = false;       return; }
+                Event::Start(Tag::Strikethrough)  => { self.strikethrough = true; return; }
+                Event::End(TagEnd::Strikethrough) => { self.strikethrough = false; return; }
+                Event::Start(Tag::Link { .. }) | Event::End(TagEnd::Link)     => { return; }
+                Event::Start(Tag::Image { .. }) | Event::End(TagEnd::Image)   => { return; }
                 _ => {} // structural events fall through
             }
         }
@@ -623,9 +814,15 @@ impl Ctx {
                 self.table_alignments = alignments.to_vec();
                 self.table_head_rows.clear();
                 self.table_body_rows.clear();
-                self.table_body_sep_after.clear();
                 self.current_row.clear();
-                self.current_cell.clear();
+                self.cell_lines.clear();
+                self.cell_line.clear();
+                self.cell_pre = 0;
+                self.cell_line_pre = false;
+                self.cell_html_bold = false;
+                self.cell_html_italic = false;
+                self.cell_html_strike = false;
+                self.cell_html_code = false;
             }
             Event::End(TagEnd::Table) => {
                 self.in_table = false;
@@ -643,26 +840,22 @@ impl Ctx {
             Event::Start(Tag::TableRow)   => { self.current_row.clear(); }
             Event::End(TagEnd::TableRow)  => {
                 let row = std::mem::take(&mut self.current_row);
-                if is_separator_row(&row) {
-                    // The user repeated the delimiter row between data rows:
-                    // mark the most-recently-added body row as needing a
-                    // horizontal divider drawn after it.
-                    if let Some(flag) = self.table_body_sep_after.last_mut() {
-                        *flag = true;
-                    }
-                } else {
-                    self.table_body_rows.push(row);
-                    self.table_body_sep_after.push(false);
-                }
+                self.table_body_rows.push(row);
             }
             Event::Start(Tag::TableCell)  => {
-                self.current_cell.clear();
+                self.cell_lines.clear();
+                self.cell_line.clear();
+                self.cell_pre = 0;
+                self.cell_line_pre = false;
+                self.cell_html_bold = false;
+                self.cell_html_italic = false;
+                self.cell_html_strike = false;
+                self.cell_html_code = false;
                 self.in_table_cell = true;
             }
             Event::End(TagEnd::TableCell) => {
                 self.in_table_cell = false;
-                let cell = std::mem::take(&mut self.current_cell);
-                self.current_row.push(cell);
+                self.cell_finish();
             }
 
             // ── Horizontal rule ──────────────────────────────────────────────
@@ -846,73 +1039,487 @@ fn reflow(
     lines
 }
 
-// ─── Table helpers ───────────────────────────────────────────────────────────────────────
+// ─── Table cell helpers ─────────────────────────────────────────────────────
 
-/// Returns `true` when every cell in `row` looks like a Markdown table
-/// delimiter cell (e.g. `--`, `---`, `:--:`, `---:`).  Used to detect
-/// when the user has repeated the delimiter row between data rows to
-/// request an optional horizontal divider.
-fn is_separator_row(row: &[String]) -> bool {
-    !row.is_empty()
-        && row.iter().all(|cell| {
-            let c = cell.trim();
-            !c.is_empty() && c.contains('-') && c.bytes().all(|b| b == b'-' || b == b':')
-        })
+/// Style of a heading of the given level, mirroring the body-text headings.
+fn heading_style(level: u8) -> Style {
+    let colour = match level {
+        1 => Color::Indexed(20),
+        2 => Color::Indexed(26),
+        3 => Color::Indexed(62),
+        _ => return Style::default().add_modifier(Modifier::BOLD),
+    };
+    Style::default().fg(colour).add_modifier(Modifier::BOLD)
 }
 
-// ─── Table cell word-wrapper ────────────────────────────────────────────────
+/// Patch `base` underneath every run's own style, so a block-level style
+/// (heading colour, quote grey) carries through while inline styles still win.
+fn restyle(runs: &[CellRun], base: Style) -> Vec<CellRun> {
+    runs.iter()
+        .map(|r| CellRun { text: r.text.clone(), style: base.patch(r.style) })
+        .collect()
+}
+
+/// Strip `runs` down to their concatenated plain text.
+fn runs_text(runs: &[CellRun]) -> String {
+    runs.iter().map(|r| r.text.as_str()).collect()
+}
+
+/// Split `runs` into styled chunks at every whitespace boundary.
+///
+/// Each returned `(chunk, style)` pair is a candidate word for reflow.  The
+/// separating whitespace is *not* included in any chunk, but the caller can
+/// tell whether whitespace preceded a chunk from its position.  Because a
+/// word may straddle several runs (`**bo**ld`), adjacent runs without an
+/// intervening space are merged into one chunk carrying the first run's
+/// style.
+fn runs_words(runs: &[CellRun]) -> Vec<(String, Style)> {
+    let mut out: Vec<(String, Style)> = vec![];
+    let mut cur = String::new();
+    let mut cur_style = Style::default();
+    let mut have = false;
+
+    for run in runs {
+        for ch in run.text.chars() {
+            if ch.is_whitespace() {
+                if have {
+                    out.push((std::mem::take(&mut cur), cur_style));
+                    have = false;
+                }
+            } else {
+                if !have {
+                    cur_style = run.style;
+                    have = true;
+                }
+                cur.push(ch);
+            }
+        }
+    }
+    if have {
+        out.push((cur, cur_style));
+    }
+    out
+}
+
+/// The unbreakable chunks of a cell line, used to compute a column's minimum
+/// width.  For pre-formatted lines the chunks are whole (whitespace-included)
+/// segments between double spaces, since leading indentation must survive.
+fn cell_line_chunks(line: &CellLine) -> Vec<String> {
+    let text = runs_text(&line.runs);
+    if line.pre {
+        // Pre-formatted: only break at runs of 2+ spaces, keeping indentation.
+        text.split("  ")
+            .map(str::to_string)
+            .filter(|s| !s.is_empty())
+            .collect()
+    } else {
+        text.split_whitespace().map(str::to_string).collect()
+    }
+}
+
+/// Natural (unwrapped) width of a cell: the widest of its logical lines,
+/// including the width of the line's prefix.
+fn natural_cell_width(cell: &Cell) -> usize {
+    cell.iter()
+        .map(|line| {
+            let pfx = display_width(&runs_text(&line.first_pfx));
+            let body = if line.rule {
+                1
+            } else {
+                display_width(&runs_text(&line.runs))
+            };
+            pfx + body
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+// ─── Table cell block parsing ───────────────────────────────────────────────
+
+/// How a raw cell line is interpreted.
+enum CellBlock {
+    /// Plain paragraph text (default).
+    Text,
+    /// `# …`, `## …` … — heading of the given level.
+    Heading(u8),
+    /// `> …` — blockquote, possibly nested (`>> …`).
+    Quote(usize),
+    /// `- …` / `* …` / `+ …` — unordered list item at the given depth.
+    Bullet(usize),
+    /// `1. …` — ordered list item.
+    Ordered(u64, usize),
+    /// `---` — a horizontal rule spanning the cell.
+    Rule,
+    /// A ``` / ~~~ fence delimiter.
+    Fence,
+}
+
+/// Recognise a leading block marker in `text`, returning the block kind and
+/// the remaining content (already trimmed of the marker's trailing space).
+fn parse_block_marker(text: &str) -> (CellBlock, &str) {
+    let trimmed = text.trim_start();
+    let indent  = (text.len() - trimmed.len()) / 2; // 2 spaces ≈ 1 nesting level
+
+    // Horizontal rule.
+    let compact: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact.len() >= 3
+        && compact.chars().all(|c| c == '-')
+    {
+        return (CellBlock::Rule, "");
+    }
+
+    // Fences.
+    if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+        return (CellBlock::Fence, "");
+    }
+
+    // Blockquote (nested bars).
+    let mut bars = 0;
+    let mut rest = trimmed;
+    while let Some(r) = rest.strip_prefix('>') {
+        bars += 1;
+        rest = r.strip_prefix(' ').unwrap_or(r);
+    }
+    if bars > 0 {
+        return (CellBlock::Quote(bars + indent), rest);
+    }
+
+    // Heading.
+    let hashes = trimmed.chars().take_while(|c| *c == '#').count();
+    if (1..=6).contains(&hashes) {
+        let after = &trimmed[hashes..];
+        if after.is_empty() || after.starts_with(' ') {
+            return (CellBlock::Heading(hashes as u8), after.trim_start());
+        }
+    }
+
+    // Unordered list item.
+    for marker in ["- ", "* ", "+ "] {
+        if let Some(rest) = trimmed.strip_prefix(marker) {
+            return (CellBlock::Bullet(indent + 1), rest);
+        }
+    }
+
+    // Ordered list item.
+    let digits = trimmed.chars().take_while(char::is_ascii_digit).count();
+    if digits > 0 {
+        if let Some(rest) = trimmed[digits..].strip_prefix(". ") {
+            if let Ok(n) = trimmed[..digits].parse::<u64>() {
+                return (CellBlock::Ordered(n, indent + 1), rest);
+            }
+        }
+    }
+
+    (CellBlock::Text, text)
+}
+
+/// Turn the raw `<br>`-separated lines of a cell into laid-out [`CellLine`]s,
+/// interpreting block markers and tracking ordered-list numbering.
+fn build_cell(raw: &[RawCellLine], quote_style: Style) -> Cell {
+    let mut out: Vec<CellLine> = vec![];
+    // Next number for each ordered-list nesting depth.
+    let mut counters: Vec<u64> = vec![];
+    // Whether we are inside a ``` fence.
+    let mut in_fence = false;
+
+    for raw_line in raw {
+        let text = runs_text(&raw_line.runs);
+
+        // Inside a fence: emit verbatim pre-formatted lines until the closing
+        // fence, without interpreting any block marker.
+        if in_fence {
+            if text.trim_start().starts_with("```") || text.trim_start().starts_with("~~~") {
+                in_fence = false;
+                continue;
+            }
+            out.push(CellLine {
+                first_pfx: vec![],
+                cont_pfx:  vec![],
+                runs:      raw_line.runs.clone(),
+                pre:       true,
+                rule:      false,
+            });
+            continue;
+        }
+
+        // Lines that were inside `<pre>…</pre>` are already pre-formatted.
+        if raw_line.pre {
+            out.push(CellLine {
+                first_pfx: vec![],
+                cont_pfx:  vec![],
+                runs:      raw_line.runs.clone(),
+                pre:       true,
+                rule:      false,
+            });
+            continue;
+        }
+
+        let (block, rest) = parse_block_marker(&text);
+
+        match block {
+            CellBlock::Fence => { in_fence = true; }
+
+            CellBlock::Rule => out.push(CellLine {
+                first_pfx: vec![],
+                cont_pfx:  vec![],
+                runs:      vec![],
+                pre:       false,
+                rule:      true,
+            }),
+
+            CellBlock::Heading(level) => {
+                counters.clear();
+                let h_style = heading_style(level);
+                let pfx = vec![CellRun { text: format!("{} ", "#".repeat(level as usize)), style: h_style }];
+                out.push(CellLine {
+                    first_pfx: pfx.clone(),
+                    cont_pfx:  pfx,
+                    runs:      restyle(&slice_runs_after(&raw_line.runs, &text, rest), h_style),
+                    pre:       false,
+                    rule:      false,
+                });
+            }
+
+            CellBlock::Quote(depth) => {
+                counters.clear();
+                let pfx = vec![CellRun { text: format!("{} ", "│".repeat(depth)), style: quote_style }];
+                out.push(CellLine {
+                    first_pfx: pfx.clone(),
+                    cont_pfx:  pfx,
+                    runs:      restyle(&slice_runs_after(&raw_line.runs, &text, rest), quote_style),
+                    pre:       false,
+                    rule:      false,
+                });
+            }
+
+            CellBlock::Bullet(depth) => {
+                // A bullet ends any ordered list nested at or below its depth.
+                counters.truncate(depth.saturating_sub(1).min(counters.len()));
+                let indent = "  ".repeat(depth.saturating_sub(1));
+                let pfx = vec![CellRun { text: format!("{indent}• "), style: Style::default() }];
+                out.push(CellLine {
+                    first_pfx: pfx,
+                    cont_pfx:  vec![CellRun { text: format!("{indent}  "), style: Style::default() }],
+                    runs:      slice_runs_after(&raw_line.runs, &text, rest),
+                    pre:       false,
+                    rule:      false,
+                });
+            }
+
+            CellBlock::Ordered(n, depth) => {
+                // `counters[d]` is the number of the most recent ordered item
+                // at depth `d + 1`.  An item at a depth we have not seen yet
+                // *starts* a list there, so honour the number the author wrote;
+                // otherwise continue counting from the previous item, which
+                // makes `1.` / `1.` / `1.` render as 1, 2, 3.
+                let num = if counters.len() >= depth {
+                    // Deeper lists have ended.
+                    counters.truncate(depth);
+                    counters[depth - 1] += 1;
+                    counters[depth - 1]
+                } else {
+                    while counters.len() < depth - 1 { counters.push(1); }
+                    counters.push(n);
+                    n
+                };
+                let indent = "  ".repeat(depth.saturating_sub(1));
+                let bullet = format!("{indent}{num}. ");
+                out.push(CellLine {
+                    first_pfx: vec![CellRun { text: bullet.clone(), style: Style::default() }],
+                    cont_pfx:  vec![CellRun { text: " ".repeat(bullet.len()), style: Style::default() }],
+                    runs:      slice_runs_after(&raw_line.runs, &text, rest),
+                    pre:       false,
+                    rule:      false,
+                });
+            }
+
+            CellBlock::Text => {
+                counters.clear();
+                out.push(CellLine {
+                    first_pfx: vec![],
+                    cont_pfx:  vec![],
+                    runs:      raw_line.runs.clone(),
+                    pre:       false,
+                    rule:      false,
+                });
+            }
+        }
+    }
+
+    out
+}
+
+/// Return the runs of `runs` with the first `skip` visible characters
+/// removed, so block markers can be stripped without losing inline styling.
+fn slice_runs_after(runs: &[CellRun], full: &str, rest: &str) -> Vec<CellRun> {
+    // Number of characters the marker consumed.  Counting in `char`s (not
+    // bytes) keeps this correct for non-ASCII cell content.
+    let consumed = full.chars().count().saturating_sub(rest.chars().count());
+    if consumed == 0 {
+        return runs.to_vec();
+    }
+    let mut remaining = consumed;
+    let mut out = vec![];
+    for run in runs {
+        let n = run.text.chars().count();
+        if remaining >= n {
+            remaining -= n;
+            continue;
+        }
+        let kept: String = run.text.chars().skip(remaining).collect();
+        remaining = 0;
+        if !kept.is_empty() {
+            out.push(CellRun { text: kept, style: run.style });
+        }
+    }
+    out
+}
+
+// ─── Table cell layout ──────────────────────────────────────────────────────
 
 /// Word-wrap `text` into lines of at most `width` visible characters,
 /// breaking on whitespace boundaries.  Words longer than `width` are
 /// hard-wrapped character by character.  Always returns at least one element.
+///
+/// This is the plain-text entry point into the cell layout machinery; the
+/// renderer itself works on styled [`CellLine`]s, so this wrapper exists only
+/// to keep the wrapping behaviour directly testable.
+#[cfg(test)]
 fn word_wrap_cell(text: &str, width: usize) -> Vec<String> {
-    if width == 0 || text.is_empty() {
-        return vec![String::new()];
+    let line = CellLine {
+        first_pfx: vec![],
+        cont_pfx:  vec![],
+        runs:      vec![CellRun { text: text.to_string(), style: Style::default() }],
+        pre:       false,
+        rule:      false,
+    };
+    let laid_out = wrap_cell_line(&line, width.max(1), Style::default(), Style::default());
+    let mut out: Vec<String> = laid_out
+        .iter()
+        .map(|spans| spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect();
+    // Trim trailing padding introduced by wrapping, and guarantee the
+    // "at least one element" contract for empty input.
+    while out.len() > 1 && out.last().is_some_and(|s| s.trim().is_empty()) {
+        out.pop();
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+/// Wrap one cell's runs into lines of at most `width` columns, prefixing the
+/// first line with `first_pfx` and continuations with `cont_pfx`.
+fn wrap_cell_line(
+    line:   &CellLine,
+    width:  usize,
+    base:   Style,
+    rule_s: Style,
+) -> Vec<Vec<Span<'static>>> {
+    let mut out: Vec<Vec<Span<'static>>> = vec![];
+
+    if line.rule {
+        out.push(vec![Span::styled("─".repeat(width), rule_s)]);
+        return out;
     }
 
-    let mut lines: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut cur_w: usize = 0;
+    let first_pfx_w = display_width(&runs_text(&line.first_pfx));
+    let cont_pfx_w  = display_width(&runs_text(&line.cont_pfx));
 
-    for word in text.split_whitespace() {
-        let wlen = display_width(word);
+    // Prefix runs, with `base` patched underneath.
+    let emit_pfx = |pfx: &[CellRun]| -> Vec<Span<'static>> {
+        pfx.iter()
+            .map(|r| Span::styled(r.text.clone(), base.patch(r.style)))
+            .collect()
+    };
 
-        if cur_w > 0 {
-            if cur_w + 1 + wlen <= width {
-                // Word fits on the current line (with a separating space).
-                current.push(' ');
-                current.push_str(word);
-                cur_w += 1 + wlen;
-                continue;
+    let mut spans = emit_pfx(&line.first_pfx);
+    let mut cur_w = first_pfx_w;
+    let mut words_on_line = 0usize;
+
+    if line.pre {
+        // Pre-formatted: preserve whitespace; char-wrap at the column edge.
+        for run in &line.runs {
+            let mut chunk = String::new();
+            for ch in run.text.chars() {
+                let cw = char_display_width(ch);
+                if cur_w + cw > width && cur_w > 0 {
+                    if !chunk.is_empty() {
+                        spans.push(Span::styled(std::mem::take(&mut chunk), base.patch(run.style)));
+                    }
+                    out.push(std::mem::take(&mut spans));
+                    spans = emit_pfx(&line.cont_pfx);
+                    cur_w = cont_pfx_w;
+                }
+                chunk.push(ch);
+                cur_w += cw;
             }
-            // Word doesn't fit: flush the current line and start a new one.
-            lines.push(std::mem::take(&mut current));
-            cur_w = 0;
+            if !chunk.is_empty() {
+                spans.push(Span::styled(chunk, base.patch(run.style)));
+            }
+        }
+        out.push(spans);
+        return out;
+    }
+
+    let words = runs_words(&line.runs);
+    for (word, style) in words {
+        let ww = display_width(&word);
+        let space = usize::from(words_on_line > 0);
+
+        if words_on_line > 0 && cur_w + space + ww > width {
+            out.push(std::mem::take(&mut spans));
+            spans = emit_pfx(&line.cont_pfx);
+            cur_w = cont_pfx_w;
+            words_on_line = 0;
+        } else if space > 0 {
+            spans.push(Span::styled(" ", Style::default()));
+            cur_w += 1;
         }
 
-        // cur_w == 0: lay the word down, hard-wrapping if it exceeds `width`.
-        if wlen <= width {
-            current.push_str(word);
-            cur_w = wlen;
-        } else {
-            // Hard-wrap character by character, accounting for wide chars.
+        // Hard-break a word that cannot fit on the remaining space.
+        if cur_w + ww > width {
             for ch in word.chars() {
                 let cw = char_display_width(ch);
                 if cur_w + cw > width && cur_w > 0 {
-                    lines.push(std::mem::take(&mut current));
-                    cur_w = 0;
+                    out.push(std::mem::take(&mut spans));
+                    spans = emit_pfx(&line.cont_pfx);
+                    cur_w = cont_pfx_w;
                 }
-                current.push(ch);
+                spans.push(Span::styled(ch.to_string(), base.patch(style)));
                 cur_w += cw;
             }
+        } else {
+            spans.push(Span::styled(word, base.patch(style)));
+            cur_w += ww;
         }
+        words_on_line += 1;
     }
 
-    if !current.is_empty() || lines.is_empty() {
-        lines.push(current);
-    }
+    out.push(spans);
+    out
+}
 
-    lines
+/// Lay out a whole cell to `width` columns, returning one `Vec<Span>` per
+/// display line.
+fn layout_cell(
+    cell:  Option<&Cell>,
+    width: usize,
+    base:  Style,
+    rule_s: Style,
+) -> Vec<Vec<Span<'static>>> {
+    let Some(cell) = cell else {
+        return vec![vec![]];
+    };
+    if cell.is_empty() {
+        return vec![vec![]];
+    }
+    let mut out = vec![];
+    for line in cell {
+        out.extend(wrap_cell_line(line, width, base, rule_s));
+    }
+    out
 }
 
 // ─── Code-block line wrapper ─────────────────────────────────────────────────
@@ -1558,95 +2165,272 @@ mod tests {
         }
     }
 
-    // ── Table body separators ─────────────────────────────────────────────────────
+    // ── Inter-row borders ────────────────────────────────────────────────────
 
     #[test]
-    fn rm_table_no_body_sep_without_repeated_delimiter() {
-        // A plain table (no repeated delimiter row) must produce exactly one
-        // ├ line: the header/body separator.
+    fn rm_table_draws_rule_between_every_row() {
+        // Every pair of adjacent rows is separated by a ├ rule, so an
+        // n-row table has exactly n−1 of them.
         let md = "| A | B |\n| -- | -- |\n| r1 | d1 |\n| r2 | d2 |";
         let lines = render_markdown(md, 80, &theme());
-        let mid_lines: Vec<_> = lines.iter()
-            .filter(|l| line_text(l).contains('├'))
-            .collect();
-        assert_eq!(mid_lines.len(), 1,
-            "expected 1 separator line (header sep only), got {}", mid_lines.len());
+        let mid_lines = lines.iter().filter(|l| line_text(l).contains('├')).count();
+        assert_eq!(mid_lines, 2, "3 rows → 2 rules (header|r1, r1|r2)");
     }
 
     #[test]
-    fn rm_table_body_sep_from_repeated_delimiter() {
-        // Repeating the delimiter row between data rows should produce an
-        // additional ├ line (the body separator) in addition to the header separator.
-        let md = "| A | B |\n\
-                  | -- | -- |\n\
-                  | r1 | d1 |\n\
-                  | -- | -- |\n\
-                  | r2 | d2 |";
+    fn rm_table_single_body_row_has_header_rule_only() {
+        let md = "| A | B |\n| -- | -- |\n| r1 | d1 |";
         let lines = render_markdown(md, 80, &theme());
-        // All content must be present.
-        let text = all_text(&lines);
-        assert!(text.contains("r1"), "missing r1: {:?}", text);
-        assert!(text.contains("r2"), "missing r2: {:?}", text);
-        // Exactly 2 ├ lines: header sep + 1 body sep.
-        let mid_lines: Vec<_> = lines.iter()
-            .filter(|l| line_text(l).contains('├'))
-            .collect();
-        assert_eq!(mid_lines.len(), 2,
-            "expected 2 separator lines (header + body), got {}", mid_lines.len());
+        let mid_lines = lines.iter().filter(|l| line_text(l).contains('├')).count();
+        assert_eq!(mid_lines, 1, "2 rows → 1 rule");
     }
 
     #[test]
-    fn rm_table_body_sep_lighter_than_header_sep() {
-        // The body separator must use a lighter color than the header separator.
-        let md = "| A | B |\n\
-                  | -- | -- |\n\
-                  | r1 | d1 |\n\
-                  | -- | -- |\n\
-                  | r2 | d2 |";
+    fn rm_table_rules_use_border_colour() {
+        // Inter-row rules must be the same colour as the outer borders.
+        let md = "| A | B |\n| -- | -- |\n| r1 | d1 |\n| r2 | d2 |";
         let lines = render_markdown(md, 80, &theme());
-        let mid_lines: Vec<_> = lines.iter()
-            .filter(|l| line_text(l).contains('├'))
-            .collect();
-        assert_eq!(mid_lines.len(), 2);
-        let fg = |l: &&ratatui::text::Line<'static>| {
-            l.spans.first().and_then(|s| s.style.fg)
+        let fg_of = |pred: fn(&str) -> bool| -> Option<Color> {
+            lines.iter()
+                .find(|l| pred(&line_text(l)))
+                .and_then(|l| l.spans.first())
+                .and_then(|s| s.style.fg)
         };
-        let header_sep_fg = fg(&mid_lines[0]);
-        let body_sep_fg   = fg(&mid_lines[1]);
-        assert_eq!(header_sep_fg, Some(Color::DarkGray),
-            "header separator should be DarkGray");
-        assert_eq!(body_sep_fg, Some(Color::Indexed(244)),
-            "body separator should be mid-gray (Indexed 244)");
-        assert_ne!(header_sep_fg, body_sep_fg,
-            "header and body separators must use different colors");
+        let border_fg = fg_of(|t| t.contains('┌'));
+        let mid_fg    = fg_of(|t| t.contains('├'));
+        assert_eq!(border_fg, Some(Color::DarkGray));
+        assert_eq!(mid_fg, border_fg, "inter-row rules must match the border colour");
     }
 
     #[test]
-    fn rm_table_trailing_delimiter_not_drawn() {
-        // A delimiter row at the very end of the table (after the last data
-        // row) should be silently dropped — no separator before the bottom border.
+    fn rm_table_repeated_delimiter_is_ordinary_row() {
+        // The old "optional divider" syntax is gone: a repeated delimiter row
+        // is now just a normal data row, so it renders as content and does
+        // not add an extra rule beyond the always-on inter-row ones.
         let md = "| A | B |\n\
                   | -- | -- |\n\
                   | r1 | d1 |\n\
-                  | -- | -- |";
+                  | -- | -- |\n\
+                  | r2 | d2 |";
         let lines = render_markdown(md, 80, &theme());
-        // Still only 1 ├ (header sep); the trailing delimiter produces none.
-        let mid_lines: Vec<_> = lines.iter()
-            .filter(|l| line_text(l).contains('├'))
-            .collect();
-        assert_eq!(mid_lines.len(), 1,
-            "trailing delimiter row should not add a separator, got {}", mid_lines.len());
+        let text = all_text(&lines);
+        assert!(text.contains("r1") && text.contains("r2"), "got: {:?}", text);
+        // 4 rows → 3 rules.
+        let mid_lines = lines.iter().filter(|l| line_text(l).contains('├')).count();
+        assert_eq!(mid_lines, 3, "4 rows → 3 rules, got {}", mid_lines);
+    }
+
+    // ── Table cell inline styles ─────────────────────────────────────────────
+
+    /// Find the span in `lines` that contains `needle`.
+    fn span_with<'a>(lines: &'a [Line<'static>], needle: &str) -> &'a ratatui::text::Span<'static> {
+        lines.iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.contains(needle))
+            .unwrap_or_else(|| panic!("no span containing {:?} in {}", needle, all_text(lines)))
     }
 
     #[test]
-    fn is_separator_row_recognises_common_patterns() {
-        use super::is_separator_row;
-        assert!(is_separator_row(&["--".into(), "---".into()]));
-        assert!(is_separator_row(&[":--:".into(), "---:".into()]));
-        assert!(is_separator_row(&[" -- ".into()]));   // leading/trailing spaces trimmed
-        assert!(!is_separator_row(&[]));               // empty row
-        assert!(!is_separator_row(&["data".into()]));  // non-delimiter cell
-        assert!(!is_separator_row(&["--".into(), "data".into()])); // mixed
+    fn rm_table_cell_bold() {
+        let md = "| A |\n| -- |\n| plain **bold** |";
+        let lines = render_markdown(md, 80, &theme());
+        let s = span_with(&lines, "bold");
+        assert!(s.style.add_modifier.contains(Modifier::BOLD),
+            "expected BOLD, got {:?}", s.style);
+        assert!(!s.content.contains("**"), "markers must be stripped: {:?}", s.content);
+    }
+
+    #[test]
+    fn rm_table_cell_italic() {
+        let md = "| A |\n| -- |\n| plain *italic* |";
+        let lines = render_markdown(md, 80, &theme());
+        let s = span_with(&lines, "italic");
+        assert!(s.style.add_modifier.contains(Modifier::ITALIC),
+            "expected ITALIC, got {:?}", s.style);
+        assert!(!s.content.contains('*'), "markers must be stripped: {:?}", s.content);
+    }
+
+    #[test]
+    fn rm_table_cell_strikethrough() {
+        let md = "| A |\n| -- |\n| ~~gone~~ |";
+        let lines = render_markdown(md, 80, &theme());
+        let s = span_with(&lines, "gone");
+        assert!(s.style.add_modifier.contains(Modifier::CROSSED_OUT),
+            "expected CROSSED_OUT, got {:?}", s.style);
+    }
+
+    #[test]
+    fn rm_table_cell_inline_code() {
+        let md = "| A |\n| -- |\n| use `cargo` now |";
+        let lines = render_markdown(md, 80, &theme());
+        let s = span_with(&lines, "cargo");
+        assert_eq!(s.content.as_ref(), "`cargo`", "code keeps its backticks");
+        assert_eq!(s.style.fg, Some(Color::DarkGray), "code style colour expected");
+    }
+
+    #[test]
+    fn rm_table_cell_nested_styles_compose() {
+        let md = "| A |\n| -- |\n| ***both*** |";
+        let lines = render_markdown(md, 80, &theme());
+        let s = span_with(&lines, "both");
+        assert!(s.style.add_modifier.contains(Modifier::BOLD));
+        assert!(s.style.add_modifier.contains(Modifier::ITALIC));
+    }
+
+    #[test]
+    fn rm_table_header_cell_keeps_styles_and_bold() {
+        let md = "| **Head** |\n| -- |\n| x |";
+        let lines = render_markdown(md, 80, &theme());
+        let s = span_with(&lines, "Head");
+        assert!(s.style.add_modifier.contains(Modifier::BOLD));
+        assert!(!s.content.contains('*'));
+    }
+
+    #[test]
+    fn rm_table_cell_html_bold_and_italic() {
+        let md = "| A |\n| -- |\n| <b>bb</b> <i>ii</i> |";
+        let lines = render_markdown(md, 80, &theme());
+        assert!(span_with(&lines, "bb").style.add_modifier.contains(Modifier::BOLD));
+        assert!(span_with(&lines, "ii").style.add_modifier.contains(Modifier::ITALIC));
+        let text = all_text(&lines);
+        assert!(!text.contains("<b>") && !text.contains("<i>"), "tags leaked: {:?}", text);
+    }
+
+    // ── Table cell block elements ────────────────────────────────────────────
+
+    #[test]
+    fn rm_table_cell_br_splits_lines() {
+        let md = "| A |\n| -- |\n| one<br>two |";
+        let lines = render_markdown(md, 80, &theme());
+        let cell_rows: Vec<String> = lines.iter()
+            .map(|l| line_text(l))
+            .filter(|t| t.contains('│'))
+            .collect();
+        assert!(cell_rows.iter().any(|t| t.contains("one")), "{:?}", cell_rows);
+        assert!(cell_rows.iter().any(|t| t.contains("two")), "{:?}", cell_rows);
+        assert!(!cell_rows.iter().any(|t| t.contains("one") && t.contains("two")),
+            "'one' and 'two' must be on separate rows: {:?}", cell_rows);
+    }
+
+    #[test]
+    fn rm_table_cell_bullet_list() {
+        let md = "| A |\n| -- |\n| - one<br>- two |";
+        let lines = render_markdown(md, 80, &theme());
+        let text = all_text(&lines);
+        assert_eq!(text.matches('•').count(), 2, "expected two bullets: {:?}", text);
+        assert!(!text.contains("- one"), "marker not stripped: {:?}", text);
+    }
+
+    #[test]
+    fn rm_table_cell_ordered_list_numbers_increment() {
+        let md = "| A |\n| -- |\n| 1. one<br>2. two |";
+        let lines = render_markdown(md, 80, &theme());
+        let text = all_text(&lines);
+        assert!(text.contains("1. one"), "{:?}", text);
+        assert!(text.contains("2. two"), "{:?}", text);
+    }
+
+    #[test]
+    fn rm_table_cell_ordered_list_continues_counting() {
+        // Repeating `1.` is the idiomatic way to write an ordered list; the
+        // renderer must number them 1, 2, 3 rather than repeating "1.".
+        let md = "| A |\n| -- |\n| 1. a<br>1. b<br>1. c |";
+        let text = all_text(&render_markdown(md, 60, &theme()));
+        for expected in ["1. a", "2. b", "3. c"] {
+            assert!(text.contains(expected), "missing {:?} in {:?}", expected, text);
+        }
+    }
+
+    #[test]
+    fn rm_table_cell_nested_bullets_indent() {
+        let md = "| A |\n| -- |\n| - outer<br>  - inner |";
+        let lines = render_markdown(md, 60, &theme());
+        let row = |needle: &str| -> String {
+            lines.iter().map(|l| line_text(l))
+                .find(|t| t.contains(needle))
+                .unwrap_or_else(|| panic!("no row with {:?}", needle))
+        };
+        let outer = row("outer");
+        let inner = row("inner");
+        let outer_col = outer.find('•').unwrap();
+        let inner_col = inner.find('•').unwrap();
+        assert!(inner_col > outer_col,
+            "nested bullet should be indented further: {:?} vs {:?}", inner, outer);
+    }
+
+    #[test]
+    fn rm_table_cell_heading() {
+        let md = "| A |\n| -- |\n| ## Title |";
+        let lines = render_markdown(md, 80, &theme());
+        let text = all_text(&lines);
+        assert!(text.contains("## Title"), "{:?}", text);
+        let s = span_with(&lines, "Title");
+        assert!(s.style.add_modifier.contains(Modifier::BOLD), "heading should be bold");
+    }
+
+    #[test]
+    fn rm_table_cell_blockquote() {
+        let md = "| A |\n| -- |\n| > quoted |";
+        let lines = render_markdown(md, 80, &theme());
+        let text = all_text(&lines);
+        assert!(text.contains("│ quoted"), "expected a quote bar: {:?}", text);
+    }
+
+    #[test]
+    fn rm_table_cell_rule() {
+        let md = "| A |\n| -- |\n| above<br>---<br>below |";
+        let lines = render_markdown(md, 80, &theme());
+        let text = all_text(&lines);
+        assert!(text.contains("above") && text.contains("below"), "{:?}", text);
+        // The rule row sits between them.
+        let idx = |needle: &str| lines.iter().position(|l| line_text(l).contains(needle)).unwrap();
+        assert!(idx("above") < idx("below"));
+        let rule_row = lines.iter().find(|l| {
+            let t = line_text(l);
+            t.contains('│') && t.contains("───") && !t.contains("above")
+        });
+        assert!(rule_row.is_some(), "no rule row rendered: {:?}", text);
+    }
+
+    #[test]
+    fn rm_table_cell_pre_formatted() {
+        let md = "| A |\n| -- |\n| <pre>  x = 1<br>  y = 2</pre> |";
+        let lines = render_markdown(md, 80, &theme());
+        let text = all_text(&lines);
+        assert!(text.contains("  x = 1"), "indentation must survive: {:?}", text);
+        assert!(text.contains("  y = 2"), "{:?}", text);
+    }
+
+    #[test]
+    fn rm_table_cell_fence_pre_formatted() {
+        let md = "| A |\n| -- |\n| ```<br>  x = 1<br>``` |";
+        let lines = render_markdown(md, 80, &theme());
+        let text = all_text(&lines);
+        assert!(text.contains("  x = 1"), "indentation must survive: {:?}", text);
+        assert!(!text.contains("```"), "fence markers must be dropped: {:?}", text);
+    }
+
+    #[test]
+    fn rm_table_cell_styles_survive_block_markers() {
+        // Stripping the `- ` marker must not lose the bold styling after it.
+        let md = "| A |\n| -- |\n| - **bold** item |";
+        let lines = render_markdown(md, 80, &theme());
+        let s = span_with(&lines, "bold");
+        assert!(s.style.add_modifier.contains(Modifier::BOLD), "got {:?}", s.style);
+        assert!(!s.content.contains("**"));
+    }
+
+    #[test]
+    fn rm_table_cell_multiline_row_height_matches() {
+        // A cell with three lines makes its row three rows tall, and the
+        // vertical borders must be drawn on every one of them.
+        let md = "| A | B |\n| -- | -- |\n| one<br>two<br>three | x |";
+        let lines = render_markdown(md, 80, &theme());
+        let content_rows = lines.iter()
+            .map(|l| line_text(l))
+            .filter(|t| t.contains('│') && (t.contains("one") || t.contains("two") || t.contains("three") || t.contains(" x ")))
+            .count();
+        assert_eq!(content_rows, 3, "row should be 3 lines tall");
     }
 
     // ── Token::Join / punctuation gluing ────────────────────────────────────
