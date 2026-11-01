@@ -4,6 +4,12 @@ A keyboard-driven terminal UI (TUI) for managing projects, todos, and journal
 updates. Written in Rust using ratatui + crossterm; all data is stored locally
 in SQLite via rusqlite.
 
+The project management binary is `ptm`. Separate helper binaries are also included:
+
+- `ptm-sync` - Cloud sync for ptm data
+- `md` - Markdown viewer with spell-checking
+- `enc` - Symmetric file encryption tool
+
 ---
 
 ## Build & Run
@@ -45,6 +51,7 @@ src/
 ├── ui/
 │   ├── mod.rs       — top-level render() dispatcher
 │   ├── theme.rs     — Theme struct (Color palette); always used as Theme::default()
+│   ├── markdown.rs  — Markdown → ratatui renderer; shared with `md` (path-included)
 │   └── views/
 │       ├── mod.rs               — shared helpers (hint_height)
 │       ├── project_list.rs      — Project List screen renderer
@@ -55,6 +62,10 @@ src/
 └── bin/
     ├── enc/         — enc binary (file encryption CLI; see §enc below)
     │   └── main.rs     — clap subcommands: keygen/encrypt/decrypt/export/import
+    ├── md/          — md binary (Markdown viewer + spell check)
+    │   ├── main.rs     — TUI viewer: scroll, incremental search, $EDITOR, S:spell
+    │   ├── ui.rs       — path-includes src/ui/theme.rs and src/ui/markdown.rs
+    │   └── log.rs      — file logger → $XDG_DATA_HOME/md/md.log
     └── ptm_sync/    — ptm-sync binary (S3 backup sync; see §ptm-sync below)
         ├── main.rs     — CLI args (clap), Paths struct, shared utilities, entry point
         ├── ops.rs      — high-level --start and --end flows
@@ -92,7 +103,7 @@ other wrote.
 | `--output` / `-o` | *(derived from input)* | Output path (encrypt / decrypt only) |
 | `--force` / `-f` | off | Overwrite an existing output/key file without prompting |
 
-### Behaviour notes
+### Behavior notes
 
 - **Prompts** happen on stderr so that `enc export > key.b64` stays clean.
   When stdin is not a terminal (scripts, pipes) an overwrite prompt is
