@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 
 use crate::{
-    archive, check_key_permissions, compute_hash, crypto, db, log_entry, merge_dictionaries,
+    archive, compute_hash, crypto, db, log_entry, merge_dictionaries,
     prompt_continue_without_pull, read_etag_file, write_etag_file, Args, Paths,
 };
 use crate::s3client::S3Client;
@@ -25,7 +25,7 @@ fn require_s3_args(args: &Args) -> Result<()> {
 pub fn run_start(args: &Args, paths: &Paths) -> Result<()> {
     require_s3_args(args)?;
     let key_path = args.key_path();
-    check_key_permissions(&key_path)?;
+    crypto::check_key_permissions(&key_path)?;
 
     // ── Determine initial pull intent ─────────────────────────────────────
     let mut pull = !args.local_is_master;
@@ -298,7 +298,7 @@ pub fn run_end(args: &Args, paths: &Paths) -> Result<()> {
     }
 
     let key_path = args.key_path();
-    check_key_permissions(&key_path)?;
+    crypto::check_key_permissions(&key_path)?;
 
     // ── WAL file handling ─────────────────────────────────────────────────
     if paths.db_wal.exists() {

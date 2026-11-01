@@ -6,6 +6,6 @@ PROJ_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJ_DIR"
 
 tar -czf "ptm-binaries-${DS}.tgz" \
-  target/{aarch64-apple-darwin,x86_64-unknown-linux-musl}/release/{ptm,ptm-sync,md}
+  target/{aarch64-apple-darwin,x86_64-unknown-linux-musl}/release/{ptm,ptm-sync,md,enc}
 
 ls -l "ptm-binaries-${DS}.tgz"

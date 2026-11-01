@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds a ptm workspace binary for linux/amd64 (musl, shared) inside a Docker container.
-# Usage: ./build-linux-musl-x86_64 [ptm|ptm-sync]   (default: ptm)
+# Usage: ./build-linux-musl-x86_64 [ptm|ptm-sync|md|enc]   (default: ptm)
 # Uses Alpine Linux as the build platform — Alpine's native gcc already targets
 # musl, so no cross-compilation wrappers are needed.
 # RUSTFLAGS=-C target-feature=-crt-static disables the default +crt-static feature
@@ -12,8 +12,8 @@
 set -euo pipefail
 
 BINARY="${1:-ptm}"
-if [[ "$BINARY" != "ptm" && "$BINARY" != "ptm-sync" && "$BINARY" != "md" ]]; then
-  echo "Error: unknown binary '$BINARY'. Valid options: ptm, ptm-sync, md" >&2
+if [[ "$BINARY" != "ptm" && "$BINARY" != "ptm-sync" && "$BINARY" != "md" && "$BINARY" != "enc" ]]; then
+  echo "Error: unknown binary '$BINARY'. Valid options: ptm, ptm-sync, md, enc" >&2
   exit 1
 fi
 

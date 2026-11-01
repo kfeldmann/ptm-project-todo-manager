@@ -6,11 +6,16 @@
 //!   ptm
 
 mod archive;
-mod crypto;
 mod db;
 mod merge;
 mod ops;
 mod s3client;
+
+/// Shared AES-256-GCM implementation (path-included from the main ptm source
+/// so that `enc` and `ptm-sync` always agree on the file format).
+#[path = "../../crypto.rs"]
+#[allow(dead_code)] // shared module: each binary uses a different subset
+mod crypto;
 
 use anyhow::{Context, Result};
 use chrono::DateTime;
@@ -162,23 +167,6 @@ pub fn log_entry(paths: &Paths, msg: &str) {
     {
         let _ = f.write_all(line.as_bytes());
     }
-}
-
-/// Verify that the key file exists and has no group/other read or write bits.
-pub fn check_key_permissions(key_path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let meta = fs::metadata(key_path)
-        .with_context(|| format!("Cannot access encryption key: {}", key_path.display()))?;
-    let mode = meta.permissions().mode();
-    if mode & 0o077 != 0 {
-        anyhow::bail!(
-            "Encryption key '{}' has insecure permissions ({:04o}). \
-             It must be accessible only by the owner (e.g. chmod 600).",
-            key_path.display(),
-            mode & 0o777
-        );
-    }
-    Ok(())
 }
 
 /// Read a stored ETag from a file, returning None if the file is absent or empty.
@@ -453,63 +441,6 @@ mod tests {
         let path = dir.path().join(".etag_ws");
         fs::write(&path, b"   \n  ").unwrap();
         assert!(read_etag_file(&path).is_none());
-    }
-
-    // ── check_key_permissions ────────────────────────────────────────────────────
-
-    fn write_file_with_mode(dir: &TempDir, name: &str, mode: u32) -> PathBuf {
-        let path = dir.path().join(name);
-        fs::write(&path, b"key data").unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
-        path
-    }
-
-    #[test]
-    fn check_key_permissions_accepts_owner_read_write_only() {
-        let dir = TempDir::new().unwrap();
-        let path = write_file_with_mode(&dir, "key_600.bin", 0o600);
-        assert!(check_key_permissions(&path).is_ok());
-    }
-
-    #[test]
-    fn check_key_permissions_accepts_owner_read_only() {
-        // 0o400: owner-read only — group/other bits are 0, so it should pass.
-        let dir = TempDir::new().unwrap();
-        let path = write_file_with_mode(&dir, "key_400.bin", 0o400);
-        assert!(check_key_permissions(&path).is_ok());
-    }
-
-    #[test]
-    fn check_key_permissions_rejects_group_readable() {
-        let dir = TempDir::new().unwrap();
-        let path = write_file_with_mode(&dir, "key_640.bin", 0o640);
-        assert!(check_key_permissions(&path).is_err());
-    }
-
-    #[test]
-    fn check_key_permissions_rejects_world_readable() {
-        let dir = TempDir::new().unwrap();
-        let path = write_file_with_mode(&dir, "key_644.bin", 0o644);
-        let err = check_key_permissions(&path).unwrap_err();
-        assert!(
-            err.to_string().contains("insecure"),
-            "expected 'insecure' in error, got: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn check_key_permissions_rejects_world_writable() {
-        let dir = TempDir::new().unwrap();
-        let path = write_file_with_mode(&dir, "key_622.bin", 0o622);
-        assert!(check_key_permissions(&path).is_err());
-    }
-
-    #[test]
-    fn check_key_permissions_returns_error_for_missing_file() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("no_key_here.bin");
-        assert!(check_key_permissions(&path).is_err());
     }
 
     // ── Args::key_path ─────────────────────────────────────────────────────────────

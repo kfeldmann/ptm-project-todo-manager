@@ -1320,9 +1320,11 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
+ "base64",
  "chrono",
  "clap",
  "crossterm",
+ "getrandom 0.4.3",
  "pulldown-cmark",
  "ratatui",
  "rusqlite",

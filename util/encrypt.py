@@ -2,6 +2,10 @@
 """
 Symmetric file encryption — AES-256-GCM.
 
+NOTE: superseded by the `enc` Rust binary in this repo (src/bin/enc), which
+implements the same file/key format plus `export`/`import` for base64 keys.
+This script is kept for reference and for machines without the Rust build.
+
 Commands:
   keygen   Generate a new 256-bit key (saved to ~/.encryption_key by default)
   encrypt  Encrypt a file  → <file>.enc
