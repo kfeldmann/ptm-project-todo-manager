@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Cross-compiles a ptm workspace binary for macOS Intel (x86_64-apple-darwin)
+# inside a Docker container using zig-cc as the C/linker toolchain.
+# Usage: ./build-macos-x86_64 [ptm|ptm-sync|md|enc]   (default: ptm)
+# The container runs as the host user's UID:GID so output files are
+# owned by the caller. The Cargo registry is cached in a named Docker
+# volume (ptm-cargo-cache-macos-x86_64) across runs.
+set -euo pipefail
+
+BINARY="${1:-ptm}"
+if [[ "$BINARY" != "ptm" && "$BINARY" != "ptm-sync" && "$BINARY" != "md" && "$BINARY" != "enc" ]]; then
+  echo "Error: unknown binary '$BINARY'. Valid options: ptm, ptm-sync, md, enc" >&2
+  exit 1
+fi
+
+BUILD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJ_DIR="$(cd "${BUILD_DIR}/.." && pwd)"
+IMAGE="ptm-builder-macos-x86_64"
+CARGO_VOLUME="ptm-cargo-cache-macos-x86_64"
+
+# Always clean build cache
+docker buildx prune -f
+
+echo "==> Building Docker image ($IMAGE)..."
+docker build --platform linux/amd64 -t "$IMAGE" -f "$BUILD_DIR/Dockerfile.macos-x86_64" "$BUILD_DIR"
+
+# Minimum macOS version to link against. Without this, Zig 0.16 defaults to
+# macOS 13.0, which is newer than rustc's own default and would refuse to run
+# on older Intel Macs. Override with e.g. MACOS_MIN=11.0 ./build-macos-x86_64
+MACOS_MIN="${MACOS_MIN:-12.0}"
+
+echo "==> Cross-compiling $BINARY (release) for x86_64-apple-darwin inside container..."
+docker run --rm \
+  --platform linux/amd64 \
+  --user "$(id -u):$(id -g)" \
+  --volume "$PROJ_DIR:/workspace" \
+  --volume "$CARGO_VOLUME:/cargo-cache" \
+  --env MACOSX_DEPLOYMENT_TARGET="$MACOS_MIN" \
+  "$IMAGE" \
+  cargo zigbuild --release --target x86_64-apple-darwin --bin "$BINARY"
+
+echo "==> Done: $PROJ_DIR/target/x86_64-apple-darwin/release/$BINARY  (min macOS $MACOS_MIN)"
