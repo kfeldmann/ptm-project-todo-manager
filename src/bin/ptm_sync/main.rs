@@ -299,7 +299,6 @@ fn main() {
 mod tests {
     use super::*;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
     // ── compute_hash ──────────────────────────────────────────────────────────────
