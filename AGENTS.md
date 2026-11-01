@@ -240,7 +240,14 @@ Each backup is a zip archive (Deflate) containing:
 
 During a pull, `user_words.txt` from the remote backup is **merged** with the
 local copy (union + dedup + sort) rather than overwritten. The database is
-always replaced wholesale.
+always replaced wholesale — but only after the downloaded copy passes
+`PRAGMA integrity_check`, so a corrupt or truncated backup is reported instead
+of installed.
+
+The `ptm.db` entry is a `VACUUM INTO` snapshot, not the raw file: committed
+transactions can still be sitting in `ptm.db-wal`, and the raw file may not
+contain them. Local backups (`local-backups/`) are built the same way, so they
+are complete even when taken while `ptm` is running.
 
 ### Data Directory Files
 
@@ -257,14 +264,49 @@ All files live alongside `ptm.db` in `$XDG_DATA_HOME/ptm/` (default
 
 ### WAL Handling
 
-Before pulling (`--start`) or pushing (`--end`), ptm-sync checks for a live
-`ptm.db-wal` file:
+All of this lives in `src/bin/ptm_sync/db.rs`. Three SQLite behaviours shape it:
 
-- If the WAL exists but no other process has the database open, it runs
-  `PRAGMA wal_checkpoint(TRUNCATE)` to fold it in before syncing.
-- If another ptm process is running, `--start` skips the pull (allowing
-  concurrent launch) unless `--block-concurrent` is given; `--end` silently
-  skips the push (the other process will push when it exits).
+- **`PRAGMA wal_checkpoint(TRUNCATE)` reports failure in a result row, not as an
+  error.** It returns `(busy, log, checkpointed)` and raises nothing when it
+  cannot advance, so `execute_batch` reports success for a WAL that is still
+  full. Every checkpoint goes through `run_checkpoint`, which reads that row,
+  and callers must check `CheckpointReport::is_clean()` (`busy == 0` and
+  `log_frames <= 0`).
+- **A `BEGIN EXCLUSIVE; COMMIT;` probe releases the lock at the `COMMIT`.** It
+  does detect a database another process has open, but the answer is stale as
+  soon as it is returned. Work that must not race with a running `ptm` holds an
+  `ExclusiveLock` across the whole operation instead.
+- **Committed data may live only in `ptm.db-wal`.** `std::fs::read("ptm.db")`
+  then returns a copy containing none of it, so anything that needs a complete
+  copy uses `db::snapshot_bytes` (`VACUUM INTO`), never a raw file read.
+
+Behaviour:
+
+- If `ptm.db-wal` is non-empty and no other process has the database open,
+  ptm-sync runs `wal_checkpoint(TRUNCATE)` and verifies the result is clean
+  before syncing.
+- If another ptm process is running, or the checkpoint cannot advance, `--start`
+  skips the pull (allowing concurrent launch) unless `--block-concurrent` is
+  given.
+- The "is another process running?" check is gated on `ptm.db-wal` being
+  non-empty, because probing for a lock creates the `-wal`/`-shm` sidecars. A
+  concurrent session that has not written anything is therefore not detected by
+  `--end` (the upload is still coherent — `snapshot_bytes` does not need an
+  exclusive lock — it is just not reported as concurrent).
+- `--end` **exits non-zero** in that case, because the documented wrapper is
+  `trap 'ptm-sync --end' EXIT` and a silent success means the session's work is
+  never backed up. This holds regardless of `--local-is-master`: that flag is
+  about *S3 authority* (push even when the remote has diverged), not about local
+  concurrency, and a user who passed it explicitly asked for a push. The
+  attached client is itself the signal that the other session will push when it
+  exits; the error message says so instead of pretending the backup succeeded.
+- The pulled database is installed while holding an `ExclusiveLock`: checkpoint,
+  verify clean, delete the `-wal`/`-shm` sidecars, then `rename`. Renaming over
+  a database with a live `-wal` lets the stale frames be replayed into the new
+  file, which discards the pull while `--start` reports success.
+- Every connection here sets `busy_timeout` (5 s, matching `src/data/db.rs`);
+  without it a probe against a busy database fails instantly, making "in use"
+  indistinguishable from "broken".
 
 ### AWS Credentials
 

@@ -110,10 +110,9 @@ impl Args {
 /// All paths derived from the ptm data directory.
 pub struct Paths {
     pub data_dir: PathBuf,
-    /// ptm.db
+    /// ptm.db  (`ptm.db-wal` / `ptm.db-shm` are derived by `db::wal_path` /
+    /// `db::shm_path`, so the suffix lives in exactly one place)
     pub db: PathBuf,
-    /// ptm.db-wal
-    pub db_wal: PathBuf,
     /// user_words.txt (optional)
     pub dict: PathBuf,
     /// local-backups/ subdirectory
@@ -133,7 +132,6 @@ impl Paths {
         let data_dir = resolve_data_dir();
         Ok(Self {
             db: data_dir.join("ptm.db"),
-            db_wal: data_dir.join("ptm.db-wal"),
             dict: data_dir.join("user_words.txt"),
             local_backups: data_dir.join("local-backups"),
             last_pushed_etag: data_dir.join(".last_pushed_etag"),

@@ -80,10 +80,16 @@ pub fn unpack(zip_bytes: &[u8]) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
 /// `timestamp` must be an ISO 8601 string with colons replaced by hyphens, e.g.
 /// `"2025-01-15T10-23-45Z"`.
 ///
+/// The database is copied with `VACUUM INTO` rather than `std::fs::read`: a
+/// backup taken while a `ptm` session is running may have all of its committed
+/// data in `ptm.db-wal`, and reading the file alone would produce an archive
+/// missing everything since the last checkpoint (finding #2).  The snapshot
+/// also does not disturb the live session, so this is safe to run mid-pull.
+///
 /// Returns the path to the newly created zip file.
 pub fn create_local_backup(paths: &Paths, timestamp: &str) -> Result<PathBuf> {
-    let db_bytes = std::fs::read(&paths.db)
-        .with_context(|| format!("Cannot read {} for local backup", paths.db.display()))?;
+    let db_bytes = crate::db::snapshot_bytes(&paths.db)
+        .with_context(|| format!("Cannot snapshot {} for local backup", paths.db.display()))?;
     let dict_bytes = std::fs::read(&paths.dict).ok();
 
     let zip_bytes = pack(&db_bytes, dict_bytes.as_deref())
@@ -136,7 +142,6 @@ mod tests {
         crate::Paths {
             data_dir: d.to_path_buf(),
             db: d.join("ptm.db"),
-            db_wal: d.join("ptm.db-wal"),
             dict: d.join("user_words.txt"),
             local_backups: d.join("local-backups"),
             last_pushed_etag: d.join(".last_pushed_etag"),
@@ -296,10 +301,32 @@ mod tests {
 
     // ── create_local_backup ─────────────────────────────────────────────────────────
 
+    /// Create a real WAL-mode database with `n` rows in table `t`.
+    fn make_db(path: &Path, n: i64) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; \
+             CREATE TABLE t (x INTEGER);",
+        )
+        .unwrap();
+        for i in 0..n {
+            conn.execute("INSERT INTO t VALUES (?1)", [i]).unwrap();
+        }
+    }
+
+    fn count_rows(db_bytes: &[u8], tag: &str) -> i64 {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(format!("{}.db", tag));
+        fs::write(&path, db_bytes).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap()
+    }
+
     #[test]
     fn create_local_backup_produces_readable_zip_containing_db() {
         let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("ptm.db"), b"test db content").unwrap();
+        make_db(&dir.path().join("ptm.db"), 3);
         let paths = make_paths(&dir);
 
         let backup_path = create_local_backup(&paths, "2025-01-15T10-30-00Z").unwrap();
@@ -315,16 +342,51 @@ mod tests {
             "filename should embed the timestamp"
         );
 
-        // The zip must be parseable and contain the original db bytes.
+        // The zip must be parseable and contain a readable database.
         let zip_bytes = fs::read(&backup_path).unwrap();
         let (db, _) = unpack(&zip_bytes).unwrap();
-        assert_eq!(db.as_slice(), b"test db content");
+        assert_eq!(count_rows(&db, "backed-up"), 3);
+    }
+
+    #[test]
+    fn create_local_backup_snapshots_data_that_is_still_in_the_wal() {
+        // Finding #2: a backup taken from `std::fs::read(ptm.db)` can be empty
+        // of committed data while a live session holds it in the WAL.
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("ptm.db");
+        let paths = make_paths(&dir);
+
+        // Keep a writer open so nothing is checkpointed, and hold a second
+        // connection open so the WAL survives.
+        let writer = rusqlite::Connection::open(&db_path).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        writer.execute_batch("CREATE TABLE t (x INTEGER);").unwrap();
+        for i in 0..25 {
+            writer.execute("INSERT INTO t VALUES (?1)", [i]).unwrap();
+        }
+        assert!(
+            crate::db::wal_size(&db_path) > 0,
+            "precondition: the rows are in the WAL, not the main file"
+        );
+
+        let backup_path = create_local_backup(&paths, "2025-01-15T10-30-00Z").unwrap();
+        let zip_bytes = fs::read(&backup_path).unwrap();
+        let (db, _) = unpack(&zip_bytes).unwrap();
+
+        assert_eq!(
+            count_rows(&db, "from-wal"),
+            25,
+            "the local backup must include data that is still in the WAL"
+        );
+        drop(writer);
     }
 
     #[test]
     fn create_local_backup_includes_dict_when_present() {
         let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("ptm.db"), b"db").unwrap();
+        make_db(&dir.path().join("ptm.db"), 1);
         fs::write(dir.path().join("user_words.txt"), b"hello\nworld\n").unwrap();
         let paths = make_paths(&dir);
 
@@ -338,6 +400,15 @@ mod tests {
     fn create_local_backup_missing_db_returns_error() {
         let dir = TempDir::new().unwrap();
         let paths = make_paths(&dir); // no ptm.db written
+        assert!(create_local_backup(&paths, "2025-01-01T00-00-00Z").is_err());
+    }
+
+    #[test]
+    fn create_local_backup_of_an_unreadable_db_returns_error() {
+        // The snapshot path fails loudly instead of zipping garbage.
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("ptm.db"), b"not a database").unwrap();
+        let paths = make_paths(&dir);
         assert!(create_local_backup(&paths, "2025-01-01T00-00-00Z").is_err());
     }
 }

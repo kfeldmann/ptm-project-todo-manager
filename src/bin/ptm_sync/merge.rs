@@ -139,11 +139,22 @@ pub fn run_merge(paths: &crate::Paths, from_dir: &Path, dry_run: bool) -> Result
     }
 
     // ── Local WAL checkpoint ──────────────────────────────────────────────
-    if paths.db_wal.exists() {
+    // The merge writes to the local database, so the WAL has to be folded in
+    // first — and a checkpoint that could not advance has to be treated as
+    // "in use", not as success (finding #1b).
+    if crate::db::wal_size(&paths.db) > 0 {
         crate::log_entry(paths, "WAL file found; checking if database is in use");
         match crate::db::check_and_checkpoint_wal(&paths.db) {
-            Ok(true) => crate::log_entry(paths, "Local WAL checkpointed"),
-            Ok(false) => bail!(
+            Ok(Some(report)) if report.is_clean() => {
+                crate::log_entry(paths, "Local WAL checkpointed")
+            }
+            Ok(Some(report)) => bail!(
+                "Local WAL could not be checkpointed (busy={}, {} frame(s) left); \
+                 close any running ptm and try again",
+                report.busy,
+                report.log_frames
+            ),
+            Ok(None) => bail!(
                 "Local database is in use by another process; close it before merging"
             ),
             Err(e) => bail!("WAL status check failed: {:#}", e),

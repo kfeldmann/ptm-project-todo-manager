@@ -1,6 +1,6 @@
 //! High-level --start and --end operational flows.
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::{
     archive, compute_hash, crypto, db, log_entry, merge_dictionaries,
@@ -22,6 +22,32 @@ fn require_s3_args(args: &Args) -> Result<()> {
 
 // ── --start ───────────────────────────────────────────────────────────────────
 
+/// Bytes of the local database in the form every hash in this file is computed
+/// from.
+///
+/// This is a `VACUUM INTO` snapshot, never `std::fs::read(ptm.db)`.  Three
+/// reasons: the raw file can be missing committed data that is still in the WAL
+/// (finding #2); a snapshot is byte-identical across checkpoints, so the same
+/// logical state always hashes the same; and `--end` hashes a snapshot too, so
+/// the change test and the upload always agree.  A missing or unreadable
+/// database yields no bytes, which is what the callers want — they only use this
+/// to decide whether to record a baseline.
+fn current_db_bytes(paths: &Paths) -> Vec<u8> {
+    if !paths.db.exists() {
+        return Vec::new();
+    }
+    match db::snapshot_bytes(&paths.db) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            log_entry(
+                paths,
+                &format!("Warning: could not snapshot ptm.db for hashing: {:#}", e),
+            );
+            Vec::new()
+        }
+    }
+}
+
 pub fn run_start(args: &Args, paths: &Paths) -> Result<()> {
     require_s3_args(args)?;
     let key_path = args.key_path();
@@ -31,17 +57,45 @@ pub fn run_start(args: &Args, paths: &Paths) -> Result<()> {
     let mut pull = !args.local_is_master;
 
     // ── WAL file handling ─────────────────────────────────────────────────
-    if paths.db_wal.exists() {
+    if db::wal_size(&paths.db) > 0 {
         log_entry(paths, "WAL file found; checking if database is in use");
         match db::check_and_checkpoint_wal(&paths.db) {
-            Ok(true) => {
-                log_entry(paths, "Stale WAL detected; checkpointed and truncated");
+            Ok(Some(report)) if report.is_clean() => {
+                log_entry(
+                    paths,
+                    &format!(
+                        "Stale WAL detected; checkpointed {} frame(s) and truncated it",
+                        report.checkpointed
+                    ),
+                );
                 // pull intent unchanged
             }
-            Ok(false) => {
+            // Either another process has the database open (`Ok(None)`) or the
+            // checkpoint could not advance (`busy` / frames left behind, which
+            // SQLite does not report as an error).  Both mean the WAL is live,
+            // so the pull must not proceed.
+            Ok(Some(report)) => {
+                let why = format!(
+                    "WAL is live (checkpoint busy={}, {} frame(s) left)",
+                    report.busy, report.log_frames
+                );
+                if args.block_concurrent {
+                    bail!(
+                        "Database is currently in use by another ptm process ({}). \
+                         Omit --block-concurrent to allow concurrent launch.",
+                        why
+                    );
+                }
+                log_entry(
+                    paths,
+                    &format!("{}; skipping pull, allowing launch", why),
+                );
+                pull = false;
+            }
+            Ok(None) => {
                 // Another ptm process has the database open.
                 if args.block_concurrent {
-                    anyhow::bail!(
+                    bail!(
                         "Database is currently in use by another ptm process. \
                          Omit --block-concurrent to allow concurrent launch."
                     );
@@ -56,7 +110,7 @@ pub fn run_start(args: &Args, paths: &Paths) -> Result<()> {
                 // Cannot determine WAL status; be conservative.
                 log_entry(
                     paths,
-                    &format!("WAL status check error (treating as in-use): {}", e),
+                    &format!("WAL status check error (treating as in-use): {:#}", e),
                 );
                 pull = false;
             }
@@ -64,9 +118,11 @@ pub fn run_start(args: &Args, paths: &Paths) -> Result<()> {
     }
 
     // ── Pull logic ────────────────────────────────────────────────────────
-    if pull {
-        pull = evaluate_and_maybe_pull(args, paths)?;
-    }
+    let pulled = if pull {
+        evaluate_and_maybe_pull(args, paths)?
+    } else {
+        false
+    };
 
     // ── Seed db hash on first launch ──────────────────────────────────────
     // .db_hash records the state at the last successful push or pull so that
@@ -75,7 +131,7 @@ pub fn run_start(args: &Args, paths: &Paths) -> Result<()> {
     // push-failure is not silently reset by a subsequent session start.
     // do_pull and a successful --end are the only code paths that update it.
     if !paths.db_hash.exists() {
-        let db_bytes = std::fs::read(&paths.db).unwrap_or_default();
+        let db_bytes = current_db_bytes(paths);
         let dict_bytes = std::fs::read(&paths.dict).ok();
         let hash = compute_hash(&db_bytes, dict_bytes.as_deref());
 
@@ -90,7 +146,7 @@ pub fn run_start(args: &Args, paths: &Paths) -> Result<()> {
         log_entry(paths, "db hash present; leaving unchanged");
     }
 
-    if pull {
+    if pulled {
         log_entry(paths, "--start complete (pulled from S3)");
     } else {
         log_entry(paths, "--start complete (no pull)");
@@ -126,7 +182,7 @@ fn evaluate_and_maybe_pull(args: &Args, paths: &Paths) -> Result<bool> {
         if let Ok(stored) = std::fs::read_to_string(&paths.db_hash) {
             let stored = stored.trim();
             if !stored.is_empty() {
-                let db_bytes = std::fs::read(&paths.db).unwrap_or_default();
+                let db_bytes = current_db_bytes(paths);
                 let dict_bytes = std::fs::read(&paths.dict).ok();
                 let current = compute_hash(&db_bytes, dict_bytes.as_deref());
                 if current != stored {
@@ -183,12 +239,15 @@ fn evaluate_and_maybe_pull(args: &Args, paths: &Paths) -> Result<bool> {
     }
 
     // ── Perform the pull ──────────────────────────────────────────────────
-    do_pull(args, paths, &s3, &remote_etag)?;
-    Ok(true)
+    do_pull(args, paths, &s3, &remote_etag)
 }
 
 /// Download, decrypt, unpack, and install the remote backup.
-fn do_pull(args: &Args, paths: &Paths, s3: &S3Client, remote_etag: &str) -> Result<()> {
+///
+/// Returns `true` when the pulled database was installed (or would have been,
+/// under `--dry-run`), `false` when the install was refused because another
+/// `ptm` session owns the database.
+fn do_pull(args: &Args, paths: &Paths, s3: &S3Client, remote_etag: &str) -> Result<bool> {
     // Create a local backup of whatever is currently on disk.
     let has_local_data = paths.db.exists() || paths.dict.exists();
     if has_local_data && !args.dry_run {
@@ -215,7 +274,7 @@ fn do_pull(args: &Args, paths: &Paths, s3: &S3Client, remote_etag: &str) -> Resu
             paths,
             &format!("[dry-run] would download and install backup (remote etag: {})", remote_etag),
         );
-        return Ok(());
+        return Ok(true);
     }
 
     // Download.
@@ -241,6 +300,14 @@ fn do_pull(args: &Args, paths: &Paths, s3: &S3Client, remote_etag: &str) -> Resu
     std::fs::write(&tmp_db, &db_bytes)
         .context("Failed to write db to temp directory")?;
 
+    // A backup that cannot be opened is never installed.  Checking here — before
+    // the local database is touched — turns "restored a corrupt file over good
+    // data" into a reported failure with the local data still in place.
+    if let Err(e) = db::check_integrity(&tmp_db) {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        bail!("Downloaded backup is unusable, local data left untouched: {:#}", e);
+    }
+
     // Merge the user dictionary.
     let merged_dict: Option<String> = match &backup_dict {
         Some(remote_dict_bytes) => {
@@ -252,21 +319,71 @@ fn do_pull(args: &Args, paths: &Paths, s3: &S3Client, remote_etag: &str) -> Resu
         None => None, // no dict in backup — leave local dict untouched
     };
 
-    if let Some(ref dict_content) = merged_dict {
-        let tmp_dict = tmp_dir.join("user_words.txt");
-        std::fs::write(&tmp_dict, dict_content.as_bytes())
-            .context("Failed to write merged dict to temp directory")?;
-        // Move dict into place before db so that if dict rename fails, db is still intact.
-        std::fs::rename(&tmp_dict, &paths.dict)
-            .context("Failed to move merged dict into place")?;
-    }
+    // ── Install ───────────────────────────────────────────────────────────
+    // Everything below happens while holding an EXCLUSIVE lock, so a `ptm`
+    // that starts up mid-install cannot be writing to the database we are
+    // about to replace.  Finding #1c was exactly that race: the lock probe
+    // released the lock before the rename, and the stale `-wal` left beside
+    // the old database was then replayed into the new one, discarding the
+    // pulled data while `--start` reported success.
+    let lock = match db::ExclusiveLock::acquire_or_create(&paths.db) {
+        Ok(Some(lock)) => lock,
+        // Another ptm started while we were downloading.
+        Ok(None) => {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            log_entry(
+                paths,
+                "Database became in use during the pull; skipping install, allowing launch",
+            );
+            eprintln!(
+                "Warning: the database is in use by another ptm process; \
+                 the pulled backup was not installed."
+            );
+            return Ok(false);
+        }
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return Err(e).context("Failed to lock the database for the install");
+        }
+    };
 
-    // Move db into place (atomic rename on same filesystem).
-    std::fs::rename(&tmp_db, &paths.db)
-        .context("Failed to move db into place")?;
+    let install = (|| {
+        // Fold the WAL in and confirm it is empty: a non-empty WAL means
+        // committed data that the file we are about to delete still owes.
+        let report = lock.checkpoint()?;
+        if !report.is_clean() {
+            bail!(
+                "cannot install the pulled backup: the local WAL could not be \
+                 checkpointed (busy={}, {} frame(s) left)",
+                report.busy,
+                report.log_frames
+            );
+        }
+        // Remove the sidecars so nothing is replayed into the new database.
+        lock.remove_wal_files()?;
+
+        if let Some(ref dict_content) = merged_dict {
+            let tmp_dict = tmp_dir.join("user_words.txt");
+            std::fs::write(&tmp_dict, dict_content.as_bytes())
+                .context("Failed to write merged dict to temp directory")?;
+            // Move dict into place before db so that if dict rename fails, db
+            // is still intact.
+            std::fs::rename(&tmp_dict, &paths.dict)
+                .context("Failed to move merged dict into place")?;
+        }
+
+        // Move db into place (atomic rename on same filesystem).
+        std::fs::rename(&tmp_db, &paths.db)
+            .context("Failed to move db into place")?;
+        Ok(())
+    })();
+
+    // Released either way: the install is over, successfully or not.
+    drop(lock);
 
     // Clean up temp dir (best effort — a leftover dir is harmless).
-    let _ = std::fs::remove_dir(&tmp_dir);
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    install?;
 
     // Record the pulled ETag.
     write_etag_file(&paths.last_pulled_etag, remote_etag)
@@ -274,18 +391,42 @@ fn do_pull(args: &Args, paths: &Paths, s3: &S3Client, remote_etag: &str) -> Resu
 
     // Record the hash of what was just installed so --end treats this pulled
     // state as the baseline.  Without this, --end would see current != last-push
-    // hash and re-upload data we just downloaded.
+    // hash and re-upload data we just downloaded.  The hash must come from the
+    // same snapshot function --end uses, or the two can never agree.
+    let installed_db_bytes = current_db_bytes(paths);
     let dict_bytes_on_disk = std::fs::read(&paths.dict).ok();
-    let installed_hash = compute_hash(&db_bytes, dict_bytes_on_disk.as_deref());
+    let installed_hash = compute_hash(&installed_db_bytes, dict_bytes_on_disk.as_deref());
     std::fs::write(&paths.db_hash, &installed_hash)
         .context("Failed to write .db_hash after pull")?;
 
     log_entry(paths, &format!("Pull complete; etag: {}", remote_etag));
 
-    Ok(())
+    Ok(true)
 }
 
 // ── --end ─────────────────────────────────────────────────────────────────────
+
+/// A push that could not run.
+///
+/// Always an error: the documented wrapper runs `trap 'ptm-sync --end' EXIT`, so
+/// a silent success means the session's work is never backed up and nobody is
+/// told.  `--local-is-master` does **not** suppress this — that flag is about
+/// S3 authority (push regardless of what the remote holds), and a user who
+/// passed it has explicitly asked for a push, so quietly skipping one and
+/// exiting 0 is the worst answer available.
+///
+/// In practice the only reachable caller is "another client is attached to the
+/// database".  That condition is itself the signal that the other session will
+/// push when it exits; the message says so rather than pretending the backup
+/// succeeded.
+fn push_refused(paths: &Paths, why: &str) -> Result<()> {
+    log_entry(paths, &format!("Push failed: {}", why));
+    bail!(
+        "Cannot back up: {}. This session's changes are NOT in S3. \
+         Re-run ptm-sync --end once the database is free.",
+        why
+    )
+}
 
 pub fn run_end(args: &Args, paths: &Paths) -> Result<()> {
     require_s3_args(args)?;
@@ -300,36 +441,60 @@ pub fn run_end(args: &Args, paths: &Paths) -> Result<()> {
     let key_path = args.key_path();
     crypto::check_key_permissions(&key_path)?;
 
-    // ── WAL file handling ─────────────────────────────────────────────────
-    if paths.db_wal.exists() {
-        log_entry(paths, "WAL file found; checking if database is in use");
-        match db::check_and_checkpoint_wal(&paths.db) {
-            Ok(true) => {
-                log_entry(paths, "Stale WAL detected; checkpointed and truncated");
-                // fall through to push logic
-            }
-            Ok(false) => {
-                log_entry(
-                    paths,
-                    "Database in use by another process; skipping push",
-                );
-                return Ok(()); // exit 0 — another ptm is still running
-            }
-            Err(e) => {
-                log_entry(paths, &format!("WAL status check error: {}; skipping push", e));
-                return Ok(());
-            }
-        }
-    }
-
     // ── --remote-is-master: skip push ─────────────────────────────────────
+    // Decided before the WAL handling, which exists only to protect the push.
     if args.remote_is_master {
         log_entry(paths, "--remote-is-master set; skipping push");
         return Ok(());
     }
 
+    // ── WAL file handling ─────────────────────────────────────────────────
+    if db::wal_size(&paths.db) > 0 {
+        log_entry(paths, "WAL file found; checking if database is in use");
+        match db::check_and_checkpoint_wal(&paths.db) {
+            Ok(Some(report)) if report.is_clean() => {
+                log_entry(
+                    paths,
+                    &format!(
+                        "Stale WAL detected; checkpointed {} frame(s) and truncated it",
+                        report.checkpointed
+                    ),
+                );
+                // fall through to push logic
+            }
+            // A checkpoint that could not advance leaves committed data in the
+            // WAL.  That is not an error as far as SQLite is concerned, so it
+            // has to be caught here (finding #1b).
+            Ok(Some(report)) => {
+                return push_refused(
+                    paths,
+                    &format!(
+                        "the WAL could not be checkpointed (busy={}, {} frame(s) left)",
+                        report.busy, report.log_frames
+                    ),
+                );
+            }
+            Ok(None) => {
+                // The other session will push when it exits.
+                return push_refused(
+                    paths,
+                    "the database is in use by another ptm process",
+                );
+            }
+            Err(e) => {
+                return Err(e)
+                    .context("WAL status check failed; refusing to push a possibly stale snapshot");
+            }
+        }
+    }
+
     // ── Hash check: skip upload if nothing changed ────────────────────────
-    let db_bytes = std::fs::read(&paths.db).context("Failed to read ptm.db")?;
+    // `snapshot_bytes`, not `std::fs::read`: committed data can still be sitting
+    // in `ptm.db-wal`, so the raw file may be missing everything since the last
+    // checkpoint (finding #2).  The snapshot is both what gets hashed and what
+    // gets packed, so the change test and the upload can never disagree.
+    let db_bytes = db::snapshot_bytes(&paths.db)
+        .context("Failed to snapshot ptm.db for upload")?;
     let dict_bytes = std::fs::read(&paths.dict).ok();
     let current_hash = compute_hash(&db_bytes, dict_bytes.as_deref());
 
@@ -413,4 +578,257 @@ pub fn run_end(args: &Args, paths: &Paths) -> Result<()> {
     log_entry(paths, "--end complete");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::snapshot_bytes;
+    use rusqlite::Connection;
+    use std::path::{Path, PathBuf};
+    use tempfile::TempDir;
+
+    /// A `Paths` rooted in a temp dir, matching what `Paths::new` derives.
+    /// A 32-byte key file with owner-only permissions, in `dir`.
+    fn make_key(dir: &TempDir) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.path().join("key.bin");
+        std::fs::write(&path, [7u8; 32]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        path
+    }
+
+    fn make_paths(dir: &TempDir) -> Paths {
+        let d = dir.path();
+        Paths {
+            data_dir: d.to_path_buf(),
+            db: d.join("ptm.db"),
+            dict: d.join("user_words.txt"),
+            local_backups: d.join("local-backups"),
+            last_pushed_etag: d.join(".last_pushed_etag"),
+            last_pulled_etag: d.join(".last_pulled_etag"),
+            db_hash: d.join(".db_hash"),
+            sync_log: d.join("ptm-sync.log"),
+        }
+    }
+
+    /// Args for `run_end`, with the key file created by the caller.
+    fn args(key: &Path) -> Args {
+        Args {
+            start: false,
+            end: true,
+            bucket_name: Some("bucket".into()),
+            prefix: Some("prefix".into()),
+            encryption_key: key.to_string_lossy().into_owned(),
+            dry_run: true,
+            local_is_master: false,
+            remote_is_master: false,
+            block_concurrent: false,
+            merge: false,
+            from: None,
+        }
+    }
+
+    /// A database whose only copy of `n` rows is in its `-wal`.
+    fn crashed_wal_db(db_path: &Path, n: i64) {
+        let conn = Connection::open(db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; \
+             PRAGMA wal_autocheckpoint=0; \
+             CREATE TABLE t (x INTEGER);",
+        )
+        .unwrap();
+        for i in 0..n {
+            conn.execute("INSERT INTO t VALUES (?1)", [i]).unwrap();
+        }
+        let wal = std::fs::read(crate::db::wal_path(db_path)).unwrap();
+        let shm = std::fs::read(crate::db::shm_path(db_path)).unwrap();
+        let main = std::fs::read(db_path).unwrap();
+        drop(conn);
+        std::fs::write(db_path, main).unwrap();
+        std::fs::write(crate::db::wal_path(db_path), wal).unwrap();
+        std::fs::write(crate::db::shm_path(db_path), shm).unwrap();
+    }
+
+    fn rows_in(db_path: &Path, sql: &str) -> i64 {
+        let conn = Connection::open(db_path).unwrap();
+        conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    fn count_in_bytes(bytes: &[u8], dir: &TempDir, tag: &str) -> i64 {
+        let path: PathBuf = dir.path().join(format!("{}.db", tag));
+        std::fs::write(&path, bytes).unwrap();
+        rows_in(&path, "SELECT count(*) FROM t")
+    }
+
+    // ── current_db_bytes ──────────────────────────────────────────────────────
+
+    #[test]
+    fn current_db_bytes_includes_data_that_is_only_in_the_wal() {
+        // Finding #2: this is the value that gets hashed and packed.  Reading
+        // ptm.db directly would return a database with no table at all.
+        let dir = TempDir::new().unwrap();
+        let paths = make_paths(&dir);
+        crashed_wal_db(&paths.db, 9);
+
+        let bytes = current_db_bytes(&paths);
+        assert_eq!(count_in_bytes(&bytes, &dir, "snap"), 9);
+    }
+
+    #[test]
+    fn current_db_bytes_is_identical_before_and_after_a_checkpoint() {
+        // The same logical state must hash the same way, or --end and --start
+        // disagree about whether anything changed.
+        let dir = TempDir::new().unwrap();
+        let paths = make_paths(&dir);
+        crashed_wal_db(&paths.db, 5);
+
+        let before = current_db_bytes(&paths);
+        crate::db::check_and_checkpoint_wal(&paths.db).unwrap().unwrap();
+        let after = current_db_bytes(&paths);
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn current_db_bytes_is_empty_when_the_database_is_absent() {
+        let dir = TempDir::new().unwrap();
+        assert!(current_db_bytes(&make_paths(&dir)).is_empty());
+    }
+
+    #[test]
+    fn current_db_bytes_is_empty_for_an_unreadable_database() {
+        let dir = TempDir::new().unwrap();
+        let paths = make_paths(&dir);
+        std::fs::write(&paths.db, b"not a database").unwrap();
+        assert!(current_db_bytes(&paths).is_empty());
+    }
+
+    // ── run_end ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn run_end_checkpoints_the_wal_before_hashing() {
+        // A --dry-run --end still does the WAL handling, and must leave the WAL
+        // empty so the bytes that would be packed are complete (finding #1b/#2).
+        let dir = TempDir::new().unwrap();
+        let paths = make_paths(&dir);
+        crashed_wal_db(&paths.db, 20);
+
+        // Record the current state as already synced, so --end stops at the
+        // change check instead of trying to reach S3.
+        let synced = compute_hash(&current_db_bytes(&paths), None);
+        std::fs::write(&paths.db_hash, &synced).unwrap();
+
+        let mut a = args(&make_key(&dir));
+        a.dry_run = true;
+        run_end(&a, &paths).unwrap();
+
+        assert_eq!(crate::db::wal_size(&paths.db), 0, "the WAL must be truncated");
+        // Everything the push would have uploaded is in the main file now.
+        let packed = std::fs::read(&paths.db).unwrap();
+        assert_eq!(count_in_bytes(&packed, &dir, "packed"), 20);
+    }
+
+    #[test]
+    fn run_end_refuses_to_push_when_the_wal_cannot_be_checkpointed() {
+        // Finding #1b: a busy checkpoint is not an error to SQLite, so it used
+        // to be reported as success and a stale snapshot was uploaded.
+        let dir = TempDir::new().unwrap();
+        let paths = make_paths(&dir);
+        crashed_wal_db(&paths.db, 3);
+
+        // Pin a read mark from this process; POSIX locks are per-process, so a
+        // second connection here *can* make the checkpoint busy.
+        let pinner = Connection::open(&paths.db).unwrap();
+        pinner.execute_batch("BEGIN; SELECT count(*) FROM sqlite_master;").unwrap();
+
+        let mut a = args(&make_key(&dir));
+        a.dry_run = true;
+        let err = run_end(&a, &paths).unwrap_err();
+        pinner.execute_batch("COMMIT").unwrap();
+
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("in use") || msg.contains("checkpointed"),
+            "expected a refusal about the WAL, got: {}",
+            msg
+        );
+        assert_ne!(
+            crate::db::wal_size(&paths.db),
+            0,
+            "the refusal must not pretend the WAL was emptied"
+        );
+    }
+
+    #[test]
+    fn run_end_still_refuses_under_local_is_master_when_the_db_is_in_use() {
+        // --local-is-master is about S3 authority, not about local concurrency.
+        // A user who passed it asked for a forced push; skipping one silently
+        // and exiting 0 would be the worst possible answer.
+        let dir = TempDir::new().unwrap();
+        let paths = make_paths(&dir);
+        crashed_wal_db(&paths.db, 3);
+
+        let pinner = Connection::open(&paths.db).unwrap();
+        pinner.execute_batch("BEGIN; SELECT count(*) FROM sqlite_master;").unwrap();
+
+        let mut a = args(&make_key(&dir));
+        a.local_is_master = true;
+        let err = run_end(&a, &paths).unwrap_err();
+
+        pinner.execute_batch("COMMIT").unwrap();
+        assert!(
+            format!("{:#}", err).contains("in use") || format!("{:#}", err).contains("checkpointed"),
+            "--local-is-master must not turn a refused push into a success: {:#}",
+            err
+        );
+    }
+
+    #[test]
+    fn run_end_skips_everything_under_remote_is_master() {
+        // A busy database is not an error for a caller that has declared the
+        // remote authoritative: it is not going to push at all.
+        let dir = TempDir::new().unwrap();
+        let paths = make_paths(&dir);
+        crashed_wal_db(&paths.db, 3);
+
+        let pinner = Connection::open(&paths.db).unwrap();
+        pinner.execute_batch("BEGIN; SELECT count(*) FROM sqlite_master;").unwrap();
+
+        let mut a = args(&make_key(&dir));
+        a.remote_is_master = true;
+        run_end(&a, &paths).unwrap();
+
+        pinner.execute_batch("COMMIT").unwrap();
+    }
+
+    #[test]
+    fn run_end_requires_an_existing_database() {
+        let dir = TempDir::new().unwrap();
+        let paths = make_paths(&dir);
+        let err = run_end(&args(&make_key(&dir)), &paths).unwrap_err();
+        assert!(format!("{:#}", err).contains("nothing to back up"));
+    }
+
+    // ── snapshot/pack agreement ───────────────────────────────────────────────
+
+    #[test]
+    fn the_hash_and_the_uploaded_bytes_come_from_the_same_snapshot() {
+        // --end hashes `db_bytes` and packs the same `db_bytes`.  If they came
+        // from different reads (raw file vs snapshot) the change test and the
+        // upload could disagree forever, re-uploading or never uploading.
+        let dir = TempDir::new().unwrap();
+        let paths = make_paths(&dir);
+        crashed_wal_db(&paths.db, 11);
+
+        let hashed = snapshot_bytes(&paths.db).unwrap();
+        crate::db::check_and_checkpoint_wal(&paths.db).unwrap().unwrap();
+        let packed = snapshot_bytes(&paths.db).unwrap();
+
+        assert_eq!(hashed, packed);
+        assert_eq!(
+            compute_hash(&hashed, None),
+            compute_hash(&packed, None),
+            "the same state must hash identically before and after a checkpoint"
+        );
+    }
 }
