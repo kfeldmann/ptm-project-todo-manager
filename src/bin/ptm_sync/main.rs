@@ -123,6 +123,8 @@ pub struct Paths {
     pub last_pulled_etag: PathBuf,
     /// .db_hash
     pub db_hash: PathBuf,
+    /// .needs_push
+    pub needs_push: PathBuf,
     /// ptm-sync.log
     pub sync_log: PathBuf,
 }
@@ -137,6 +139,7 @@ impl Paths {
             last_pushed_etag: data_dir.join(".last_pushed_etag"),
             last_pulled_etag: data_dir.join(".last_pulled_etag"),
             db_hash: data_dir.join(".db_hash"),
+            needs_push: data_dir.join(".needs_push"),
             sync_log: data_dir.join("ptm-sync.log"),
             data_dir,
         })
@@ -195,6 +198,75 @@ pub fn compute_hash(db_bytes: &[u8], dict_bytes: Option<&[u8]>) -> String {
         .collect()
 }
 
+// ── The unsynced-changes marker ───────────────────────────────────────────────
+//
+// `.db_hash` answers one question — "is the local state the same as the state
+// we last pushed or pulled?" — and two commands need to say "no, and I know it":
+//
+//   * `--merge` has just changed the local database outside any sync, so the
+//     merged state must be pushed by the next `--end`.
+//   * `--end` found changes but could not push (no network, refused upload), so
+//     the session's work is still unbacked-up.
+//
+// Both used to be expressed by *deleting* `.db_hash`, which cannot work:
+// `--start` seeds that file from the current database whenever it is missing,
+// and it has to, because a genuinely first launch has no other baseline.  A
+// deletion is therefore indistinguishable from "never synced", and the next
+// `--start` silently records the unpushed state as the sync baseline — the
+// change is then invisible to `--end` forever (finding #3).
+//
+// `.needs_push` is the out-of-band marker instead: it survives `--start`
+// (which never touches it), and only a successful push removes it.  It is
+// separate from `.db_hash` because `.db_hash` keeps its "last synced state"
+// meaning and the pull guards still need it.
+
+/// Record that the local state has to be pushed, whatever `.db_hash` says.
+///
+/// Failure to write the marker is not fatal at the call site — the push may
+/// still happen because the hash differs — but it is logged, because a silent
+/// failure is how finding #3 looked in the first place.  The one case that is
+/// then lost is a state whose hash already matches the baseline.
+pub fn mark_needs_push(paths: &Paths, reason: &str) {
+    match fs::write(&paths.needs_push, format!("{}\n", reason)) {
+        Ok(()) => log_entry(
+            paths,
+            &format!("Marked local data for upload ({}); the next --end will push it", reason),
+        ),
+        Err(e) => log_entry(
+            paths,
+            &format!(
+                "Warning: could not write {} ({}); relying on the db hash instead",
+                paths.needs_push.display(),
+                e
+            ),
+        ),
+    }
+}
+
+/// True when something recorded that the local state is not in S3 yet.
+///
+/// The file's *contents* are irrelevant — its existence is the whole signal —
+/// so an unreadable or empty marker still counts.
+pub fn needs_push(paths: &Paths) -> bool {
+    paths.needs_push.exists()
+}
+
+/// Clear the marker.  Only a successful upload may call this: clearing it
+/// without uploading is exactly the silent data loss the marker exists to
+/// prevent.
+pub fn clear_needs_push(paths: &Paths) -> Result<()> {
+    match fs::remove_file(&paths.needs_push) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| {
+            format!(
+                "Backup uploaded, but {} could not be cleared",
+                paths.needs_push.display()
+            )
+        }),
+    }
+}
+
 /// Union + dedup + sort merge of two newline-separated word lists.
 pub fn merge_dictionaries(local: &str, remote: &str) -> String {
     let mut words: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -212,29 +284,56 @@ pub fn merge_dictionaries(local: &str, remote: &str) -> String {
     out
 }
 
-/// On a network error during --start, ask the user whether to continue without
-/// pulling (requires a TTY). Returns Ok(()) to continue, Err to abort.
+/// Decide what to do after a network error during `--start`.
+///
+/// The contract is "the launch goes ahead": `--start` runs immediately before
+/// `ptm`, and a transient S3 problem must not stop the user from working.  On a
+/// terminal we ask; without one we **continue with a warning**, because a
+/// launch from a desktop launcher, a script, or over a pipe is not a decision
+/// point — there is nobody to answer, and refusing to continue turns a network
+/// blip into "ptm will not start" (finding #12).
+///
+/// The data-loss guards do not depend on this answer: a failed pull never
+/// touches the local database, and `.db_hash` / `.needs_push` are unchanged, so
+/// the skipped pull is retried on the next launch.  Callers that need a hard
+/// stop have `--block-concurrent` for the concurrency case.
+///
+/// Returns `Ok(())` to continue; `Err` only when a user who was actually asked
+/// said no, or the terminal could not be read.
 pub fn prompt_continue_without_pull(paths: &Paths, reason: &str) -> Result<()> {
     let msg = format!("Network error during pull: {}", reason);
     log_entry(paths, &format!("Warning: {}", msg));
     eprintln!("Warning: {}", msg);
 
     if !std::io::stdin().is_terminal() {
-        log_entry(paths, "No TTY detected; cannot prompt — aborting");
-        anyhow::bail!("Network error and no interactive terminal; cannot pull");
+        // Not an error: no interactive decision is possible, and the safe
+        // action (launch, keep local data, retry the pull next time) is known.
+        log_entry(
+            paths,
+            "No terminal to ask on; continuing without the pull (local data untouched)",
+        );
+        eprintln!(
+            "Continuing without the pull; local data is untouched and the pull \
+             will be retried on the next launch."
+        );
+        return Ok(());
     }
 
-    eprint!("Continue without pulling? [y/N] ");
+    eprint!("Continue without pulling? [Y/n] ");
     let _ = std::io::stderr().flush();
 
     let mut input = String::new();
     std::io::stdin().lock().read_line(&mut input)?;
 
-    if input.trim().eq_ignore_ascii_case("y") {
+    // Default to continuing: the prompt is an escape hatch for someone who
+    // wants to stop, not a gate in front of `ptm`.
+    let answer = input.trim();
+    if answer.is_empty() || answer.eq_ignore_ascii_case("y") {
         log_entry(paths, "User chose to continue without pulling");
         Ok(())
     } else {
-        anyhow::bail!("Aborted by user after network error")
+        log_entry(paths, "User declined to continue without pulling");
+        anyhow::bail!("Aborted at the user's request after a network error")
     }
 }
 
@@ -456,6 +555,59 @@ mod tests {
             merge: false,
             from: None,
         }
+    }
+
+    // ── prompt_continue_without_pull (finding #12) ─────────────────────────────
+
+    fn make_paths(dir: &TempDir) -> Paths {
+        let d = dir.path();
+        Paths {
+            data_dir: d.to_path_buf(),
+            db: d.join("ptm.db"),
+            dict: d.join("user_words.txt"),
+            local_backups: d.join("local-backups"),
+            last_pushed_etag: d.join(".last_pushed_etag"),
+            last_pulled_etag: d.join(".last_pulled_etag"),
+            db_hash: d.join(".db_hash"),
+            needs_push: d.join(".needs_push"),
+            sync_log: d.join("ptm-sync.log"),
+        }
+    }
+
+    #[test]
+    fn a_network_error_without_a_terminal_continues_the_launch() {
+        // Finding #12: `--start` runs immediately before `ptm`, and stdin is a
+        // pipe whenever it is launched from a desktop launcher, a script or a
+        // wrapper.  Refusing to continue there turns a transient S3 error into
+        // "ptm will not start".  `cargo test` runs without a TTY on stdin, so
+        // this exercises the real branch.
+        let dir = TempDir::new().unwrap();
+        let paths = make_paths(&dir);
+
+        if std::io::stdin().is_terminal() {
+            // Someone ran the suite from an interactive terminal; the branch
+            // under test is unreachable, and prompting would block the run.
+            return;
+        }
+
+        let result = prompt_continue_without_pull(&paths, "S3 HEAD request failed");
+        assert!(
+            result.is_ok(),
+            "a network error with no terminal must not abort the launch: {:#?}",
+            result.err()
+        );
+
+        let log = fs::read_to_string(&paths.sync_log).unwrap();
+        assert!(
+            !log.contains("cannot prompt"),
+            "the old abort message must be gone; log was:\n{}",
+            log
+        );
+        assert!(
+            log.contains("continuing without the pull"),
+            "the skipped pull must be recorded; log was:\n{}",
+            log
+        );
     }
 
     #[test]

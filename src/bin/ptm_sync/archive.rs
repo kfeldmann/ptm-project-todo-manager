@@ -147,6 +147,7 @@ mod tests {
             last_pushed_etag: d.join(".last_pushed_etag"),
             last_pulled_etag: d.join(".last_pulled_etag"),
             db_hash: d.join(".db_hash"),
+            needs_push: d.join(".needs_push"),
             sync_log: d.join("ptm-sync.log"),
         }
     }

@@ -3,8 +3,9 @@
 use anyhow::{bail, Context, Result};
 
 use crate::{
-    archive, compute_hash, crypto, db, log_entry, merge_dictionaries,
-    prompt_continue_without_pull, read_etag_file, write_etag_file, Args, Paths,
+    archive, clear_needs_push, compute_hash, crypto, db, log_entry, mark_needs_push,
+    merge_dictionaries, needs_push, prompt_continue_without_pull, read_etag_file,
+    write_etag_file, Args, Paths,
 };
 use crate::s3client::S3Client;
 
@@ -126,11 +127,21 @@ pub fn run_start(args: &Args, paths: &Paths) -> Result<()> {
 
     // ── Seed db hash on first launch ──────────────────────────────────────
     // .db_hash records the state at the last successful push or pull so that
-    // --end can detect whether a push is needed.  --start only creates it when
-    // absent (first launch, or the file was deleted) so that an unsynced
-    // push-failure is not silently reset by a subsequent session start.
-    // do_pull and a successful --end are the only code paths that update it.
-    if !paths.db_hash.exists() {
+    // --end can detect whether a push is needed.  --start creates it when
+    // absent (first launch) so that the very first session has a baseline.
+    //
+    // It must NOT create it when something has recorded that the local state is
+    // unpushed — a --merge, or a --end that could not upload.  Seeding there
+    // would record the unpushed state as the sync baseline and the next --end
+    // would see "no changes" and upload nothing (finding #3).  The marker is
+    // what makes that case distinguishable from a genuine first launch; see
+    // `needs_push` in main.rs.
+    if needs_push(paths) {
+        log_entry(
+            paths,
+            "Local data is marked for upload; not seeding .db_hash (the next --end must push)",
+        );
+    } else if !paths.db_hash.exists() {
         let db_bytes = current_db_bytes(paths);
         let dict_bytes = std::fs::read(&paths.dict).ok();
         let hash = compute_hash(&db_bytes, dict_bytes.as_deref());
@@ -178,7 +189,21 @@ fn evaluate_and_maybe_pull(args: &Args, paths: &Paths) -> Result<bool> {
     // Compare the current db hash against the stored last-synced hash.  A
     // mismatch means local data has changed since the last successful push or
     // pull; pulling now would clobber those unsynced changes.
+    //
+    // The `.needs_push` marker has to be checked too, not just the hash: a
+    // state that changed and was *then* recorded as the baseline (by `--start`
+    // seeding a missing `.db_hash`) matches the hash while being unpushed
+    // (finding #3).  The marker is the only thing that remembers.
     if !args.remote_is_master && db_exists {
+        if needs_push(paths) {
+            let msg = "Local data is marked as not yet pushed; \
+                       skipping pull to protect local data. \
+                       Run ptm-sync --end to push first, or use \
+                       --remote-is-master to force a pull.";
+            log_entry(paths, msg);
+            eprintln!("Warning: {}", msg);
+            return Ok(false);
+        }
         if let Ok(stored) = std::fs::read_to_string(&paths.db_hash) {
             let stored = stored.trim();
             if !stored.is_empty() {
@@ -399,12 +424,69 @@ fn do_pull(args: &Args, paths: &Paths, s3: &S3Client, remote_etag: &str) -> Resu
     std::fs::write(&paths.db_hash, &installed_hash)
         .context("Failed to write .db_hash after pull")?;
 
+    // The database on disk is now exactly what the remote holds, so nothing is
+    // waiting to be pushed — including a marker left by a `--merge` whose merge
+    // this pull has just overwritten.  Leaving it would make the next `--end`
+    // re-upload the same state for no reason.
+    clear_needs_push(paths)
+        .context("Failed to clear the upload marker after a pull")?;
+
     log_entry(paths, &format!("Pull complete; etag: {}", remote_etag));
 
     Ok(true)
 }
 
 // ── --end ─────────────────────────────────────────────────────────────────────
+
+/// What `--end` should do about the upload, given the sync baseline.
+///
+/// Kept as a value (rather than inlined in `run_end`) so the decision can be
+/// tested without a database, a key, or S3 — it is the part that finding #3 is
+/// about, and getting it wrong loses data silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadDecision {
+    /// The local state is what we last pushed or pulled: nothing to upload.
+    Skip,
+    /// The hash differs from the baseline: upload.
+    Push,
+    /// A `.needs_push` marker is set: upload even though the hash matches.
+    PushBecauseMarked,
+}
+
+/// Decide whether `--end` uploads.
+///
+/// The marker wins over the hash.  Without that rule, a state that was recorded
+/// as the baseline *after* it changed (by `--start` re-seeding a missing
+/// `.db_hash`) is indistinguishable from a synced one, and the change is never
+/// pushed (finding #3).  An absent or empty baseline means "never synced", which
+/// always pushes.
+fn upload_decision(marked: bool, stored_hash: &str, current_hash: &str) -> UploadDecision {
+    if marked {
+        return UploadDecision::PushBecauseMarked;
+    }
+    if !stored_hash.is_empty() && stored_hash == current_hash {
+        return UploadDecision::Skip;
+    }
+    UploadDecision::Push
+}
+
+/// Record that a refused push left the local state unpushed.
+///
+/// The refusal is reported as an error, but that is not the end of the story:
+/// this session's changes are still on disk and still unbacked-up.  The marker
+/// is what makes the next `--end` push them even if `--start` runs first and
+/// re-seeds `.db_hash` (finding #3).  A non-zero exit alone is not enough — the
+/// documented wrapper is `trap 'ptm-sync --end' EXIT`, which discards it.
+///
+/// `--dry-run` promises to leave the data directory alone, so there it only
+/// says what it would have done.
+fn mark_refusal(paths: &Paths, dry_run: bool, why: &str) {
+    if dry_run {
+        log_entry(paths, &format!("[dry-run] would mark local data for upload: {}", why));
+    } else {
+        mark_needs_push(paths, why);
+    }
+}
 
 /// A push that could not run.
 ///
@@ -419,7 +501,8 @@ fn do_pull(args: &Args, paths: &Paths, s3: &S3Client, remote_etag: &str) -> Resu
 /// database".  That condition is itself the signal that the other session will
 /// push when it exits; the message says so rather than pretending the backup
 /// succeeded.
-fn push_refused(paths: &Paths, why: &str) -> Result<()> {
+fn push_refused(paths: &Paths, dry_run: bool, why: &str) -> Result<()> {
+    mark_refusal(paths, dry_run, why);
     log_entry(paths, &format!("Push failed: {}", why));
     bail!(
         "Cannot back up: {}. This session's changes are NOT in S3. \
@@ -468,6 +551,7 @@ pub fn run_end(args: &Args, paths: &Paths) -> Result<()> {
             Ok(Some(report)) => {
                 return push_refused(
                     paths,
+                    args.dry_run,
                     &format!(
                         "the WAL could not be checkpointed (busy={}, {} frame(s) left)",
                         report.busy, report.log_frames
@@ -478,6 +562,7 @@ pub fn run_end(args: &Args, paths: &Paths) -> Result<()> {
                 // The other session will push when it exits.
                 return push_refused(
                     paths,
+                    args.dry_run,
                     "the database is in use by another ptm process",
                 );
             }
@@ -502,11 +587,28 @@ pub fn run_end(args: &Args, paths: &Paths) -> Result<()> {
         .unwrap_or_default();
     let stored_hash = stored_hash.trim();
 
-    if !stored_hash.is_empty() && stored_hash == current_hash {
-        log_entry(paths, "No changes detected since last sync; skipping upload");
-        return Ok(());
+    // A pending `.needs_push` marker means the local state is known to be
+    // unpushed even if the hash matches — `--start` may have re-seeded the
+    // baseline (finding #3), or an earlier `--end` failed to upload.  The
+    // marker outranks the hash.
+    let marked = needs_push(paths);
+    if marked {
+        log_entry(
+            paths,
+            "Local data is marked for upload; pushing regardless of the db hash",
+        );
     }
-    log_entry(paths, "Changes detected; preparing upload");
+
+    match upload_decision(marked, stored_hash, &current_hash) {
+        UploadDecision::Skip => {
+            log_entry(paths, "No changes detected since last sync; skipping upload");
+            return Ok(());
+        }
+        UploadDecision::Push => {}
+        UploadDecision::PushBecauseMarked => {
+            // Already logged above; the point is that the marker won.
+        }
+    }
 
     // ── Check remote ETag before deciding to push ─────────────────────────
     let bucket = args.bucket_name.as_deref().unwrap_or_default();
@@ -524,6 +626,7 @@ pub fn run_end(args: &Args, paths: &Paths) -> Result<()> {
     // that we ourselves pushed (remote_etag == last_pushed_etag).
     let we_own_the_remote = stored_pushed_etag.is_some() && stored_pushed_etag == remote_etag;
     if stored_pulled_etag.is_none() && remote_etag.is_some() && !args.local_is_master && !we_own_the_remote {
+        mark_refusal(paths, args.dry_run, "a push was refused because the remote has never been pulled");
         anyhow::bail!(
             "A remote backup exists but this machine has never pulled it. \
              Pull first, or use --local-is-master to force overwrite."
@@ -537,6 +640,7 @@ pub fn run_end(args: &Args, paths: &Paths) -> Result<()> {
         || remote_etag == stored_pushed_etag;
 
     if !can_push {
+        mark_refusal(paths, args.dry_run, "a push was refused because the remote has changed");
         anyhow::bail!(
             "Remote backup has been updated since our last pull (ETag mismatch). \
              Pull first to reconcile, or use --local-is-master to force overwrite."
@@ -562,7 +666,17 @@ pub fn run_end(args: &Args, paths: &Paths) -> Result<()> {
     }
 
     log_entry(paths, "Uploading to S3");
-    let new_etag = s3.upload(&encrypted).context("Failed to upload backup to S3")?;
+    let new_etag = match s3.upload(&encrypted) {
+        Ok(etag) => etag,
+        Err(e) => {
+            // The upload itself failed: this session's work is not in S3, and
+            // the shell wrapper's `trap … EXIT` will not look at the exit code.
+            // Record the marker so the next `--end` pushes regardless of what
+            // `.db_hash` says by then.
+            mark_needs_push(paths, "the upload to S3 failed");
+            return Err(e).context("Failed to upload backup to S3");
+        }
+    };
 
     write_etag_file(&paths.last_pushed_etag, &new_etag)
         .context("Failed to write .last_pushed_etag")?;
@@ -573,6 +687,12 @@ pub fn run_end(args: &Args, paths: &Paths) -> Result<()> {
     // leaves the old hash in place, causing the next --end to retry the push.
     std::fs::write(&paths.db_hash, &current_hash)
         .context("Failed to write .db_hash")?;
+
+    // The state in S3 and the state on disk now match, so nothing is pending.
+    // Only a confirmed upload clears this; every failure path above leaves it
+    // set so the next `--end` tries again.
+    clear_needs_push(paths)
+        .context("Failed to clear the upload marker after a successful push")?;
 
     log_entry(paths, &format!("Upload complete; etag: {}", new_etag));
     log_entry(paths, "--end complete");
@@ -608,6 +728,7 @@ mod tests {
             last_pushed_etag: d.join(".last_pushed_etag"),
             last_pulled_etag: d.join(".last_pulled_etag"),
             db_hash: d.join(".db_hash"),
+            needs_push: d.join(".needs_push"),
             sync_log: d.join("ptm-sync.log"),
         }
     }
@@ -807,6 +928,209 @@ mod tests {
         let paths = make_paths(&dir);
         let err = run_end(&args(&make_key(&dir)), &paths).unwrap_err();
         assert!(format!("{:#}", err).contains("nothing to back up"));
+    }
+
+
+    // ── the unsynced-changes marker (finding #3) ──────────────────────────────
+
+    /// A database with one project, closed cleanly, so the main file is
+    /// complete and `snapshot_bytes` has something to hash.
+    fn db_with_project(paths: &Paths, title: &str) {
+        let conn = Connection::open(&paths.db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS projects (
+                 id TEXT PRIMARY KEY, title TEXT NOT NULL,
+                 description TEXT NOT NULL DEFAULT '',
+                 sort_order REAL NOT NULL DEFAULT 0.0,
+                 archived INTEGER NOT NULL DEFAULT 0,
+                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO projects VALUES (?1, ?2, '', 1.0, 0,
+                 '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z')",
+            rusqlite::params![format!("p-{}", title), title],
+        )
+        .unwrap();
+    }
+
+    fn hash_now(paths: &Paths) -> String {
+        compute_hash(&current_db_bytes(paths), None)
+    }
+
+    #[test]
+    fn a_marker_outranks_a_matching_hash() {
+        // The exact shape of finding #3: the hash says "already synced" while
+        // the state is known to be unpushed.  The marker has to win, or the
+        // merge result is never uploaded.
+        assert_eq!(
+            upload_decision(true, "abc", "abc"),
+            UploadDecision::PushBecauseMarked
+        );
+        assert_eq!(
+            upload_decision(true, "", ""),
+            UploadDecision::PushBecauseMarked
+        );
+    }
+
+    #[test]
+    fn without_a_marker_the_hash_decides() {
+        assert_eq!(upload_decision(false, "abc", "abc"), UploadDecision::Skip);
+        assert_eq!(upload_decision(false, "abc", "def"), UploadDecision::Push);
+        // No baseline at all means "never synced", which always pushes.
+        assert_eq!(upload_decision(false, "", "abc"), UploadDecision::Push);
+    }
+
+    #[test]
+    fn mark_and_clear_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let paths = make_paths(&dir);
+        assert!(!needs_push(&paths));
+
+        mark_needs_push(&paths, "merged");
+        assert!(needs_push(&paths), "the marker must be visible to --end");
+
+        clear_needs_push(&paths).unwrap();
+        assert!(!needs_push(&paths));
+        // Clearing twice is not an error: --end may run on a clean tree.
+        clear_needs_push(&paths).unwrap();
+    }
+
+    #[test]
+    fn an_empty_marker_file_still_counts() {
+        // Existence is the signal, not the contents: a truncated or empty file
+        // left by a crash must not be read as "nothing to push".
+        let dir = TempDir::new().unwrap();
+        let paths = make_paths(&dir);
+        std::fs::write(&paths.needs_push, b"").unwrap();
+        assert!(needs_push(&paths));
+    }
+
+    #[test]
+    fn run_start_does_not_seed_the_hash_while_a_push_is_pending() {
+        // Finding #3 end to end at the function level: --merge (or a failed
+        // --end) marks the data, --start runs, and the unpushed state must not
+        // be recorded as the sync baseline.
+        let dir = TempDir::new().unwrap();
+        let paths = make_paths(&dir);
+        db_with_project(&paths, "merged");
+        mark_needs_push(&paths, "the local database was merged");
+
+        let mut a = args(&make_key(&dir));
+        a.start = true;
+        a.end = false;
+        a.local_is_master = true; // skip the pull; this test is about the seed
+        a.dry_run = false;
+        run_start(&a, &paths).unwrap();
+
+        assert!(
+            !paths.db_hash.exists(),
+            ".db_hash must stay absent so the next --end sees work to do"
+        );
+        assert!(needs_push(&paths), "the marker must survive --start");
+    }
+
+    #[test]
+    fn run_start_still_seeds_the_hash_on_a_genuine_first_launch() {
+        // The guard must not break the case it exists for: a brand-new data
+        // directory has no baseline and needs one.
+        let dir = TempDir::new().unwrap();
+        let paths = make_paths(&dir);
+        db_with_project(&paths, "first");
+
+        let mut a = args(&make_key(&dir));
+        a.start = true;
+        a.end = false;
+        a.local_is_master = true;
+        a.dry_run = false;
+        run_start(&a, &paths).unwrap();
+
+        assert!(paths.db_hash.exists(), "a first launch needs a baseline");
+        assert_eq!(
+            std::fs::read_to_string(&paths.db_hash).unwrap().trim(),
+            hash_now(&paths)
+        );
+    }
+
+    #[test]
+    fn a_refused_push_marks_the_data_for_the_next_run() {
+        // Finding #3's other half: --end exits non-zero, but the wrapper's
+        // `trap … EXIT` throws that away, so the refusal itself has to leave a
+        // trace or the session's work is lost.
+        let dir = TempDir::new().unwrap();
+        let paths = make_paths(&dir);
+        db_with_project(&paths, "unsaved");
+
+        // A WAL has to exist for --end to probe, and a read mark held by
+        // another connection in this process makes the checkpoint busy.
+        let pinner = Connection::open(&paths.db).unwrap();
+        pinner
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA wal_autocheckpoint=0;
+                 INSERT INTO projects VALUES ('p2', 'x', '', 2.0, 0,
+                     '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z');
+                 BEGIN;
+                 SELECT count(*) FROM sqlite_master;",
+            )
+            .unwrap();
+        assert!(crate::db::wal_size(&paths.db) > 0, "precondition: a live WAL");
+
+        // Not a dry run: --dry-run must not touch the data directory, and this
+        // test is about the marker a *real* refusal leaves behind.  The refusal
+        // happens at the WAL check, well before any S3 call.
+        let mut a = args(&make_key(&dir));
+        a.dry_run = false;
+        let err = run_end(&a, &paths).unwrap_err();
+        pinner.execute_batch("COMMIT").unwrap();
+
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("in use") || msg.contains("checkpointed"),
+            "expected a WAL refusal, got: {}",
+            msg
+        );
+        assert!(
+            needs_push(&paths),
+            "a refused push must leave the data marked for the next --end"
+        );
+    }
+
+    #[test]
+    fn a_dry_run_end_neither_sets_nor_clears_the_marker() {
+        // --dry-run promises to leave the data directory alone, so it must not
+        // write the marker on a refusal — and only a confirmed upload may clear
+        // it, which a dry run never performs.
+        let dir = TempDir::new().unwrap();
+        let paths = make_paths(&dir);
+        db_with_project(&paths, "pending");
+
+        // (a) a pending marker survives a dry run
+        mark_needs_push(&paths, "merged");
+        let mut a = args(&make_key(&dir));
+        a.dry_run = true;
+        let _ = run_end(&a, &paths);
+        assert!(needs_push(&paths), "a dry run must not clear the marker");
+
+        // (b) a refused push under --dry-run does not create one
+        std::fs::remove_file(&paths.needs_push).unwrap();
+        let pinner = Connection::open(&paths.db).unwrap();
+        pinner
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA wal_autocheckpoint=0;
+                 INSERT INTO projects VALUES ('p2', 'x', '', 2.0, 0,
+                     '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z');
+                 BEGIN;
+                 SELECT count(*) FROM sqlite_master;",
+            )
+            .unwrap();
+        let _ = run_end(&a, &paths);
+        pinner.execute_batch("COMMIT").unwrap();
+        assert!(
+            !needs_push(&paths),
+            "a --dry-run refusal must not touch the data directory"
+        );
     }
 
     // ── snapshot/pack agreement ───────────────────────────────────────────────

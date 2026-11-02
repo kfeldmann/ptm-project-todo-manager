@@ -76,7 +76,7 @@ the `/etc/hosts` entry, which is host state — `s3-roundtrip.py` will print
 | Script | Findings | Covers |
 |---|---|---|
 | `wal-safety.py` | 1a, 1b, 1c, 2 | WAL liveness probe, checkpoint return value, non-atomic install, stale-snapshot push (drives the real binary against the fake S3 — needs the hosts entry) |
-| `sync-state.py` | 3, 12 | `.db_hash` seeding after `--merge`, non-TTY network-failure behaviour |
+| `sync-state.py` | 3, 12, 2 (exit code) | `--merge` → `--start` → `--end` uploads the merged state; a refused `--end` exits non-zero and queues the work; non-TTY network-failure behaviour |
 | `merge-robust.py` | 7, 8, 9 | legacy local db, dangling FK, `sort_order` policy for `updates` |
 | `panics.py` | 4, 5, 13 | key-help wrap at narrow widths, `~` key path, non-ASCII date truncation |
 | `keyhelp-widths.py` | 4 | exhaustive width sweep over the real `key_help_lines()` strings |
@@ -129,11 +129,23 @@ crashed `ptm` leaves behind. Two consequences worth knowing before editing it:
   harness SKIPs without it (exit 0). `s3-roundtrip.py` covers the same ground
   for the happy path; `wal-safety.py` is the authority for the failure modes.
 
-## Verification status (2026-11-01, after session A — `ptm-sync` WAL safety)
+## Verification status (2026-11-01, after session B — sync state machine)
 
-Session A fixed findings 1b, 1c and 2 (plus a corrupt-backup install guard); `wal-safety.py` is **23/23 green** and
-`s3-roundtrip.py` is still **12/12**. The remaining harnesses are unchanged and
-still fail, because their findings belong to sessions B–H.
+Session A fixed findings 1b, 1c and 2's snapshot half; session B fixed 3 and 12
+and settled 2's exit-code half. `wal-safety.py` is **23/23**, `sync-state.py`
+**20/20**, `s3-roundtrip.py` **12/12**. `merge-robust.py`, `panics.py` and
+`search-highlight.py` are unchanged and still fail, because their findings
+belong to sessions C, D and G.
+
+### Why `sync-state.py` changed shape in session B
+
+Its original #3 check hand-built the state `merge.rs` produced (a database plus
+a *deleted* `.db_hash`) and asserted that `--start` left `.db_hash` absent.
+That asserts the old *mechanism*: it fails for the correct fix (which no longer
+deletes the file) and would pass for any change that kept deleting it. It now
+drives the real `--merge`, asserts the behaviour the review is about — the
+merged state reaches S3 — and was re-run against the unfixed tree (13/17) to
+confirm it still catches the bug.
 
 Where a harness result differs from the review's write-up, the review is the
 thing that is wrong — these harnesses were run, the review's `/tmp`
@@ -144,14 +156,15 @@ reproductions were not preserved.
 | 1a (WAL probe unsound) | **does not reproduce as described** | The review says `BEGIN EXCLUSIVE` *succeeds* with an idle-but-open session, so the probe wrongly concludes "no other process". A real child process holding the db open (`PRAGMA journal_mode=WAL` + a `SELECT`, no transaction) makes `BEGIN EXCLUSIVE` **fail** with `database is locked` after the busy timeout. `check_and_checkpoint_wal` therefore returns `Ok(false)` correctly, and `--end` logs "in use; skipping push". The probe is *not* the data-loss path. |
 | 1b (checkpoint result ignored) | **reproduces; fixed in session A** | `wal_checkpoint(TRUNCATE)` returns `(busy=1, log=N, checkpointed=0)` and raises nothing, so `execute_batch` reports success while the WAL stays full. Confirmed. |
 | 1c (non-atomic install) | **reproduces, narrower than claimed; fixed in session A** | The *lost-pull* variant is real and reproducible: rename over a db with a live `-wal` leaves the stale WAL, and after the live session exits the **local data wins and the pulled backup is gone**, with `--start` reporting success. The *"database disk image is malformed"* variant did **not** reproduce in several attempts (page sizes 4096/8192, reader/writer holders, differing schema): after replay, `integrity_check` returned `ok`. Treat "malformed" as unconfirmed and the lost-pull as the concrete bug. |
-| 2 (`--end` packs WAL-less db) | **reproduces; fixed in session A** | The bytes `std::fs::read(&paths.db)` returns contain **zero** committed rows while the live connection sees all 50. Separately confirmed: a skipped push exits **0**, so `trap 'ptm-sync --end' EXIT` sees success. |
-| 3 (`.db_hash` seeding) | **reproduces** | After `--start` with no `.db_hash`, the file is re-created from the current db; current == stored, so the next `--end` logs "No changes detected" and the merge result is never pushed. |
+| 2 (`--end` packs WAL-less db) | **reproduces; fixed in session A** | The bytes `std::fs::read(&paths.db)` returns contain **zero** committed rows while the live connection sees all 50. |
+| 2 (skipped push exit code) | **fixed in sessions A + B** | A skipped push exited **0**, so `trap 'ptm-sync --end' EXIT` saw success. A now exits non-zero; B additionally leaves a `.needs_push` marker, because the trap discards the code. |
+| 3 (`.db_hash` seeding) | **reproduces; fixed in session B** | `--merge` deleted `.db_hash` to force a push, but `--start` re-created it from the current db, so the merged state became the sync baseline and the next `--end` logged "No changes detected". Replaced with a `.needs_push` marker that `--start` never touches. The harness now drives the real `--merge` and asserts the merged state reaches S3. |
 | 4 (key-help panic) | **reproduces** | Panics at `desc_width` **1, 2, 5, 6, 19, 20** (the review quotes terminal widths 21/22/25/26/39/40; the panic depends on the computed description width, so the fix's test should sweep `desc_width`, not terminal width). Only 3 of the 62 descriptions contain multi-byte characters, all involving `→`. |
 | 5 (`~` key path) | **reproduces** | `--encryption-key '~'` panics: `start byte index 2 is out of bounds for string of length 1`. `'~x'` silently resolves to `$HOME/`. |
 | 7 (legacy local db) | **reproduces** | Merge aborts with `table todos has no column named archived` — note the first failing column is `todos.archived`, not `updates.label` as the review states. |
 | 8 (dangling FK) | **reproduces** | `FOREIGN KEY constraint failed`, whole merge rolled back. |
 | 9 (updates ordering) | **reproduces** | Local `L1(0), L2(-1), L3(-2)` + foreign `R1(0), R2(-1)` renders `L3, L2, R2, L1, R1` — interleaved, not `L1..L3, R1..R2`. |
-| 12 (non-TTY abort) | **reproduces** | `--start` exits 1 with "Network error and no interactive terminal; cannot pull" when stdin is a pipe. |
+| 12 (non-TTY abort) | **reproduces; fixed in session B** | `--start` exited 1 with "Network error and no interactive terminal; cannot pull" when stdin was a pipe. It now continues with a warning and leaves the local data untouched, so `ptm` still launches. |
 | 13 (byte-sliced dates) | **reproduces** | `&s[..10]` panics on `"2025-01-1é"` (`not a char boundary`). Note `"→2025-01-01"` does *not* panic — the boundary has to land mid-character. |
 | 17 (`split_span`) | **reproduces** | Searching `İ` in `İstanbul` highlights `İs` instead of `İ`. Searching `i` highlights `İ` correctly. |
 

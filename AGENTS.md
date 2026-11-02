@@ -183,7 +183,10 @@ Merges a diverged ptm data directory into the local one.  Implemented in
   merge runs in a single `BEGIN IMMEDIATE` transaction and rolls back on
   any error.
 - **`user_words.txt`** is union-merged (dedup + sort), like a pull.
-- **`.db_hash` is deleted** so the next `--end` pushes the merged state.
+- **`.needs_push` is written** so the next `--end` pushes the merged state.
+  Deleting `.db_hash` would not work: `--start` re-seeds it from the current
+  database whenever it is missing, so the merged-but-unpushed state would be
+  recorded as the sync baseline and never uploaded.
 - **Known limitation**: deletions are not propagated — a row deleted on one
   side is resurrected by the other side's surviving copy (tombstones would
   be needed for true delete propagation).
@@ -258,7 +261,8 @@ All files live alongside `ptm.db` in `$XDG_DATA_HOME/ptm/` (default
 |------|-------------|
 | `.last_pushed_etag` | ETag of the last object we uploaded |
 | `.last_pulled_etag` | ETag of the last object we downloaded |
-| `.db_hash` | SHA-256 of `ptm.db ∥ user_words.txt` at the last successful push or pull; updated by `--end` on a successful push and by `do_pull` on a successful pull; seeded by `--start` only when absent (first launch) |
+| `.db_hash` | SHA-256 of `ptm.db ∥ user_words.txt` at the last successful push or pull; updated by `--end` on a successful push and by `do_pull` on a successful pull; seeded by `--start` only when absent (first launch) and no push is pending |
+| `.needs_push` | Present when the local state is known to be unpushed, whatever `.db_hash` says. Written by `--merge`, by a refused `--end` (busy WAL, ETag guards, failed upload) and cleared only by a confirmed upload or an install during a pull. Its existence is the signal; the contents are a human-readable reason |
 | `ptm-sync.log` | Append-only sync activity log |
 | `local-backups/` | Rolling local zip snapshots created before each pull (up to 5 kept); also holds `ptm-premerge-*.db` snapshots created before each merge (up to 5 kept) |
 
@@ -287,7 +291,9 @@ Behaviour:
   before syncing.
 - If another ptm process is running, or the checkpoint cannot advance, `--start`
   skips the pull (allowing concurrent launch) unless `--block-concurrent` is
-  given.
+  given. A network error during the pull is treated the same way: on a terminal
+  it asks, without one it continues with a warning — `--start` runs immediately
+  before `ptm`, so failing it means `ptm` does not start at all.
 - The "is another process running?" check is gated on `ptm.db-wal` being
   non-empty, because probing for a lock creates the `-wal`/`-shm` sidecars. A
   concurrent session that has not written anything is therefore not detected by
@@ -307,6 +313,40 @@ Behaviour:
 - Every connection here sets `busy_timeout` (5 s, matching `src/data/db.rs`);
   without it a probe against a busy database fails instantly, making "in use"
   indistinguishable from "broken".
+
+### Sync State Machine
+
+Two files decide whether `--end` uploads, and neither is sufficient alone.
+
+- **`.db_hash`** is the "last synced state" baseline: `--end` compares the
+  current snapshot's hash against it. `--start` seeds it when it is absent,
+  because a genuinely first launch has no baseline — which is exactly why
+  *deleting* it cannot mean "please push". `--start` would recreate it from the
+  current database and record the unpushed state as synced.
+- **`.needs_push`** is the out-of-band "this is unpushed, whatever the hash
+  says" marker. Its existence is the signal. It is written by `--merge`, by
+  every refused `--end` (busy WAL, either ETag guard, a failed upload) and is
+  cleared only by a confirmed upload or by the install during a pull. `--end`
+  pushes when the marker is present even if the hash matches, and `--start`
+  never seeds `.db_hash` while it is present.
+
+Failure semantics follow from the documented wrapper
+(`trap 'ptm-sync --end' EXIT; ptm`), which discards the exit code:
+
+- A push that cannot run is an **error** (non-zero exit) *and* leaves the
+  marker, so the work is retried by the next `--end` rather than lost.
+- `--start` is on the launch path, so it **does not fail the launch** for a
+  recoverable problem. A network error asks on a terminal and continues with a
+  warning without one; only `--block-concurrent` (a deliberate request to abort
+  on a concurrent session) turns a skip into a hard failure. A skipped pull
+  never touches the local database, so continuing is safe.
+- `--dry-run` reports what it would do and writes nothing, including the
+  marker.
+
+The corresponding functions live in `src/bin/ptm_sync/main.rs`
+(`mark_needs_push`, `needs_push`, `clear_needs_push`,
+`prompt_continue_without_pull`) and `src/bin/ptm_sync/ops.rs`
+(`upload_decision`, `mark_refusal`, `push_refused`).
 
 ### AWS Credentials
 

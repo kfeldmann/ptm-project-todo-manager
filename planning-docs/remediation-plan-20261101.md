@@ -9,7 +9,7 @@
 | # | Status | Session | Findings | Files touched |
 |---|---|---|---|---|
 | **A** | DONE | `ptm-sync` WAL safety | **1, 2** | `ptm_sync/db.rs`, `ops.rs`, `archive.rs` |
-| **B** | | Sync state machine & failure semantics | **3, 12**, exit-code half of 2 | `ptm_sync/ops.rs`, `main.rs`, `merge.rs` (1 line) |
+| **B** | DONE | Sync state machine & failure semantics | **3, 12**, exit-code half of 2 | `ptm_sync/ops.rs`, `main.rs`, `merge.rs` (1 line) |
 | **C** | | `merge` robustness | **7, 8, 9** | `ptm_sync/merge.rs` |
 | **D** | | Crash fixes | **4, 5, 13** | `views/overlay.rs`, `ptm_sync/main.rs`, `bin/enc/main.rs`, `crypto.rs`, `views/{mod,project_list,todo_list,project_detail}.rs` |
 | **E** | | Key handling & render purity | **6, 14, 15, 23** | `app.rs`, `views/project_detail.rs`, `views/overlay.rs` |
@@ -88,6 +88,62 @@ now pin the behaviour that must hold instead of a defect).
 - Deliberately **not** done here: `merge.rs`'s one-line `.db_hash` sentinel (#3,
   session B) and its `sort_order` policy (#9, session C). `merge.rs` changed only
   to follow `check_and_checkpoint_wal`'s new return type.
+
+---
+
+### B — Sync state machine & failure semantics — **done**
+
+Findings #3 and #12 fixed, and #2's exit-code half settled so the semantics live
+in one place.
+
+- **#3 — the unsynced-changes guard.** The root cause was that "push this next
+  time" was expressed as *deleting* `.db_hash`, which `--start` must re-seed
+  (a first launch has no baseline). A deletion is indistinguishable from "never
+  synced", so the merged state became the baseline and `--end` reported "no
+  changes" forever. There is now an out-of-band `.needs_push` marker
+  (`mark_needs_push` / `needs_push` / `clear_needs_push` in `main.rs`) that
+  `--start` never touches: `--start` refuses to seed `.db_hash` while it is
+  present, and `--end` pushes regardless of the hash while it is present. Only a
+  confirmed upload — or the install during a pull, after which disk and remote
+  agree — clears it.
+- **#2's exit-code half.** A refused push already exited non-zero (session A),
+  but the documented wrapper is `trap 'ptm-sync --end' EXIT`, which discards the
+  code, so the refusal now also leaves the marker: busy WAL, both ETag guards
+  and a failed upload all mark the state for the next `--end`. The push decision
+  is now a testable value (`upload_decision` → `Skip` / `Push` /
+  `PushBecauseMarked`) instead of an inline `if`. `--dry-run` still writes
+  nothing, so its refusal only logs what it would have done (`mark_refusal`).
+- **#12 — the launch must not be blocked.** `prompt_continue_without_pull` now
+  *continues* when stdin is not a TTY (with a warning and a log line) instead of
+  aborting; on a terminal the prompt defaults to continuing. The skipped pull
+  never touches the local database, and `.db_hash` / `.needs_push` are unchanged,
+  so the pull is simply retried on the next launch. Only `--block-concurrent`
+  turns a skip into a hard failure, which is the case where the user asked for
+  one.
+- Tests: 441 → **450**, all green (36 + 82 + 214 + 118). New `ops.rs` tests
+  cover the marker outranking a matching hash, `mark`/`clear` round trips (an
+  empty marker file still counts), `--start` refusing to seed while a push is
+  pending and still seeding on a genuine first launch, a refused push leaving
+  the marker, and `--dry-run` neither setting nor clearing it. A new `main.rs`
+  test exercises the real non-TTY network path (`cargo test` has no TTY on
+  stdin).
+- `sync-state.py` went from 2/5 to **20/20**, and now includes a real
+  `--merge` → `--start` → `--end` round trip against `lib/fakes3.py` asserting
+  the merged state actually reaches S3, a second `--end` not re-uploading, and a
+  refused `--end` both exiting non-zero and queueing the work.
+- **The harness had to change shape**, which the procedure requires be
+  justified. Its old #3 check hand-built the state `merge.rs` used to produce
+  (a database plus a *deleted* `.db_hash`) and then asserted `--start` left
+  `.db_hash` absent. That is a test of the old mechanism, not of the behaviour:
+  it fails for the correct fix and would have passed for any change that kept
+  deleting the file. It now drives the real `--merge` and asserts what the
+  review actually cares about — that the merged state gets uploaded — and it was
+  re-run against the unfixed tree (13/17) to confirm it still catches the bug.
+- `wal-safety.py` is still **23/23** and `s3-roundtrip.py` still **12/12**;
+  `merge-robust.py`, `panics.py` and `search-highlight.py` are unchanged and
+  still fail, because their findings belong to sessions C, D and G.
+- AGENTS.md gains a §Sync State Machine section stating which file means what,
+  and the merge section no longer claims `.db_hash` is deleted.
 
 ---
 
@@ -358,10 +414,10 @@ any finding.
 | Finding | Harness | Currently |
 |---|---|---|
 | 1a | `wal-safety.py` | does not reproduce (see above) |
-| 1b | `wal-safety.py` | FAIL — live |
-| 1c | `wal-safety.py` | FAIL — live (lost-pull variant) |
-| 2 | `wal-safety.py` | FAIL — live (both snapshot and exit code) |
-| 3 | `sync-state.py` | FAIL — live |
+| 1b | `wal-safety.py` | PASS — fixed in A |
+| 1c | `wal-safety.py` | PASS — fixed in A (lost-pull variant) |
+| 2 | `wal-safety.py` | PASS — fixed in A (snapshot), exit code in A+B |
+| 3 | `sync-state.py` | PASS — fixed in B |
 | 4 | `panics.py`, `keyhelp-widths.py` | FAIL — live |
 | 5 | `panics.py` | FAIL — live |
 | 6 | — | not covered (needs a terminal) |
@@ -370,10 +426,11 @@ any finding.
 | 9 | `merge-robust.py` | FAIL — live |
 | 10 | — | not covered (add a `repo` unit test) |
 | 11 | — | not covered (add a `repo` unit test) |
-| 12 | `sync-state.py` | FAIL — live |
+| 12 | `sync-state.py` | PASS — fixed in B |
 | 13 | `panics.py` | FAIL — live |
 | 14, 15 | — | judgement calls |
 | 16 | — | not covered |
 | 17 | `search-highlight.py` | FAIL — live |
 | 2, 3, 1c (partial) | `s3-roundtrip.py` | **12/12 passing** (happy path; #1c race not asserted — see above) |
+| 2 (exit code) | `sync-state.py`, `wal-safety.py` | PASS — fixed in A, marker added in B |
 | 18–24 | — | polish / docs |

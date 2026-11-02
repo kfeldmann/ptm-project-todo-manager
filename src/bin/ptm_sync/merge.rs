@@ -115,7 +115,9 @@ CREATE TABLE IF NOT EXISTS reference_tags (
 ///    (guarded ALTER TABLE migrations, mirroring `migrate()` in the app).
 /// 5. ATTACH the copy, run the merge inside one transaction, DETACH.
 /// 6. Union-merge `user_words.txt` from both sides.
-/// 7. Invalidate `.db_hash` so the next `--end` pushes the merged state.
+/// 7. Mark the local data for upload so the next `--end` pushes the merged
+///    state (`.needs_push`; see `mark_needs_push` — deleting `.db_hash` is
+///    not enough, `--start` re-seeds it).
 pub fn run_merge(paths: &crate::Paths, from_dir: &Path, dry_run: bool) -> Result<()> {
     let from_db = from_dir.join("ptm.db");
 
@@ -214,8 +216,12 @@ pub fn run_merge(paths: &crate::Paths, from_dir: &Path, dry_run: bool) -> Result
     }
 
     // ── Invalidate the sync baseline ──────────────────────────────────────
-    let _ = std::fs::remove_file(&paths.db_hash);
-    crate::log_entry(paths, "Removed .db_hash; next --end will push the merged state");
+    // A marker, not a deleted `.db_hash`: `--start` re-seeds `.db_hash` from
+    // the current database whenever it is missing, so deleting it would record
+    // the merged-but-unpushed state as the sync baseline and the next `--end`
+    // would see "no changes" and upload nothing (finding #3).  The marker
+    // survives `--start` and is cleared only by a confirmed push.
+    crate::mark_needs_push(paths, "the local database was merged");
 
     Ok(())
 }
