@@ -16,30 +16,67 @@ fn new_id() -> String {
     Uuid::new_v4().to_string()
 }
 
+/// The `soonest_reminder` column expression, inlined into the project SELECTs.
+///
+/// This is the only definition of "soonest reminder" in the data layer: it used
+/// to be a separate `load_soonest_reminder` query run once per project row
+/// (finding #10), which made `list_projects` — and therefore every keystroke in
+/// a search box — cost two round trips per project. It is a correlated
+/// subquery, so SQLite evaluates it per row without an extra statement.
+///
+/// `Project::soonest_reminder` is computed, never stored; this is the predicate
+/// that decides it. Note it counts only *active* todos (not done, not canceled),
+/// which is what makes the reminder disappear from the Project List once its
+/// todo is completed.
+const SOONEST_REMINDER_COL: &str =
+    "(SELECT MIN(t.reminder) FROM todos t
+      WHERE t.project_id = p.id AND t.reminder IS NOT NULL
+        AND t.status NOT IN ('done','canceled'))";
+
+/// Load the tags of one project, alphabetically. One statement.
 fn load_project_tags(conn: &Connection, project_id: &str) -> Result<Vec<Tag>> {
-    let mut stmt = conn.prepare(
-        "SELECT t.id, t.name, t.color FROM tags t
-         JOIN project_tags pt ON pt.tag_id = t.id
-         WHERE pt.project_id = ?1
-         ORDER BY t.name",
-    )?;
-    let tags = stmt
-        .query_map(params![project_id], |row| {
-            Ok(Tag { id: row.get(0)?, name: row.get(1)?, color: row.get(2)? })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(tags)
+    let mut tags = load_tags_for_projects(conn, std::slice::from_ref(&project_id.to_string()))?;
+    Ok(tags.remove(project_id).unwrap_or_default())
 }
 
-fn load_soonest_reminder(conn: &Connection, project_id: &str) -> Result<Option<String>> {
-    let r: rusqlite::Result<Option<String>> = conn.query_row(
-        "SELECT MIN(reminder) FROM todos
-         WHERE project_id = ?1 AND reminder IS NOT NULL
-           AND status NOT IN ('done','canceled')",
-        params![project_id],
-        |row| row.get(0),
+/// Load the tags of many projects at once, keyed by project id.
+///
+/// One statement for the whole set, however many projects are asked for — the
+/// bulk form of [`load_project_tags`], and the fix for finding #10's per-row
+/// tag query. Projects with no tags are absent from the map rather than mapped
+/// to an empty `Vec`; callers use `.unwrap_or_default()`.
+///
+/// An empty `ids` slice issues no statement at all (there is nothing to bind).
+fn load_tags_for_projects(
+    conn: &Connection,
+    ids: &[String],
+) -> Result<std::collections::HashMap<String, Vec<Tag>>> {
+    let mut by_project: std::collections::HashMap<String, Vec<Tag>> = Default::default();
+    if ids.is_empty() {
+        return Ok(by_project);
+    }
+
+    // `ORDER BY t.name` keeps each project's tag list alphabetical, as the
+    // per-project query did.
+    let placeholders = std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT pt.project_id, t.id, t.name, t.color FROM tags t
+         JOIN project_tags pt ON pt.tag_id = t.id
+         WHERE pt.project_id IN ({placeholders})
+         ORDER BY t.name"
     );
-    Ok(r.unwrap_or(None))
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter()), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            Tag { id: row.get(1)?, name: row.get(2)?, color: row.get(3)? },
+        ))
+    })?;
+    for row in rows {
+        let (project_id, tag) = row?;
+        by_project.entry(project_id).or_default().push(tag);
+    }
+    Ok(by_project)
 }
 
 fn row_to_todo(row: &rusqlite::Row) -> rusqlite::Result<Todo> {
@@ -80,8 +117,13 @@ pub fn list_projects(
         ""
     };
 
+    // Two statements per call, however many rows come back: the project rows
+    // (with the soonest reminder inlined) and one bulk tag query for all of
+    // them. This function runs on every keystroke of the search box, so a
+    // per-row query is a per-keystroke query — finding #10.
     let sql = format!(
-        "SELECT id, title, description, sort_order, archived, created_at, updated_at
+        "SELECT p.id, p.title, p.description, p.sort_order, p.archived,
+                p.created_at, p.updated_at, {SOONEST_REMINDER_COL}
          FROM projects p
          WHERE 1=1 {archived_clause} {tag_clause}
          ORDER BY p.sort_order ASC, p.created_at ASC"
@@ -89,49 +131,64 @@ pub fn list_projects(
 
     let mut stmt = conn.prepare(&sql)?;
 
-    type Row7 = (String, String, String, f64, bool, String, String);
+    type Row = (String, String, String, f64, bool, String, String, Option<String>);
 
-    let rows: Vec<Row7> = if let Some(tag) = tag_filter {
-        stmt.query_map(params![tag], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?,
-                row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))
-        })?.collect::<rusqlite::Result<Vec<_>>>()?
-    } else {
-        stmt.query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?,
-                row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?))
-        })?.collect::<rusqlite::Result<Vec<_>>>()?
+    let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<Row> {
+        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+            row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?))
     };
 
-    let search_lower = search.map(|s| s.to_lowercase());
-    let mut projects = Vec::new();
+    let rows: Vec<Row> = if let Some(tag) = tag_filter {
+        stmt.query_map(params![tag], map_row)?.collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        stmt.query_map([], map_row)?.collect::<rusqlite::Result<Vec<_>>>()?
+    };
 
-    for (id, title, description, sort_order, archived, created_at, updated_at) in rows {
-        if let Some(ref q) = search_lower {
-            if !title.to_lowercase().contains(q.as_str()) {
-                continue;
+    // The search filter is applied in Rust (it is a substring test on the
+    // lowercased title, which SQL `LIKE` would not reproduce for non-ASCII
+    // input), so drop the non-matches before the tag query — there is no point
+    // fetching tags for rows the caller will not see.
+    let search_lower = search.map(|s| s.to_lowercase());
+    let rows: Vec<Row> = match search_lower {
+        Some(ref q) => rows
+            .into_iter()
+            .filter(|(_, title, ..)| title.to_lowercase().contains(q.as_str()))
+            .collect(),
+        None => rows,
+    };
+
+    let ids: Vec<String> = rows.iter().map(|r| r.0.clone()).collect();
+    let mut tags_by_project = load_tags_for_projects(conn, &ids)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(id, title, description, sort_order, archived, created_at, updated_at, soonest_reminder)| {
+            let tags = tags_by_project.remove(&id).unwrap_or_default();
+            Project {
+                id, title, description, sort_order, archived,
+                created_at, updated_at, tags, soonest_reminder,
             }
-        }
-        let tags = load_project_tags(conn, &id)?;
-        let soonest_reminder = load_soonest_reminder(conn, &id)?;
-        projects.push(Project {
-            id, title, description, sort_order, archived,
-            created_at, updated_at, tags, soonest_reminder,
-        });
-    }
-    Ok(projects)
+        })
+        .collect())
 }
 
+/// Load one project, with its tags and soonest reminder.
+///
+/// Two statements: the row (with the reminder inlined) and the tag query. The
+/// single-project form of [`list_projects`].
 pub fn get_project(conn: &Connection, id: &str) -> Result<Project> {
-    let (title, description, sort_order, archived, created_at, updated_at) = conn.query_row(
-        "SELECT title, description, sort_order, archived, created_at, updated_at
-         FROM projects WHERE id = ?1",
-        params![id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?,
-                   row.get(3)?, row.get(4)?, row.get(5)?)),
-    )?;
+    let (title, description, sort_order, archived, created_at, updated_at, soonest_reminder) =
+        conn.query_row(
+            &format!(
+                "SELECT p.title, p.description, p.sort_order, p.archived,
+                        p.created_at, p.updated_at, {SOONEST_REMINDER_COL}
+                 FROM projects p WHERE p.id = ?1"
+            ),
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+                      row.get(4)?, row.get(5)?, row.get(6)?)),
+        )?;
     let tags = load_project_tags(conn, id)?;
-    let soonest_reminder = load_soonest_reminder(conn, id)?;
     Ok(Project {
         id: id.to_string(), title, description, sort_order, archived,
         created_at, updated_at, tags, soonest_reminder,
@@ -531,24 +588,58 @@ pub fn tag_project(conn: &Connection, project_id: &str, tag_name: &str) -> Resul
     Ok(tag_id)
 }
 
-/// Rename a tag globally (affects every project using it).  Returns an error
-/// message string (not a rusqlite error) if the name is already taken.
-pub fn rename_tag(conn: &Connection, tag_id: &str, new_name: &str) -> Result<()> {
-    // Reject if another tag already has that name (case-insensitive).
-    let collision: bool = conn.query_row(
-        "SELECT COUNT(*) FROM tags WHERE LOWER(name) = LOWER(?1) AND id != ?2",
-        params![new_name, tag_id],
-        |r| r.get::<_, u32>(0),
-    ).map(|n| n > 0).unwrap_or(false);
-    if collision {
-        // Signal collision via a rusqlite QueryReturnedNoRows (sentinel).
-        // Callers check for this via a wrapper that converts to a user message.
-        anyhow::bail!("tag name already exists");
+/// Why [`rename_tag`] refused.
+///
+/// The two cases are deliberately distinct values rather than one string: a
+/// taken name is something the user can fix by typing a different name, while a
+/// database failure is not. Collapsing them (finding #11) meant a locked or
+/// corrupt database silently performed the rename *and* the UI reported the
+/// unrelated SQL error as `'X' already exists`.
+#[derive(Debug)]
+pub enum RenameTagError {
+    /// Another tag already holds the requested name (case-insensitive).
+    NameTaken,
+    /// The database could not be read or written; nothing was renamed.
+    Db(anyhow::Error),
+}
+
+impl std::fmt::Display for RenameTagError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NameTaken => write!(f, "tag name already exists"),
+            Self::Db(e)     => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for RenameTagError {}
+
+/// Rename a tag globally (affects every project using it).
+///
+/// Fails with [`RenameTagError::NameTaken`] when another tag already holds
+/// `new_name` (case-insensitively, mirroring the app's rename checks), and with
+/// [`RenameTagError::Db`] when the collision probe or the `UPDATE` itself fails.
+/// A failed probe is never treated as "no collision".
+pub fn rename_tag(
+    conn: &Connection,
+    tag_id: &str,
+    new_name: &str,
+) -> std::result::Result<(), RenameTagError> {
+    let taken: u32 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tags WHERE LOWER(name) = LOWER(?1) AND id != ?2",
+            params![new_name, tag_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| RenameTagError::Db(e.into()))?;
+    if taken > 0 {
+        return Err(RenameTagError::NameTaken);
     }
     conn.execute(
         "UPDATE tags SET name = ?1 WHERE id = ?2",
         params![new_name, tag_id],
-    )?;
+    )
+    .map_err(|e| RenameTagError::Db(e.into()))?;
     Ok(())
 }
 
@@ -591,50 +682,75 @@ pub fn list_todos_global(
     tag_filter: Option<&str>,
     include_archived: bool,
 ) -> Result<Vec<TodoGroup>> {
-    let status_clause   = if hide_done       { " AND status NOT IN ('done','canceled')" } else { "" };
-    let archived_clause = if include_archived { "" } else { " AND archived = 0" };
+    let status_clause   = if hide_done       { " AND t.status NOT IN ('done','canceled')" } else { "" };
+    let archived_clause = if include_archived { "" } else { " AND t.archived = 0" };
     let search_lower  = search.map(|s| s.to_lowercase());
 
-    let mut groups: Vec<TodoGroup> = Vec::new();
+    // Three statements per call, however many projects there are: the project
+    // list (itself constant — see `list_projects`), one query for every todo in
+    // the inbox *and* in those projects, and the bulk tag load inside
+    // `list_projects`. The per-project todo query this replaces was the other
+    // half of finding #10.
+    let projects = list_projects(conn, false, tag_filter, None)?;
+    let project_ids: Vec<String> = projects.iter().map(|p| p.id.clone()).collect();
 
-    // Inbox (only shown when no tag filter is active)
-    if tag_filter.is_none() {
-        let sql = format!(
-            "SELECT id, project_id, title, status, reminder, sort_order, created_at, updated_at, archived
-             FROM todos WHERE project_id IS NULL{status_clause}{archived_clause} ORDER BY sort_order ASC"
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let mut todos: Vec<Todo> = stmt
-            .query_map([], row_to_todo)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+    // The inbox is only shown when no tag filter is active; `NULL IN (...)` is
+    // never true, so selecting on `project_id IN (…)` naturally excludes it.
+    let select_inbox = tag_filter.is_none();
+    let id_placeholders = std::iter::repeat_n("?", project_ids.len()).collect::<Vec<_>>().join(",");
+
+    let where_ids = match (select_inbox, project_ids.is_empty()) {
+        (true,  true)  => "t.project_id IS NULL".to_string(),
+        (true,  false) => format!("(t.project_id IS NULL OR t.project_id IN ({id_placeholders}))"),
+        (false, true)  => return Ok(Vec::new()),
+        (false, false) => format!("t.project_id IN ({id_placeholders})"),
+    };
+
+    let sql = format!(
+        "SELECT id, project_id, title, status, reminder, sort_order, created_at, updated_at, archived
+         FROM todos t WHERE {where_ids}{status_clause}{archived_clause}
+         ORDER BY sort_order ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let all_todos: Vec<Todo> = stmt
+        .query_map(rusqlite::params_from_iter(project_ids.iter()), row_to_todo)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    // Bucket by project, dropping non-matching titles as we go. `None` is the
+    // inbox.
+    let mut inbox: Vec<Todo> = Vec::new();
+    let mut by_project: std::collections::HashMap<String, Vec<Todo>> = Default::default();
+    for todo in all_todos {
         if let Some(ref q) = search_lower {
-            todos.retain(|t| t.title.to_lowercase().contains(q.as_str()));
+            if !todo.title.to_lowercase().contains(q.as_str()) {
+                continue;
+            }
         }
-        if !todos.is_empty() {
-            groups.push(TodoGroup { project_id: None, project_title: "Inbox".to_string(), todos });
+        match &todo.project_id {
+            None => inbox.push(todo),
+            Some(pid) => by_project.entry(pid.clone()).or_default().push(todo),
         }
     }
 
-    // Active projects in priority order
-    let projects = list_projects(conn, false, tag_filter, None)?;
+    // Assemble in display order: the inbox band first, then the projects in
+    // their sort order, skipping bands with no matching todos.
+    let mut groups: Vec<TodoGroup> = Vec::new();
+    if !inbox.is_empty() {
+        groups.push(TodoGroup {
+            project_id: None,
+            project_title: "Inbox".to_string(),
+            todos: inbox,
+        });
+    }
     for project in projects {
-        let sql = format!(
-            "SELECT id, project_id, title, status, reminder, sort_order, created_at, updated_at, archived
-             FROM todos WHERE project_id = ?1{status_clause}{archived_clause} ORDER BY sort_order ASC"
-        );
-        let mut stmt = conn.prepare(&sql)?;
-        let mut todos: Vec<Todo> = stmt
-            .query_map(params![project.id], row_to_todo)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        if let Some(ref q) = search_lower {
-            todos.retain(|t| t.title.to_lowercase().contains(q.as_str()));
-        }
-        if !todos.is_empty() {
-            groups.push(TodoGroup {
-                project_id: Some(project.id),
-                project_title: project.title,
-                todos,
-            });
+        if let Some(todos) = by_project.remove(&project.id) {
+            if !todos.is_empty() {
+                groups.push(TodoGroup {
+                    project_id: Some(project.id),
+                    project_title: project.title,
+                    todos,
+                });
+            }
         }
     }
 
@@ -646,9 +762,72 @@ mod tests {
     use super::*;
     use crate::data::db;
     use crate::data::models::TodoStatus;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     fn mk_conn() -> rusqlite::Connection {
         db::open_in_memory().expect("in-memory db")
+    }
+
+    // ── Statement counting (#10) ──────────────────────────────────────────────
+    //
+    // Finding #10 is "N+1 queries": the number of statements executed per call is
+    // the measurable success criterion, so the regression tests count them. The
+    // count comes from SQLite's own `SQLITE_TRACE_STMT` callback, which fires
+    // once per statement *execution* (a re-used prepared statement fires again),
+    // so a test cannot be fooled by caching inside rusqlite.
+    //
+    // The `trace` feature is a **dev-dependency** feature: it is unified into
+    // test builds only, so the shipped binaries do not carry the callback
+    // machinery. See Cargo.toml.
+
+    /// Count the SQL statements executed on `conn` while `f` runs.
+    ///
+    /// Returns `(result, statement_count)`. The callback is left installed on
+    /// the connection (it only bumps an `AtomicUsize`), so tests may call this
+    /// several times against the same connection; each call measures its own
+    /// window.
+    fn count_statements<T>(
+        conn: &Connection,
+        f: impl FnOnce() -> T,
+    ) -> (T, usize) {
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        unsafe extern "C" fn trace_cb(
+            _evt: std::ffi::c_uint,
+            ctx: *mut std::ffi::c_void,
+            _stmt: *mut std::ffi::c_void,
+            _sql: *mut std::ffi::c_void,
+        ) -> std::ffi::c_int {
+            // SAFETY: `ctx` is the `Arc<AtomicUsize>` handed to `sqlite3_trace_v2`
+            // below, and the `Arc` outlives the callback because it is a local of
+            // the enclosing call.
+            let counter = unsafe { &*(ctx as *const AtomicUsize) };
+            counter.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+
+        let handle = unsafe { conn.handle() };
+        let rc = unsafe {
+            rusqlite::ffi::sqlite3_trace_v2(
+                handle,
+                1, // SQLITE_TRACE_STMT
+                Some(trace_cb),
+                Arc::as_ptr(&counter) as *mut std::ffi::c_void,
+            )
+        };
+        assert_eq!(rc, 0, "sqlite3_trace_v2 failed");
+
+        let before = counter.load(Ordering::Relaxed);
+        let out = f();
+        let after = counter.load(Ordering::Relaxed);
+
+        // Detach the callback: the `Arc` must not outlive this call.
+        unsafe {
+            rusqlite::ffi::sqlite3_trace_v2(handle, 0, None, std::ptr::null_mut());
+        }
+
+        (out, after - before)
     }
 
     // ── Projects ────────────────────────────────────────────────────────────────
@@ -1112,6 +1291,43 @@ mod tests {
         assert_eq!(project.tags[0].name, "new-name");
     }
 
+    // Finding #11: `rename_tag` probed for a name collision with
+    // `.map(|n| n > 0).unwrap_or(false)`, so *any* SQL failure — a locked
+    // database, a corrupt index, a denied read — was indistinguishable from
+    // "no collision" and the rename went ahead. The probe must propagate its
+    // error instead of answering "false".
+    #[test]
+    fn rename_tag_propagates_probe_errors_instead_of_treating_them_as_no_collision() {
+        let conn = mk_conn();
+        let p = create_project(&conn, "P").unwrap();
+        let tag_id = tag_project(&conn, &p.id, "old-name").unwrap();
+
+        // Deny reads of `tags.name` — the column the collision probe reads —
+        // and nothing else. The `UPDATE tags SET name = ...` that performs the
+        // rename writes that column but never reads it, so if the probe's
+        // error is swallowed the rename still succeeds: the only difference is
+        // whether the failure was reported. (Denying the whole table would not
+        // work: the UPDATE's own `WHERE id = ?` reads `tags.id`.)
+        conn.authorizer(Some(|ctx: rusqlite::hooks::AuthContext<'_>| {
+            match ctx.action {
+                rusqlite::hooks::AuthAction::Read { table_name: "tags", column_name: "name" } =>
+                    rusqlite::hooks::Authorization::Deny,
+                _ => rusqlite::hooks::Authorization::Allow,
+            }
+        })).unwrap();
+
+        let result = rename_tag(&conn, &tag_id, "new-name");
+        assert!(
+            result.is_err(),
+            "rename_tag must not treat a failed collision probe as 'no collision' (#11)"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            !msg.contains("already exists"),
+            "a genuine SQL failure must not be reported as a name collision, got: {msg}"
+        );
+    }
+
     #[test]
     fn rename_tag_rejects_duplicate_name() {
         let conn = mk_conn();
@@ -1120,7 +1336,24 @@ mod tests {
         tag_project(&conn, &p.id, "tag-b").unwrap();
 
         let err = rename_tag(&conn, &id1, "tag-b").unwrap_err();
+        assert!(matches!(err, RenameTagError::NameTaken), "got {err:?}");
         assert!(err.to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn rename_tag_reports_name_taken_and_db_failure_as_different_values() {
+        let conn = mk_conn();
+        let p = create_project(&conn, "P").unwrap();
+        let id1 = tag_project(&conn, &p.id, "tag-a").unwrap();
+        tag_project(&conn, &p.id, "tag-b").unwrap();
+
+        // Same refusal, distinguishable from a database failure.
+        assert!(matches!(
+            rename_tag(&conn, &id1, "tag-b"),
+            Err(RenameTagError::NameTaken)
+        ));
+        // A free name is not a refusal at all.
+        assert!(rename_tag(&conn, &id1, "tag-c").is_ok());
     }
 
     #[test]
@@ -1157,6 +1390,87 @@ mod tests {
     }
 
     #[test]
+    fn soonest_reminder_is_the_same_from_the_list_and_from_get_project() {
+        // The list query inlines the reminder subquery that `get_project` also
+        // uses (#10); the two must never disagree.
+        let conn = mk_conn();
+        let with   = create_project(&conn, "With reminder").unwrap();
+        let without = create_project(&conn, "Without reminder").unwrap();
+        let t = create_todo(&conn, Some(&with.id), "t").unwrap();
+        set_todo_reminder(&conn, &t.id, Some("2025-04-02")).unwrap();
+
+        let listed = list_projects(&conn, false, None, None).unwrap();
+        for project in &listed {
+            let fetched = get_project(&conn, &project.id).unwrap();
+            assert_eq!(
+                project.soonest_reminder, fetched.soonest_reminder,
+                "list_projects and get_project disagree for {}",
+                project.title,
+            );
+        }
+        let listed_with = listed.iter().find(|p| p.id == with.id).unwrap();
+        let listed_without = listed.iter().find(|p| p.id == without.id).unwrap();
+        assert_eq!(listed_with.soonest_reminder.as_deref(), Some("2025-04-02"));
+        assert_eq!(listed_without.soonest_reminder, None);
+    }
+
+    #[test]
+    fn soonest_reminder_from_the_list_ignores_done_and_canceled_todos() {
+        // The inlined subquery must keep the "active todos only" rule that the
+        // per-row query had.
+        let conn = mk_conn();
+        let p  = create_project(&conn, "P").unwrap();
+        let done = create_todo(&conn, Some(&p.id), "done").unwrap();
+        let live = create_todo(&conn, Some(&p.id), "live").unwrap();
+        set_todo_reminder(&conn, &done.id, Some("2025-01-01")).unwrap(); // earlier, but done
+        set_todo_reminder(&conn, &live.id, Some("2025-08-08")).unwrap();
+
+        cycle_todo_status(&conn, &done.id).unwrap(); // New → InProgress
+        cycle_todo_status(&conn, &done.id).unwrap(); // InProgress → Done
+
+        let listed = list_projects(&conn, false, None, None).unwrap();
+        assert_eq!(listed[0].soonest_reminder.as_deref(), Some("2025-08-08"));
+    }
+
+    #[test]
+    fn soonest_reminder_from_the_list_is_none_when_every_todo_is_done() {
+        let conn = mk_conn();
+        let p = create_project(&conn, "P").unwrap();
+        let t = create_todo(&conn, Some(&p.id), "t").unwrap();
+        set_todo_reminder(&conn, &t.id, Some("2025-01-01")).unwrap();
+        cycle_todo_status(&conn, &t.id).unwrap(); // → InProgress
+        cycle_todo_status(&conn, &t.id).unwrap(); // → Done
+
+        assert_eq!(list_projects(&conn, false, None, None).unwrap()[0].soonest_reminder, None);
+    }
+
+    #[test]
+    fn soonest_reminder_from_the_list_is_per_project() {
+        let conn = mk_conn();
+        let a = create_project(&conn, "A").unwrap();
+        let b = create_project(&conn, "B").unwrap();
+        let ta = create_todo(&conn, Some(&a.id), "ta").unwrap();
+        let tb = create_todo(&conn, Some(&b.id), "tb").unwrap();
+        set_todo_reminder(&conn, &ta.id, Some("2025-09-09")).unwrap();
+        set_todo_reminder(&conn, &tb.id, Some("2025-02-02")).unwrap();
+
+        let listed = list_projects(&conn, false, None, None).unwrap();
+        let by_id = |id: &str| listed.iter().find(|p| p.id == id).unwrap().soonest_reminder.clone();
+        assert_eq!(by_id(&a.id).as_deref(), Some("2025-09-09"));
+        assert_eq!(by_id(&b.id).as_deref(), Some("2025-02-02"));
+    }
+
+    #[test]
+    fn soonest_reminder_from_the_list_ignores_inbox_todos() {
+        let conn = mk_conn();
+        create_project(&conn, "P").unwrap();
+        let inbox = create_todo(&conn, None, "inbox").unwrap();
+        set_todo_reminder(&conn, &inbox.id, Some("2025-01-01")).unwrap();
+
+        assert_eq!(list_projects(&conn, false, None, None).unwrap()[0].soonest_reminder, None);
+    }
+
+    #[test]
     fn soonest_reminder_excludes_done_todos() {
         let conn = mk_conn();
         let p  = create_project(&conn, "P").unwrap();
@@ -1175,7 +1489,218 @@ mod tests {
         );
     }
 
+    // ── Query counts (#10) ────────────────────────────────────────────────────
+    //
+    // These pin the shape of the fix, not just its output: `list_projects` and
+    // `list_todos_global` must run a **constant** number of statements however
+    // many rows they return. They are the functions `reload_project_list` /
+    // `reload_todo_list` call on every keystroke of a search box, so a per-row
+    // round trip is a per-keystroke round trip.
+
+    #[test]
+    fn list_projects_runs_a_constant_number_of_statements() {
+        let conn = mk_conn();
+        for i in 0..30 {
+            let p = create_project(&conn, &format!("Project {i}")).unwrap();
+            tag_project(&conn, &p.id, "work").unwrap();
+            tag_project(&conn, &p.id, "urgent").unwrap();
+            let t = create_todo(&conn, Some(&p.id), "Task").unwrap();
+            set_todo_reminder(&conn, &t.id, Some("2025-06-01")).unwrap();
+        }
+
+        let (one, one_n)   = count_statements(&conn, || list_projects(&conn, false, None, None).unwrap());
+        assert_eq!(one.len(), 30);
+        assert_eq!(one[0].tags.len(), 2, "tags must still be populated");
+        assert_eq!(one[0].soonest_reminder.as_deref(), Some("2025-06-01"),
+                   "soonest_reminder must still be populated");
+
+        // Two: the project rows (reminders inlined) and one bulk tag query.
+        assert_eq!(
+            one_n, 2,
+            "list_projects must run exactly two statements (rows + bulk tags) for 30 projects"
+        );
+    }
+
+    #[test]
+    fn list_projects_statement_count_is_independent_of_row_count() {
+        let conn = mk_conn();
+        create_project(&conn, "one").unwrap();
+        let (_, with_one) = count_statements(&conn, || list_projects(&conn, false, None, None).unwrap());
+
+        for i in 0..20 { create_project(&conn, &format!("p{i}")).unwrap(); }
+        let (_, with_many) = count_statements(&conn, || list_projects(&conn, false, None, None).unwrap());
+
+        assert_eq!(
+            with_one, with_many,
+            "list_projects must not issue per-row statements (#10): \
+             {with_one} statements for 1 project vs {with_many} for 21"
+        );
+    }
+
+    #[test]
+    fn list_todos_global_statement_count_is_independent_of_row_count() {
+        let conn = mk_conn();
+
+        let p = create_project(&conn, "only").unwrap();
+        create_todo(&conn, Some(&p.id), "t").unwrap();
+        let (_, with_one) =
+            count_statements(&conn, || list_todos_global(&conn, false, None, None, false).unwrap());
+
+        for i in 0..20 {
+            let p = create_project(&conn, &format!("p{i}")).unwrap();
+            create_todo(&conn, Some(&p.id), "t").unwrap();
+            create_todo(&conn, None, "inbox").unwrap();
+        }
+        let (groups, with_many) =
+            count_statements(&conn, || list_todos_global(&conn, false, None, None, false).unwrap());
+        // 21 project bands plus the inbox band.
+        assert_eq!(groups.len(), 22);
+        assert_eq!(
+            with_one, with_many,
+            "list_todos_global must not issue per-project statements (#10): \
+             {with_one} statements for 1 project vs {with_many} for 21"
+        );
+    }
+
+    #[test]
+    fn get_project_runs_a_constant_number_of_statements() {
+        let conn = mk_conn();
+        let p = create_project(&conn, "P").unwrap();
+        for name in ["a", "b", "c", "d", "e"] { tag_project(&conn, &p.id, name).unwrap(); }
+        for i in 0..5 {
+            let t = create_todo(&conn, Some(&p.id), &format!("t{i}")).unwrap();
+            set_todo_reminder(&conn, &t.id, Some("2025-06-01")).unwrap();
+        }
+
+        let (project, n) = count_statements(&conn, || get_project(&conn, &p.id).unwrap());
+        assert_eq!(project.tags.len(), 5);
+        assert_eq!(project.soonest_reminder.as_deref(), Some("2025-06-01"));
+        assert!(n <= 3, "get_project ran {n} statements; expected a constant handful");
+    }
+
     // ── Global Todo List ─────────────────────────────────────────────────────
+
+    #[test]
+    fn list_projects_keeps_each_projects_tags_alphabetical() {
+        // The bulk tag query replaced a per-project `ORDER BY t.name`; the
+        // grouping happens in Rust now, so the ordering has to be asserted.
+        let conn = mk_conn();
+        let p = create_project(&conn, "P").unwrap();
+        for name in ["zebra", "alpha", "middle"] { tag_project(&conn, &p.id, name).unwrap(); }
+
+        let projects = list_projects(&conn, false, None, None).unwrap();
+        let names: Vec<&str> = projects[0].tags.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["alpha", "middle", "zebra"]);
+    }
+
+    #[test]
+    fn list_projects_gives_untagged_projects_an_empty_tag_list() {
+        let conn = mk_conn();
+        create_project(&conn, "Tagged").unwrap();
+        let bare = create_project(&conn, "Bare").unwrap();
+        let tagged = list_projects(&conn, false, None, None).unwrap()[0].id.clone();
+        tag_project(&conn, &tagged, "work").unwrap();
+        assert_ne!(tagged, bare.id);
+
+        let projects = list_projects(&conn, false, None, None).unwrap();
+        let bare_row = projects.iter().find(|p| p.id == bare.id).unwrap();
+        assert!(bare_row.tags.is_empty(), "a project with no tags must get an empty Vec");
+    }
+
+    #[test]
+    fn list_projects_tag_filter_and_search_still_combine() {
+        let conn = mk_conn();
+        let work = create_project(&conn, "Work Project").unwrap();
+        tag_project(&conn, &work.id, "work").unwrap();
+        let play = create_project(&conn, "Play Project").unwrap();
+        tag_project(&conn, &play.id, "play").unwrap();
+
+        let tagged = list_projects(&conn, false, Some("work"), None).unwrap();
+        assert_eq!(tagged.len(), 1);
+        assert_eq!(tagged[0].id, work.id);
+        assert_eq!(tagged[0].tags.len(), 1, "tags must survive a tag filter");
+        assert_eq!(tagged[0].tags[0].name, "work");
+
+        // Filter and search together.
+        assert_eq!(list_projects(&conn, false, Some("work"), Some("work")).unwrap().len(), 1);
+        assert_eq!(list_projects(&conn, false, Some("work"), Some("play")).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn list_projects_empty_result_issues_no_tag_query() {
+        // Nothing to look tags up for; the bulk query must be skipped rather
+        // than run with an empty `IN ()` (which SQLite rejects).
+        let conn = mk_conn();
+        create_project(&conn, "P").unwrap();
+        let (projects, n) =
+            count_statements(&conn, || list_projects(&conn, false, None, Some("no-such-title")).unwrap());
+        assert!(projects.is_empty());
+        assert_eq!(n, 1, "an empty result needs only the row query");
+    }
+
+    #[test]
+    fn global_list_keeps_todo_order_within_each_band() {
+        let conn = mk_conn();
+        let p = create_project(&conn, "P").unwrap();
+        for title in ["first", "second", "third"] { create_todo(&conn, Some(&p.id), title).unwrap(); }
+
+        let groups = list_todos_global(&conn, false, None, None, false).unwrap();
+        let titles: Vec<&str> = groups[0].todos.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, ["first", "second", "third"]);
+    }
+
+    #[test]
+    fn global_list_excludes_archived_todos_unless_requested() {
+        let conn = mk_conn();
+        let p = create_project(&conn, "P").unwrap();
+        let keep = create_todo(&conn, Some(&p.id), "keep").unwrap();
+        let gone = create_todo(&conn, Some(&p.id), "gone").unwrap();
+        toggle_archive_todo(&conn, &gone.id).unwrap();
+
+        let visible = list_todos_global(&conn, false, None, None, false).unwrap();
+        assert_eq!(visible[0].todos.len(), 1);
+        assert_eq!(visible[0].todos[0].id, keep.id);
+
+        let all = list_todos_global(&conn, false, None, None, true).unwrap();
+        assert_eq!(all[0].todos.len(), 2);
+    }
+
+    #[test]
+    fn global_list_with_only_the_inbox() {
+        // No projects at all: the `IN ()` clause must not be generated.
+        let conn = mk_conn();
+        create_todo(&conn, None, "inbox task").unwrap();
+
+        let groups = list_todos_global(&conn, false, None, None, false).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].project_title, "Inbox");
+        assert_eq!(groups[0].todos.len(), 1);
+    }
+
+    #[test]
+    fn global_list_with_no_rows_at_all() {
+        let conn = mk_conn();
+        assert!(list_todos_global(&conn, false, None, None, false).unwrap().is_empty());
+        // And with a tag filter, which takes the early-return path.
+        assert!(list_todos_global(&conn, false, None, Some("none"), false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn global_list_tag_filter_skips_the_todo_query_when_no_project_matches() {
+        let conn = mk_conn();
+        let p = create_project(&conn, "P").unwrap();
+        tag_project(&conn, &p.id, "work").unwrap();
+        create_todo(&conn, Some(&p.id), "t").unwrap();
+        create_todo(&conn, None, "inbox").unwrap();
+
+        let (groups, n) = count_statements(&conn, || {
+            list_todos_global(&conn, false, None, Some("no-such-tag"), false).unwrap()
+        });
+        assert!(groups.is_empty());
+        // One statement: the project rows. With no projects there is nothing to
+        // load tags or todos for, so both follow-up queries are skipped.
+        assert_eq!(n, 1, "a filtered-out project list needs only the row query");
+    }
 
     #[test]
     fn global_list_inbox_group_appears_first() {

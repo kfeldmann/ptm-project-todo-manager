@@ -41,3 +41,7 @@ spellbook = "0.4.2"
 
 [dev-dependencies]
 tempfile = "3"
+# Test-only features: `trace` counts executed statements (#10 regression tests) and
+# `hooks` lets the authorizer inject a failing probe (#11). Dev-dependency features
+# are unified into test builds only, so the shipped binaries do not carry them.
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "trace", "hooks"] }

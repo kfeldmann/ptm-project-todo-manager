@@ -82,6 +82,7 @@ the `/etc/hosts` entry, which is host state — `s3-roundtrip.py` will print
 | `update-viewer.py` | 6, 23 | drives the real TUI in a pty and asserts that universal keys (`d`, `E`) work inside the update viewer |
 | `keyhelp-widths.py` | 4 | exhaustive width sweep over the real `key_help_lines()` strings |
 | `search-highlight.py` | 17 | `split_span` index drift under case-folding |
+| `query-count.py` | 10, 11 | statement counts for `list_projects` / `list_todos_global` (N+1), and `rename_tag` swallowing a failed collision probe |
 | `s3-roundtrip.py` | 2, 3, 1c (partial) | true `--end`/`--start` round trip (needs the hosts entry below) |
 
 ## What the round trip does and does not show
@@ -130,13 +131,14 @@ crashed `ptm` leaves behind. Two consequences worth knowing before editing it:
   harness SKIPs without it (exit 0). `s3-roundtrip.py` covers the same ground
   for the happy path; `wal-safety.py` is the authority for the failure modes.
 
-## Verification status (2026-11-01, after session E — key handling)
+## Verification status (2026-11-01, after session F — data layer)
 
 Session A fixed findings 1b, 1c and 2's snapshot half; session B fixed 3 and 12
 and settled 2's exit-code half; session C fixed 7, 8 and 9; session D fixed
-4, 5 and 13; session E fixed 6, 14, 15 and 23. `wal-safety.py` is **23/23**,
-`sync-state.py` **20/20**, `merge-robust.py` **6/6**, `s3-roundtrip.py`
-**12/12**, `panics.py` **9/9**, `update-viewer.py` **4/4**.
+4, 5 and 13; session E fixed 6, 14, 15 and 23; session F fixed 10 and 11.
+`wal-safety.py` is **23/23**, `sync-state.py` **20/20**, `merge-robust.py`
+**6/6**, `s3-roundtrip.py` **12/12**, `panics.py` **9/9**, `update-viewer.py`
+**4/4**, `query-count.py` **8/8**.
 `search-highlight.py` is unchanged and still fails, because its finding
 belongs to session G.
 
@@ -249,15 +251,40 @@ reproductions were not preserved.
 | 9 (updates ordering) | **reproduces; fixed in session C** | Local `L1(0), L2(-1), L3(-2)` + foreign `R1(0), R2(-1)` rendered `L3, L2, R2, L1, R1` — interleaved. Now `L3, L2, L1, R2, R1`: the local block stays intact and the foreign rows follow it. See "Why `merge-robust.py`'s #9 check changed shape" above for the display-order question. |
 | 12 (non-TTY abort) | **reproduces; fixed in session B** | `--start` exited 1 with "Network error and no interactive terminal; cannot pull" when stdin was a pipe. It now continues with a warning and leaves the local data untouched, so `ptm` still launches. |
 | 13 (byte-sliced dates) | **reproduces; fixed in session D** | `&s[..10]` panicked on `"2025-01-1é"` (`not a char boundary`). Note `"→2025-01-01"` did *not* panic — the boundary has to land mid-character. Every display site now uses `views::date_prefix`. |
+| 10 (N+1 queries) | **reproduces; fixed in session F** | Measured with SQLite's `SQLITE_TRACE_STMT`: `list_projects` ran **61** statements for 30 projects (3 for 1), `list_todos_global` **92** (5 for 1). After the fix: 2 and 3 respectively, constant in the number of rows. The inlined reminder subquery keeps the "active todos only" rule (asserted by unit tests) and the bulk tag query keeps each project's tags alphabetical. |
+| 11 (`rename_tag` swallows errors) | **reproduces; fixed in session F** | A denied read of `tags.name` made the collision probe fail; `.unwrap_or(false)` turned that into "no collision" and the rename proceeded, after which the caller reported the unrelated SQL error as `'X' already exists`. Now the probe error is propagated (`RenameTagError::Db`), the rename does not happen, and the UI distinguishes a taken name from a database failure. |
 | 17 (`split_span`) | **reproduces** | Searching `İ` in `İstanbul` highlights `İs` instead of `İ`. Searching `i` highlights `İ` correctly. |
 | 6 / 23 (viewer swallows keys) | **reproduces; fixed in session E** | The viewer guard ran before the universal-key block, so `d`/`E`/`T`/`n`/`N` were dead inside the update viewer. `?` was **not** affected (it is handled globally) — see "Why `update-viewer.py` is a pty harness". Re-run against the unfixed tree: 2/4. |
 | 14 (render mutates state) | **documented, not a defect** | Renderers publish geometry and match positions into `PublishedMetrics`; the decision to keep that (rather than add a measure pass) is recorded on the type and in AGENTS.md. Unit-tested through the key handlers that read it. |
 | 15 (`Warn` eats the key) | **reproduces; fixed in session E** | Any key dismissed the notice *and* was discarded. A safe key is now replayed after the notice closes; keys that would open an overlay are not. Unit tests in `src/app.rs`. |
 
-Not covered by a harness yet (need a terminal or are judgement calls): #10,
-#11, #16, #18–#22, #24. #10 (N+1 queries) and #11 (`rename_tag` error
-swallowing) are worth adding as `repo`-level unit tests in the sessions that
-fix them, since `repo.rs` is already well covered by `cargo test`.
+Not covered by a harness yet (need a terminal or are judgement calls): #16,
+#18–#22, #24. #10 and #11 now have both a harness (`query-count.py`) and
+`repo`-level unit tests, added in session F.
+
+### Why `query-count.py` compiles the real `repo.rs` (session F)
+
+Findings #10 and #11 are invisible from outside the process: the list renders
+correctly either way, and the UI says "already exists" either way. Both are
+about *how many statements a call issues* and *whether an error is propagated*,
+so the harness compiles the **real `src/data/repo.rs`** (via `#[path]`, with
+the schema lifted textually out of `src/data/db.rs` so it cannot drift) into a
+scratch crate and measures:
+
+* **#10** with SQLite's own `SQLITE_TRACE_STMT` callback, which fires once per
+  statement *execution* — a re-used prepared statement fires again, so caching
+  inside rusqlite cannot make the check pass. It asserts the count is the same
+  at 1, 5 and 30 projects (and small in absolute terms), and that the output is
+  still complete, so a "fix" that returns nothing does not pass.
+* **#11** with a SQLite authorizer (`hooks` feature) that denies reads of
+  `tags.name` — the column the collision probe reads and the one the
+  `UPDATE tags SET name = ?` does *not* read, so the rename would still succeed
+  if the probe's error were swallowed. A companion check asserts the authorizer
+  really denied the probe, so the check cannot pass vacuously.
+
+Measured against the unfixed tree: **2/8**, failing exactly the #10 and #11
+checks (`list_projects` 61 statements for 30 projects, `list_todos_global` 92).
+After the fix: **8/8**, at 2 and 3 statements respectively.
 
 ## Known limitation: a concurrent session is only detected via a WAL
 

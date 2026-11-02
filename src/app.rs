@@ -669,7 +669,10 @@ impl App {
                         // Reopen the TagPicker with refreshed data.
                         return self.reopen_tag_picker(return_project_id, return_filter_mode);
                     }
-                    Err(_) => {
+                    // A taken name is the user's to fix; anything else is a
+                    // database failure and must not be reported as a
+                    // collision (finding #11).
+                    Err(repo::RenameTagError::NameTaken) => {
                         return Ok(Some(Overlay::RenameTag {
                             tag_id,
                             input,
@@ -678,6 +681,7 @@ impl App {
                             return_filter_mode,
                         }));
                     }
+                    Err(repo::RenameTagError::Db(e)) => return Err(e),
                 }
             }
             InputKeyResult::Continue => {}
@@ -2428,6 +2432,82 @@ mod tests {
     fn draw(app: &mut App, w: u16, h: u16) {
         let mut term = Terminal::new(TestBackend::new(w, h)).expect("test terminal");
         term.draw(|frame| crate::ui::render(frame, app)).expect("draw");
+    }
+
+    /// Type a rename into the RenameTag overlay and press Enter.
+    fn submit_rename(app: &mut App, tag_id: &str, new_name: &str) -> anyhow::Result<()> {
+        app.overlay = Some(Overlay::RenameTag {
+            tag_id: tag_id.to_string(),
+            input: crate::input::InputState::from_str(new_name),
+            error: None,
+            return_project_id: String::new(),
+            return_filter_mode: false,
+        });
+        app.handle_key(key(KeyCode::Enter))
+    }
+
+    #[test]
+    fn renaming_a_tag_to_a_taken_name_shows_a_collision_error() {
+        let mut app = mk_app();
+        let p = repo::create_project(&app.conn, "P").unwrap();
+        let id = repo::tag_project(&app.conn, &p.id, "tag-a").unwrap();
+        repo::tag_project(&app.conn, &p.id, "tag-b").unwrap();
+
+        submit_rename(&mut app, &id, "tag-b").unwrap();
+
+        match app.overlay {
+            Some(Overlay::RenameTag { ref error, .. }) => {
+                assert_eq!(error.as_deref(), Some("'tag-b' already exists"));
+            }
+            _ => panic!("expected the RenameTag overlay to stay open with an error"),
+        }
+    }
+
+    #[test]
+    fn a_database_failure_during_rename_is_surfaced_not_reported_as_a_collision() {
+        // Finding #11 at the UI layer: a failed collision probe used to be
+        // reported to the user as "'X' already exists", which is both wrong and
+        // unactionable.  It must now propagate as an error.
+        let mut app = mk_app();
+        let p = repo::create_project(&app.conn, "P").unwrap();
+        let id = repo::tag_project(&app.conn, &p.id, "tag-a").unwrap();
+
+        // Deny the **first** read of `tags.name` — the collision probe — and
+        // allow the rest. That makes the scenario discriminating: on the fixed
+        // tree the probe's error propagates and `handle_rename_tag` returns it;
+        // on the unfixed tree the failed probe reads as "no collision", the
+        // rename's UPDATE (which does not read the column) succeeds, and the
+        // reloads that follow are allowed — so the call reports success and
+        // this test's `expect_err` fails. Denying *every* read would not
+        // discriminate: the post-rename reloads read the same column, so an
+        // error would surface either way.
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen_hook = seen.clone();
+        app.conn.authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
+            match ctx.action {
+                rusqlite::hooks::AuthAction::Read { table_name: "tags", column_name: "name" } => {
+                    if seen_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        rusqlite::hooks::Authorization::Deny
+                    } else {
+                        rusqlite::hooks::Authorization::Allow
+                    }
+                }
+                _ => rusqlite::hooks::Authorization::Allow,
+            }
+        })).unwrap();
+
+        // `expect_err`, not an overlay assertion: with the finding live the
+        // failed probe reads as "no collision" and `handle_rename_tag` carries
+        // on, so the only externally visible difference is whether an error
+        // comes back at all.  (It cannot be "the overlay shows a collision
+        // error" in the fixed tree either — a `Db` error propagates, it does
+        // not re-open the overlay.)
+        let err = submit_rename(&mut app, &id, "tag-z")
+            .expect_err("a database failure during rename must be surfaced to the user (#11)");
+        assert!(
+            !err.to_string().contains("already exists"),
+            "a database failure must not be reported as a name collision, got: {err}"
+        );
     }
 
     /// A project with one update whose body contains three search hits.

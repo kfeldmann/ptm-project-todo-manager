@@ -565,12 +565,31 @@ Key conventions:
   adjacent rows.
 - `todos.project_id IS NULL` means the todo is in the **Inbox**.
 - `soonest_reminder` on `Project` is computed with a subquery
-  (`MIN(reminder)` over active todos) — it is not a stored column.
+  (`MIN(reminder)` over active todos) — it is not a stored column. The
+  subquery exists once, as `SOONEST_REMINDER_COL`, inlined into the project
+  `SELECT`s; do not add a second definition.
 - Tags are shared globally. `repo::untag_project` garbage-collects orphaned
   tag rows automatically.
+- **List queries must issue a constant number of statements.** `list_projects`
+  and `list_todos_global` are re-run on every keystroke of a search box
+  (`reload_project_list` / `reload_todo_list`), so a per-row query is a
+  per-keystroke query. The shapes to copy: inline a correlated subquery for a
+  per-row computed column, and load a per-row collection for the whole result
+  set in one `IN (…)` query (`load_tags_for_projects`) rather than one query
+  per row. `dev-harness/query-count.py` counts statements with SQLite's
+  `SQLITE_TRACE_STMT`; the `repo` tests pin the counts at 1 vs 30 rows.
+- **Errors are propagated, not defaulted away.** A fallible lookup whose
+  failure is collapsed into a "not found"/"no conflict" answer silently
+  changes behaviour (`rename_tag` used to do exactly that). Where a caller must
+  distinguish a *user* refusal from a *database* failure, return a typed error
+  (`RenameTagError::NameTaken` vs `RenameTagError::Db`) instead of one string.
 
 Schema changes must use `CREATE TABLE IF NOT EXISTS` (or `ALTER TABLE` with
 care); there is no migration version table yet.
+
+Test-only features live in `[dev-dependencies]` (rusqlite's `trace` and
+`hooks`): dev-dependency features are unified into test builds only, so the
+shipped binaries do not carry them.
 
 ---
 

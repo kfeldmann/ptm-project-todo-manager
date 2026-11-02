@@ -13,18 +13,20 @@
 | **C** | DONE | `merge` robustness | **7, 8, 9** | `ptm_sync/merge.rs` |
 | **D** | DONE | Crash fixes | **4, 5, 13** | `views/overlay.rs`, `ptm_sync/main.rs`, `bin/enc/main.rs`, `paths.rs`, `views/{mod,project_list,todo_list,project_detail}.rs` |
 | **E** | DONE | Key handling & render purity | **6, 14, 15, 23** | `app.rs`, `views/project_detail.rs`, `views/overlay.rs`, `dev-harness/update-viewer.py` |
-| **F** | | Data-layer correctness & perf | **10, 11** | `data/repo.rs` |
+| **F** | DONE | Data-layer correctness & perf | **10, 11** | `data/repo.rs`, `app.rs` (caller) |
 | **G** | | Unicode/display-width consistency | **16, 17** | `views/mod.rs`, `views/*.rs`, `bin/md/main.rs` |
 | **H** | | Dedup, permissions, docs sweep | **18, 19, 20, 21, 22, 24** | `app.rs`, `crypto.rs`, `log.rs`, `bin/md/log.rs`, `Cargo.toml`, `AGENTS.md` |
 
 ## Status at the time of writing
 
 - `cargo test --all-targets` → **408 tests, 0 failures** (36 + 82 + 214 + 76).
-  (After session D: **478**, all green. After session E: **495**, i.e. 37 + 82 + 244 + 132.)
+  (After session D: **478**, all green. After session E: **495**, i.e. 37 + 82 + 244 + 132.
+  After session F: **517**, i.e. 37 + 82 + 266 + 132.)
 - `cargo check --all-targets` clean.
 - All 24 findings are still live at the lines the review cites.
 - **11 of the findings have been reproduced by the harnesses in `dev-harness/`**
   (#1b, #1c, #2, #3, #4, #5, #7, #8, #9, #12, #13, #17).
+  (After session F: **13**, i.e. + #10 and #11 via `query-count.py`.)
   Two of them differ from the review's write-up — see
   [§Findings that need correcting](#findings-that-need-correcting-first).
 - `git` is **not installed** in this environment. Sessions must therefore be
@@ -366,6 +368,84 @@ touched.
 
 ---
 
+### F — Data-layer correctness & perf — **done**
+
+Findings #10 and #11 fixed. `repo.rs` is where the fix lives; `app.rs` changed
+in one place because #11's fix makes a distinction the caller has to honour.
+
+- **#10 — the N+1.** `list_projects` ran `load_project_tags` and
+  `load_soonest_reminder` **per project row**, and `list_todos_global` then ran
+  one more query **per project** for its todos. Measured with SQLite's
+  `SQLITE_TRACE_STMT` callback: **61 statements for 30 projects** (3 for one),
+  and **92 for `list_todos_global` at 30 projects** (5 for one). Both are now
+  constant:
+  - The `soonest_reminder` subquery is a single `const SOONEST_REMINDER_COL`
+    inlined into the project `SELECT`. This is now the *only* definition of
+    "soonest reminder" in the data layer — the old standalone
+    `load_soonest_reminder` was deleted rather than left beside it, so the two
+    cannot drift. It keeps the "active todos only" rule, which is what makes
+    the reminder vanish from the Project List when its todo is completed; tests
+    assert the list and `get_project` agree.
+  - Tags come from one `LEFT`-free `JOIN` with an `IN (…)` placeholder list
+    (`load_tags_for_projects`), returning a `HashMap<project_id, Vec<Tag>>`.
+    `ORDER BY t.name` keeps each project's list alphabetical, as before.
+    `get_project` reuses the same helper for its single id, so there is one
+    tag-loading path, not two.
+  - `list_todos_global` issues **one** todo query for the inbox *and* every
+    project, then buckets the rows in Rust. `NULL IN (…)` is never true, which
+    is exactly the inbox-exclusion the old `tag_filter.is_none()` guard wanted.
+    The `IN ()` form SQLite rejects is never generated: an empty project list
+    with a tag filter returns early, and the empty-id tag query returns without
+    running anything.
+  - Result: **2** statements for `list_projects` and **3** for
+    `list_todos_global`, at any row count.
+- **#11 — the swallowed error.** `rename_tag`'s collision probe used
+  `.map(|n| n > 0).unwrap_or(false)`, so a locked database, a corrupt index or
+  a denied read was reported as "no collision" and the rename proceeded.
+  The probe now propagates (`?`), and the two outcomes are **typed** rather
+  than a single string: `RenameTagError::NameTaken` vs
+  `RenameTagError::Db(anyhow::Error)`. The `app.rs` caller matches on that,
+  so a database failure is surfaced as an error instead of being rewritten as
+  `'X' already exists`. The stale `QueryReturnedNoRows` comment (which
+  described a sentinel the code no longer used) is gone.
+- Tests: 495 → **517**, all green (37 + 82 + 266 + 132). New `repo.rs` tests:
+  - *Query counts* — a `count_statements` helper driven by
+    `SQLITE_TRACE_STMT`, asserting the count is **equal at 1 and 21 projects**
+    for both functions and small in absolute terms, plus the no-result and
+    no-project fast paths. The helper needs the `trace` feature, which is
+    declared as a **dev-dependency** feature so the shipped binaries do not
+    carry it (same for `hooks`, used by the #11 test).
+  - *Behaviour preserved* — tag order, untagged projects, tag filter + search
+    combined, todo order within a band, archived filtering, inbox-only,
+    empty database, and five reminder tests including "the list agrees with
+    `get_project`" and "done/canceled todos are excluded".
+  - *#11* — a SQLite authorizer denies reads of `tags.name` (the column the
+    probe reads and the `UPDATE` does not), asserting `rename_tag` errors, does
+    not rename, and does not say "already exists"; plus a test that the two
+    error variants are distinguishable. Two `app.rs` tests cover the caller:
+    one for the collision path (the overlay stays open with `'X' already
+    exists`), one for the database-failure path (the error propagates instead).
+    The latter denies only the **first** read of the column, because denying
+    every read would not discriminate — the post-rename reloads read it too,
+    so an error would surface either way.
+  - Each fix's test was confirmed to fail against the unfixed tree by
+    re-introducing the defect (counts 2 vs 22 and 4 vs 24; the authorizer case
+    passed through).
+- **New harness `dev-harness/query-count.py` (#10/#11), 8/8.** Neither finding
+  has an external symptom — the list renders correctly and the UI says the same
+  thing either way — so the harness compiles the **real `src/data/repo.rs`**
+  (path-included, with the schema lifted textually out of `db.rs`) into a
+  scratch crate and measures statement counts and error propagation directly.
+  Re-run against the unfixed tree: **2/8**, failing exactly the #10 and #11
+  checks.
+- `wal-safety.py` **23/23**, `sync-state.py` **20/20**, `merge-robust.py`
+  **6/6**, `s3-roundtrip.py` **12/12**, `panics.py` **9/9**,
+  `update-viewer.py` **4/4** — unchanged. `search-highlight.py` still fails;
+  its finding is session G.
+- `cargo clippy --all-targets` reports **no new warnings** from `repo.rs`.
+
+---
+
 ## Grouping principle
 
 Three rules drive the split:
@@ -517,8 +597,14 @@ rather than repairing it, and it needs justifying in the commit message.
   `key_help_lines()` are asserted against each other by a test. The
   render-purity decision — keep the exception, document it — is recorded on
   `PublishedMetrics` and in AGENTS.md. `update-viewer.py` is the harness.
-- **F** — query-count assertion for `list_projects` / `list_todos_global`
-  (e.g. a `Connection` wrapper that counts `prepare` calls).
+- **F** — *met.* `query-count.py` **8/8** (2/8 against the unfixed tree),
+  asserting the statement count is **equal at 1 and 30 projects** for both
+  `list_projects` (2) and `list_todos_global` (3), not merely "small": a
+  counting `Connection` wrapper was considered and rejected because it cannot
+  see statements issued inside `repo.rs` and would miss the reminder subquery
+  entirely. Counting is done by SQLite's `SQLITE_TRACE_STMT` callback instead.
+  #11 is covered by the same harness via an authorizer that denies the probe's
+  column.
 - **G** — `search-highlight.py` fully green; width test with CJK/emoji titles.
 - **H** — `cargo clippy --all-targets` at zero warnings; AGENTS.md tree matches
   `src/`.
@@ -650,8 +736,8 @@ any finding.
 | 7 | `merge-robust.py` | PASS — fixed in C |
 | 8 | `merge-robust.py` | PASS — fixed in C |
 | 9 | `merge-robust.py` | PASS — fixed in C |
-| 10 | — | not covered (add a `repo` unit test) |
-| 11 | — | not covered (add a `repo` unit test) |
+| 10 | `query-count.py` | PASS — fixed in F (2/3 statements at any row count) |
+| 11 | `query-count.py` | PASS — fixed in F (probe error propagated) |
 | 12 | `sync-state.py` | PASS — fixed in B |
 | 13 | `panics.py` | PASS — fixed in D |
 | 14 | — | documented (unit-tested via the handlers that read it) |
