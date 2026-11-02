@@ -125,8 +125,12 @@ def check_update_ordering(root):
     local = ptmdb.data_dir(root / "l9")
     c = ptmdb.new_db(local / "ptm.db")
     c.execute("INSERT INTO projects VALUES('p1','P','',1.0,0," + TS + "," + TS + ")")
-    # updates are stored newest-first: create_update uses MIN(sort_order) - 1.0,
-    # so the visible order is L1 (0), L2 (-1), L3 (-2).
+    # updates are stored newest-first: create_update uses MIN(sort_order) - 1.0
+    # and list_updates is ORDER BY sort_order ASC, so ascending sort_order *is*
+    # the on-screen order and the newest entry (L3) renders first.  The fixture
+    # therefore fixes the pre-merge display order as [L3, L2, L1], not
+    # [L1, L2, L3] -- the point of the check is that the blocks stay intact and
+    # the foreign rows land after the local ones, not what the local order is.
     for uid, title, order in [("L1", "local one", 0.0),
                               ("L2", "local two", -1.0),
                               ("L3", "local three", -2.0)]:
@@ -158,11 +162,26 @@ def check_update_ordering(root):
     ]
     # Documented promise (merge.rs docstring): local rows keep their ranking and
     # foreign-only rows slot in *after* them.
-    expected = ["L1", "L2", "L3", "R1", "R2"]
+    #
+    # Asserted structurally rather than against one hard-coded list: display
+    # order is ascending sort_order (see the note above), so the fixture's local
+    # block is [L3, L2, L1] and the source's is [R2, R1].  Comparing the
+    # concatenation is what "not interleaved" means, and it does not encode the
+    # local ordering convention a second time.
+    local_display = ["L3", "L2", "L1"]
+    foreign_display = ["R2", "R1"]
+    expected = local_display + foreign_display
     results.check(
         order == expected,
-        f"display order is {expected} (foreign rows after the local block)  "
+        f"display order is {expected} (local block intact, foreign rows after it)  "
         "[FAIL = finding #9 is live: histories are interleaved]",
+        f"got {order}",
+    )
+    results.check(
+        [u for u in order if u.startswith("L")] == local_display
+        and [u for u in order if u.startswith("R")] == foreign_display,
+        "neither history was reordered internally "
+        "(a companion invariant, not the #9 detector -- it also holds for the buggy interleaved result)",
         f"got {order}",
     )
 

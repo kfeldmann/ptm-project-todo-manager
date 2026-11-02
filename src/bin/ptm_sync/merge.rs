@@ -26,11 +26,40 @@
 //! is not inserted — mirroring the app's case-insensitive rename checks.
 //!
 //! `sort_order` policy: shared rows keep the local ranking; new rows are
-//! appended after the local rows of their ordering group (offset by the
-//! group's local max plus their own foreign rank), and every group is then
-//! re-spaced to 1.0, 2.0, … with `ROW_NUMBER()`.  Result: local relative
-//! order is untouched, foreign-only rows slot in after it, and `ORDER BY
-//! sort_order` consumers see a clean, tie-free ranking.
+//! appended after the local rows of their ordering group, and every group is
+//! then re-spaced to 1.0, 2.0, … with `ROW_NUMBER()` over `(sort_order,
+//! created_at)`.  Result: local relative order is untouched, foreign-only rows
+//! slot in after it, and `ORDER BY sort_order` consumers see a clean, tie-free
+//! ranking.
+//!
+//! "After the local rows" is expressed as *a rank strictly greater than the
+//! group's local maximum*, never as `local_max + foreign_sort_order`:
+//!
+//! - `updates` are stored **newest-first** (`repo::create_update` prepends with
+//!   `MIN(sort_order) - 1.0`), so a group's local orders run `0, -1, -2, …` and
+//!   the *last* rendered row holds the group's minimum.  Offsetting by `MAX()`
+//!   put foreign entries in the middle of the local block.
+//! - Foreign `sort_order` values are arbitrary (they come from another
+//!   database's own numbering) and may be negative, so `local_max + sort_order`
+//!   could also land *before* every local row.
+//!
+//! Because both sides are fully re-spaced afterwards, only the relative
+//! comparison has to be right: shared rows keep their own (local) order,
+//! foreign-only rows are ranked after them, and each group ends up with
+//! distinct ascending orders.
+//!
+//! Referential integrity: foreign rows are only ever *inserted* into the local
+//! database, so any reference that does not resolve locally would abort the
+//! whole merge on an FK violation.  `todos.project_id`, `updates.project_id`,
+//! `project_tags.project_id` and `reference_tags.reference_id` are therefore
+//! resolved against the local tables and nulled (or skipped) when they dangle —
+//! the row is still imported, it just loses the link.  Note that
+//! `INSERT OR IGNORE` does **not** help here: an FK violation is an error, not
+//! a conflict, so it aborts regardless.
+//!
+//! Schema drift: both databases are brought up to date before the merge
+//! (`ensure_schema_compat`), including the **local** one — a local db that
+//! predates a column the merge writes to must be migrated, not assumed.
 //!
 //! Known limitation: a row deleted on one side is resurrected by the other
 //! side's surviving copy.  True delete propagation would need tombstones.
@@ -185,21 +214,33 @@ pub fn run_merge(paths: &crate::Paths, from_dir: &Path, dry_run: bool) -> Result
         let stats = merge_dbs(&paths.db, &tmp_src).with_context(|| {
             format!("Merging '{}' into '{}'", from_db.display(), paths.db.display())
         })?;
-        crate::log_entry(
-            paths,
-            &format!(
-                "Merge stats: {} rows inserted, {} shared rows updated, \
-                 {} tags added, {} tag memberships added",
-                stats.rows_inserted, stats.rows_updated,
-                stats.tags_added, stats.tag_memberships_added,
-            ),
-        );
-        println!(
-            "Merged: {} rows inserted, {} shared rows updated, \
+        let summary = format!(
+            "{} rows inserted, {} shared rows updated, \
              {} tags added, {} tag memberships added",
             stats.rows_inserted, stats.rows_updated,
             stats.tags_added, stats.tag_memberships_added,
         );
+        crate::log_entry(paths, &format!("Merge stats: {}", summary));
+        println!("Merged: {}", summary);
+        // Rows whose references dangle locally are reported, not hidden: they
+        // are the visible residue of a source database that was missing the
+        // ON DELETE CASCADE migration (findings #8).
+        if stats.orphaned_links > 0 {
+            let msg = format!(
+                "{} todo(s) had a missing project and were imported into the Inbox",
+                stats.orphaned_links
+            );
+            crate::log_entry(paths, &format!("Merge warning: {}", msg));
+            println!("Warning: {}", msg);
+        }
+        if stats.dropped_rows > 0 {
+            let msg = format!(
+                "{} update(s) were skipped because their project does not exist locally",
+                stats.dropped_rows
+            );
+            crate::log_entry(paths, &format!("Merge warning: {}", msg));
+            println!("Warning: {}", msg);
+        }
         Ok(())
     })();
 
@@ -361,12 +402,26 @@ pub struct MergeStats {
     pub rows_updated: usize,
     pub tags_added: usize,
     pub tag_memberships_added: usize,
+    /// Foreign rows imported with a dangling reference nulled out (todos whose
+    /// project is gone — they land in the Inbox).
+    pub orphaned_links: usize,
+    /// Foreign rows that could not be imported at all because a NOT NULL
+    /// reference dangles (updates whose project is gone).
+    pub dropped_rows: usize,
 }
 
-/// Open the local db read-write, ATTACH `src_db` (already migrated) as `src`,
-/// and merge everything inside one transaction.
+/// Open the local db read-write, bring its schema up to date, ATTACH `src_db`
+/// (already migrated) as `src`, and merge everything inside one transaction.
+///
+/// The local schema is migrated too (finding #7): the merge SQL writes columns
+/// that a database predating the migrations does not have yet, so running the
+/// statements against it would abort with "no such column".  Migrating here,
+/// before `BEGIN IMMEDIATE`, keeps the migration itself out of the merge
+/// transaction — it is a series of guarded `ALTER TABLE`s that is a no-op on an
+/// up-to-date database.
 fn merge_dbs(local_db: &Path, src_db: &Path) -> Result<MergeStats> {
     let conn = open_rw(local_db)?;
+    ensure_schema_compat(&conn).context("Failed to bring the local schema up to date")?;
     conn.execute(
         "ATTACH DATABASE ?1 AS src",
         rusqlite::params![src_db.to_string_lossy()],
@@ -378,6 +433,8 @@ fn merge_dbs(local_db: &Path, src_db: &Path) -> Result<MergeStats> {
         rows_updated: 0,
         tags_added: 0,
         tag_memberships_added: 0,
+        orphaned_links: 0,
+        dropped_rows: 0,
     };
 
     conn.execute_batch("BEGIN IMMEDIATE;")
@@ -395,14 +452,48 @@ fn merge_dbs(local_db: &Path, src_db: &Path) -> Result<MergeStats> {
 /// All merge statements, executed inside an open transaction on `conn`
 /// with the source attached as `src`.
 fn merge_content(conn: &Connection, stats: &mut MergeStats) -> Result<()> {
+    // ── 0. Local ordering baselines ───────────────────────────────────────
+    // One row per ordering group holding the group's local MAX(sort_order).
+    // Computed *before* anything is inserted, so the offset a foreign row gets
+    // cannot depend on how many foreign rows happened to be written first.
+    // `project_id` is NULL for the unpartitioned tables (`projects`,
+    // `references_table`) so a single join works for every table.
+    //
+    // Foreign rows are ranked after the local block with
+    // `local_max + rank`, never `local_max + sort_order`: foreign sort_orders
+    // are arbitrary and may be negative, and `updates` stores its rows
+    // newest-first, so a group's local orders descend (`0, -1, -2, …`).
+    // Only the *relative* comparison matters, because every group is re-spaced
+    // to 1..N at the end.
+    for (name, table, partition) in [
+        ("proj", "projects", "NULL"),
+        ("todo", "todos", "project_id"),
+        ("upd", "updates", "project_id"),
+        ("ref", "references_table", "NULL"),
+    ] {
+        conn.execute_batch(&format!(
+            "DROP TABLE IF EXISTS temp.merge_base_{name};
+             CREATE TEMP TABLE merge_base_{name} AS
+                 SELECT {partition} AS grp, MAX(sort_order) AS base
+                 FROM main.{table} GROUP BY {partition};"
+        ))?;
+    }
+
     // ── 1. Projects ───────────────────────────────────────────────────────
     stats.rows_inserted += conn.execute(
-        "INSERT INTO projects (id, title, description, sort_order, archived, created_at, updated_at)
+        "WITH incoming AS (
+             SELECT id, title, description, sort_order, archived, created_at, updated_at
+             FROM src.projects
+             WHERE id NOT IN (SELECT id FROM main.projects)
+         ), ranked AS (
+             SELECT *, ROW_NUMBER() OVER (ORDER BY sort_order, created_at) AS rn
+             FROM incoming
+         )
+         INSERT INTO main.projects (id, title, description, sort_order, archived, created_at, updated_at)
          SELECT id, title, description,
-                COALESCE((SELECT MAX(sort_order) FROM main.projects), 0.0) + sort_order,
+                COALESCE((SELECT base FROM temp.merge_base_proj), 0.0) + rn,
                 archived, created_at, updated_at
-         FROM src.projects
-         WHERE id NOT IN (SELECT id FROM main.projects)",
+         FROM ranked",
         [],
     )?;
 
@@ -419,23 +510,56 @@ fn merge_content(conn: &Connection, stats: &mut MergeStats) -> Result<()> {
     )?;
 
     // ── 2. Todos (after projects so FKs resolve) ──────────────────────────
+    // `project_id` is resolved against the *local* projects table: a todo whose
+    // project was deleted on the source side (possible in any db predating the
+    // ON DELETE CASCADE migration) would otherwise abort the whole merge with a
+    // FOREIGN KEY violation (finding #8).  It is imported into the Inbox
+    // instead, and the count is reported.  The check has to happen in the
+    // SELECT — `INSERT OR IGNORE` does not suppress FK errors, it only ignores
+    // uniqueness conflicts.
+    let orphaned_todos: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM src.todos t
+         WHERE t.id NOT IN (SELECT id FROM main.todos)
+           AND t.project_id IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM main.projects p WHERE p.id = t.project_id)",
+        [],
+        |r| r.get(0),
+    )?;
+    stats.orphaned_links += orphaned_todos as usize;
+
     stats.rows_inserted += conn.execute(
-        "INSERT INTO todos (id, project_id, title, status, reminder, sort_order, archived, created_at, updated_at)
+        "WITH incoming AS (
+             SELECT id,
+                    CASE WHEN project_id IS NULL THEN NULL
+                         WHEN EXISTS (SELECT 1 FROM main.projects p
+                                      WHERE p.id = src.todos.project_id)
+                              THEN project_id
+                         ELSE NULL END AS project_id,
+                    title, status, reminder, sort_order, archived, created_at, updated_at
+             FROM src.todos
+             WHERE id NOT IN (SELECT id FROM main.todos)
+         ), ranked AS (
+             SELECT *, ROW_NUMBER() OVER (
+                 PARTITION BY project_id ORDER BY sort_order, created_at) AS rn
+             FROM incoming
+         )
+         INSERT INTO main.todos (id, project_id, title, status, reminder, sort_order, archived, created_at, updated_at)
          SELECT id, project_id, title, status, reminder,
-                COALESCE((
-                    SELECT MAX(m.sort_order) FROM main.todos m
-                    WHERE (m.project_id = src.todos.project_id)
-                       OR (m.project_id IS NULL AND src.todos.project_id IS NULL)
-                ), 0.0) + sort_order,
+                COALESCE((SELECT base FROM temp.merge_base_todo b
+                          WHERE b.grp IS ranked.project_id), 0.0) + rn,
                 archived, created_at, updated_at
-         FROM src.todos
-         WHERE id NOT IN (SELECT id FROM main.todos)",
+         FROM ranked",
         [],
     )?;
 
+    // LWW update.  The same dangling-project rule applies: a shared todo whose
+    // incoming `project_id` does not resolve locally keeps its local project
+    // rather than aborting the merge.
     stats.rows_updated += conn.execute(
         "UPDATE main.todos SET
-            project_id = s.project_id,
+            project_id = COALESCE(
+                (SELECT p.id FROM main.projects p WHERE p.id = s.project_id),
+                main.todos.project_id),
             title      = s.title,
             status     = s.status,
             reminder   = s.reminder,
@@ -448,16 +572,36 @@ fn merge_content(conn: &Connection, stats: &mut MergeStats) -> Result<()> {
     )?;
 
     // ── 3. Updates ────────────────────────────────────────────────────────
+    // `updates.project_id` is NOT NULL with an FK, so an update whose project
+    // is missing locally cannot be imported at all.  Those rows are skipped and
+    // counted rather than aborting the merge (#8).
+    let dropped_updates: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM src.updates u
+         WHERE u.id NOT IN (SELECT id FROM main.updates)
+           AND NOT EXISTS (SELECT 1 FROM main.projects p WHERE p.id = u.project_id)",
+        [],
+        |r| r.get(0),
+    )?;
+    stats.dropped_rows += dropped_updates as usize;
+
     stats.rows_inserted += conn.execute(
-        "INSERT INTO updates (id, project_id, label, body, sort_order, created_at, updated_at)
+        "WITH incoming AS (
+             SELECT id, project_id, label, body, sort_order, created_at, updated_at
+             FROM src.updates
+             WHERE id NOT IN (SELECT id FROM main.updates)
+               AND EXISTS (SELECT 1 FROM main.projects p
+                           WHERE p.id = src.updates.project_id)
+         ), ranked AS (
+             SELECT *, ROW_NUMBER() OVER (
+                 PARTITION BY project_id ORDER BY sort_order, created_at) AS rn
+             FROM incoming
+         )
+         INSERT INTO main.updates (id, project_id, label, body, sort_order, created_at, updated_at)
          SELECT id, project_id, label, body,
-                COALESCE((
-                    SELECT MAX(m.sort_order) FROM main.updates m
-                    WHERE m.project_id = src.updates.project_id
-                ), 0.0) + sort_order,
+                COALESCE((SELECT base FROM temp.merge_base_upd b
+                          WHERE b.grp = ranked.project_id), 0.0) + rn,
                 created_at, updated_at
-         FROM src.updates
-         WHERE id NOT IN (SELECT id FROM main.updates)",
+         FROM ranked",
         [],
     )?;
 
@@ -474,12 +618,19 @@ fn merge_content(conn: &Connection, stats: &mut MergeStats) -> Result<()> {
 
     // ── 4. References ─────────────────────────────────────────────────────
     stats.rows_inserted += conn.execute(
-        "INSERT INTO references_table (id, title, body, sort_order, created_at, updated_at)
+        "WITH incoming AS (
+             SELECT id, title, body, sort_order, created_at, updated_at
+             FROM src.references_table
+             WHERE id NOT IN (SELECT id FROM main.references_table)
+         ), ranked AS (
+             SELECT *, ROW_NUMBER() OVER (ORDER BY sort_order, created_at) AS rn
+             FROM incoming
+         )
+         INSERT INTO main.references_table (id, title, body, sort_order, created_at, updated_at)
          SELECT id, title, body,
-                COALESCE((SELECT MAX(sort_order) FROM main.references_table), 0.0) + sort_order,
+                COALESCE((SELECT base FROM temp.merge_base_ref), 0.0) + rn,
                 created_at, updated_at
-         FROM src.references_table
-         WHERE id NOT IN (SELECT id FROM main.references_table)",
+         FROM ranked",
         [],
     )?;
 
@@ -508,7 +659,10 @@ fn merge_content(conn: &Connection, stats: &mut MergeStats) -> Result<()> {
     // ── 6. Tag memberships, remapping name-duplicate tag ids ─────────────
     // Resolve each incoming membership's tag id: exact id if it exists
     // locally, otherwise the local tag with the same name; skip if neither.
-    let add_memberships = |table: &str, fk_col: &str| -> Result<usize> {
+    // The owning row must exist locally too — a membership whose project /
+    // reference was deleted on the source side would otherwise abort the merge
+    // on an FK violation (finding #8).
+    let add_memberships = |table: &str, fk_col: &str, parent: &str| -> Result<usize> {
         Ok(conn.execute(
             &format!(
                 "INSERT OR IGNORE INTO {table} ({fk_col}, tag_id)
@@ -520,13 +674,16 @@ fn merge_content(conn: &Connection, stats: &mut MergeStats) -> Result<()> {
                              WHERE s.id = pt.tag_id)
                         )
                  FROM src.{table} pt
-                 WHERE pt.tag_id IS NOT NULL"
+                 WHERE pt.tag_id IS NOT NULL
+                   AND EXISTS (SELECT 1 FROM main.{parent} m
+                               WHERE m.id = pt.{fk_col})"
             ),
             [],
         )?)
     };
-    stats.tag_memberships_added += add_memberships("project_tags", "project_id")?;
-    stats.tag_memberships_added += add_memberships("reference_tags", "reference_id")?;
+    stats.tag_memberships_added += add_memberships("project_tags", "project_id", "projects")?;
+    stats.tag_memberships_added +=
+        add_memberships("reference_tags", "reference_id", "references_table")?;
 
     // ── 7. Garbage-collect tags with no remaining memberships ────────────
     conn.execute(
@@ -866,15 +1023,18 @@ mod tests {
         let (src, sc) = fresh_db(&dir, "src.db");
 
         insert_project(&lc, "p1", "P1", "2025-01-01T00:00:00Z", 1.0);
-        // Corrupt the source: todo referencing a nonexistent project violates
-        // FKs during the merge.  (FKs are disabled only for this fixture
-        // write; the merge itself re-enables them via open_rw.)
+        // A row the merge cannot import *and* cannot skip: `updates.project_id`
+        // is NOT NULL with an FK, so it is dropped, not imported.  Force a real
+        // failure instead with a row that violates the status CHECK, which no
+        // resolution rule can repair.  FKs/CHECKs are disabled only for this
+        // fixture write; the merge re-enables them via open_rw.
         sc.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
-        insert_todo(&sc, "t1", Some("missing-project"), "Orphan", "new", "2025-01-01T00:00:00Z", 1.0);
+        sc.execute_batch("PRAGMA ignore_check_constraints = ON;").unwrap();
+        insert_todo(&sc, "t1", Some("p1"), "Bad status", "bogus", "2025-01-01T00:00:00Z", 1.0);
         drop(lc);
         drop(sc);
 
-        assert!(merge_dbs(&local, &src).is_err(), "FK violation must fail the merge");
+        assert!(merge_dbs(&local, &src).is_err(), "a CHECK violation must fail the merge");
 
         let conn = Connection::open(&local).unwrap();
         assert_eq!(
@@ -1004,5 +1164,414 @@ mod tests {
         let added = merge_user_words(&from, &local).unwrap();
         assert_eq!(added, 0);
         assert_eq!(std::fs::read_to_string(&local).unwrap(), "apple\n");
+    }
+
+    // ── #7: a legacy *local* database is migrated before merging ─────────────
+    //
+    // The merge SQL writes columns that predate the migrations; running it
+    // against an un-migrated local db aborted with "no such column".  The
+    // fixture below is deliberately legacy-shaped (no updates.label /
+    // sort_order / updated_at, no todos.archived), i.e. the state the guarded
+    // ALTER TABLEs exist for.
+
+    /// A database with the pre-migration schema.
+    fn legacy_db(path: &Path) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE tags (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, color TEXT);
+             CREATE TABLE projects (
+                 id TEXT PRIMARY KEY, title TEXT NOT NULL,
+                 description TEXT NOT NULL DEFAULT '', sort_order REAL NOT NULL DEFAULT 0.0,
+                 archived INTEGER NOT NULL DEFAULT 0,
+                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+             );
+             CREATE TABLE project_tags (
+                 project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                 tag_id TEXT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+                 PRIMARY KEY (project_id, tag_id)
+             );
+             CREATE TABLE updates (
+                 id TEXT PRIMARY KEY,
+                 project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                 body TEXT NOT NULL,
+                 created_at TEXT NOT NULL
+             );
+             CREATE TABLE todos (
+                 id TEXT PRIMARY KEY,
+                 project_id TEXT REFERENCES projects(id),
+                 title TEXT NOT NULL,
+                 status TEXT NOT NULL DEFAULT 'new',
+                 reminder TEXT, sort_order REAL NOT NULL DEFAULT 0.0,
+                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+             );
+             CREATE TABLE references_table (
+                 id TEXT PRIMARY KEY, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '',
+                 sort_order REAL NOT NULL DEFAULT 0.0,
+                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+             );
+             CREATE TABLE reference_tags (
+                 reference_id TEXT NOT NULL REFERENCES references_table(id) ON DELETE CASCADE,
+                 tag_id TEXT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+                 PRIMARY KEY (reference_id, tag_id)
+             );",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn merge_into_a_legacy_local_database_succeeds() {
+        let dir = TempDir::new().unwrap();
+        let local = dir.path().join("legacy-local.db");
+        let src = dir.path().join("src.db");
+
+        let lc = legacy_db(&local);
+        lc.execute(
+            "INSERT INTO projects VALUES('p1','Local','',1.0,0,
+                 '2025-01-01T00:00:00Z','2025-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        lc.execute(
+            "INSERT INTO updates (id, project_id, body, created_at)
+             VALUES('u1','p1','local body','2025-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        drop(lc);
+
+        {
+            let sc = Connection::open(&src).unwrap();
+            sc.execute_batch(SCHEMA).unwrap();
+            insert_project(&sc, "p2", "Remote", "2025-01-02T00:00:00Z", 2.0);
+            sc.execute(
+                "INSERT INTO updates (id, project_id, label, body, sort_order, created_at, updated_at)
+                 VALUES('u2','p2','','remote body',1.0,'2025-01-02T00:00:00Z','2025-01-02T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let stats = merge_dbs(&local, &src).expect("a legacy local db must be migrated, not rejected");
+        assert_eq!(stats.rows_inserted, 2, "one project + one update inserted");
+
+        let conn = Connection::open(&local).unwrap();
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM projects"), 2);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM updates"), 2);
+        // The pre-existing local row was migrated, not lost.
+        let body: String = conn
+            .query_row("SELECT body FROM updates WHERE id='u1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(body, "local body");
+    }
+
+    // ── #8: dangling foreign references do not abort the merge ───────────────
+
+    #[test]
+    fn dangling_todo_project_is_imported_into_the_inbox() {
+        let dir = TempDir::new().unwrap();
+        let (local, lc) = fresh_db(&dir, "local.db");
+        let (src, sc) = fresh_db(&dir, "src.db");
+
+        insert_project(&lc, "p1", "P1", "2025-01-01T00:00:00Z", 1.0);
+        // The source's todo points at a project that does not exist locally.
+        sc.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        insert_todo(&sc, "t1", Some("ghost"), "Orphan", "new", "2025-01-01T00:00:00Z", 1.0);
+        drop(lc);
+        drop(sc);
+
+        let stats = merge_dbs(&local, &src).expect("a dangling project must not abort the merge");
+        assert_eq!(stats.rows_inserted, 1, "the orphaned todo is still imported");
+        assert_eq!(stats.orphaned_links, 1, "and is reported");
+
+        let conn = Connection::open(&local).unwrap();
+        let pid: Option<String> = conn
+            .query_row("SELECT project_id FROM todos WHERE id='t1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(pid, None, "the unresolvable link is nulled (Inbox)");
+    }
+
+    #[test]
+    fn dangling_update_project_is_skipped_and_counted() {
+        let dir = TempDir::new().unwrap();
+        let (local, lc) = fresh_db(&dir, "local.db");
+        let (src, sc) = fresh_db(&dir, "src.db");
+
+        insert_project(&lc, "p1", "P1", "2025-01-01T00:00:00Z", 1.0);
+        // updates.project_id is NOT NULL with an FK, so this row cannot be
+        // imported at all -- it must be skipped, not abort the merge.
+        sc.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        sc.execute(
+            "INSERT INTO updates (id, project_id, label, body, sort_order, created_at, updated_at)
+             VALUES('u1','ghost','','orphan update',1.0,
+                    '2025-01-01T00:00:00Z','2025-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        // A healthy row alongside it must still be imported.
+        sc.execute(
+            "INSERT INTO updates (id, project_id, label, body, sort_order, created_at, updated_at)
+             VALUES('u2','p1','','good update',1.0,
+                    '2025-01-01T00:00:00Z','2025-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        drop(lc);
+        drop(sc);
+
+        let stats = merge_dbs(&local, &src).expect("a dangling update must not abort the merge");
+        assert_eq!(stats.dropped_rows, 1, "the unresolvable update is reported");
+        assert_eq!(stats.rows_inserted, 1, "the healthy update is still imported");
+
+        let conn = Connection::open(&local).unwrap();
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM updates WHERE id='u1'"), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM updates WHERE id='u2'"), 1);
+    }
+
+    #[test]
+    fn shared_todo_keeps_its_local_project_when_the_incoming_one_dangles() {
+        // The LWW path rewrites `project_id` too, so a *shared* todo whose
+        // incoming project does not exist locally would abort the merge on the
+        // FK check.  It must keep its local project instead.
+        let dir = TempDir::new().unwrap();
+        let (local, lc) = fresh_db(&dir, "local.db");
+        let (src, sc) = fresh_db(&dir, "src.db");
+
+        insert_project(&lc, "p1", "P1", "2025-01-01T00:00:00Z", 1.0);
+        insert_todo(&lc, "t1", Some("p1"), "local title", "new", "2025-01-01T00:00:00Z", 1.0);
+        sc.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        // Same todo, newer, but repointed at a project that is not local.
+        insert_todo(&sc, "t1", Some("ghost"), "newer title", "done", "2025-06-01T00:00:00Z", 1.0);
+        drop(lc);
+        drop(sc);
+
+        merge_dbs(&local, &src).expect("a dangling project on a shared todo must not abort");
+
+        let conn = Connection::open(&local).unwrap();
+        let (pid, title, status): (Option<String>, String, String) = conn
+            .query_row(
+                "SELECT project_id, title, status FROM todos WHERE id='t1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(pid.as_deref(), Some("p1"), "the local project is kept");
+        assert_eq!(title, "newer title", "the rest of the newer row still wins");
+        assert_eq!(status, "done");
+    }
+
+    #[test]
+    fn dangling_tag_memberships_are_skipped() {
+        let dir = TempDir::new().unwrap();
+        let (local, lc) = fresh_db(&dir, "local.db");
+        let (src, sc) = fresh_db(&dir, "src.db");
+
+        insert_project(&lc, "p1", "P1", "2025-01-01T00:00:00Z", 1.0);
+        sc.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        sc.execute("INSERT INTO tags (id, name) VALUES ('tag-1', 'rust')", []).unwrap();
+        // Membership on a project that does not exist locally.
+        sc.execute(
+            "INSERT INTO project_tags (project_id, tag_id) VALUES ('ghost', 'tag-1')",
+            [],
+        )
+        .unwrap();
+        // And one that does.
+        insert_project(&sc, "p1", "P1", "2025-01-01T00:00:00Z", 1.0);
+        sc.execute(
+            "INSERT INTO project_tags (project_id, tag_id) VALUES ('p1', 'tag-1')",
+            [],
+        )
+        .unwrap();
+        drop(lc);
+        drop(sc);
+
+        merge_dbs(&local, &src).expect("a dangling membership must not abort the merge");
+
+        let conn = Connection::open(&local).unwrap();
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM project_tags"),
+            1,
+            "only the resolvable membership is imported"
+        );
+    }
+
+    // ── #9: foreign `updates` are appended after the local block ─────────────
+    //
+    // `updates` are stored newest-first (`create_update` prepends with
+    // MIN(sort_order) - 1.0) and rendered by ascending sort_order, so a local
+    // group runs 0, -1, -2, ... in *display* order.  Offsetting foreign rows by
+    // the group's MAX() therefore dropped them into the middle of the local
+    // block instead of after it.
+
+    #[test]
+    fn foreign_updates_are_appended_after_the_local_block() {
+        let dir = TempDir::new().unwrap();
+        let (local, lc) = fresh_db(&dir, "local.db");
+        let (src, sc) = fresh_db(&dir, "src.db");
+
+        insert_project(&lc, "p1", "P1", "2025-01-01T00:00:00Z", 1.0);
+        insert_project(&sc, "p1", "P1", "2025-01-01T00:00:00Z", 1.0);
+        // Newest-first: display order is L3, L2, L1.
+        for (id, body, order) in [
+            ("L1", "local one", 0.0),
+            ("L2", "local two", -1.0),
+            ("L3", "local three", -2.0),
+        ] {
+            lc.execute(
+                "INSERT INTO updates (id, project_id, label, body, sort_order, created_at, updated_at)
+                 VALUES(?1,'p1','',?2,?3,'2025-01-01T00:00:00Z','2025-01-01T00:00:00Z')",
+                params![id, body, order],
+            )
+            .unwrap();
+        }
+        for (id, body, order) in [("R1", "remote one", 0.0), ("R2", "remote two", -1.0)] {
+            sc.execute(
+                "INSERT INTO updates (id, project_id, label, body, sort_order, created_at, updated_at)
+                 VALUES(?1,'p1','',?2,?3,'2025-01-02T00:00:00Z','2025-01-02T00:00:00Z')",
+                params![id, body, order],
+            )
+            .unwrap();
+        }
+        drop(lc);
+        drop(sc);
+
+        merge_dbs(&local, &src).unwrap();
+
+        let conn = Connection::open(&local).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id FROM updates ORDER BY sort_order ASC")
+            .unwrap();
+        let order: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            order,
+            ["L3", "L2", "L1", "R2", "R1"],
+            "the local block must stay intact and the foreign rows follow it"
+        );
+    }
+
+    #[test]
+    fn foreign_sort_orders_are_ranked_not_added() {
+        // Foreign sort_orders are another database's own numbering and may be
+        // negative.  They must only decide the *order* of the incoming rows,
+        // never be added to the local offset, or a foreign row could sort
+        // before every local row.
+        let dir = TempDir::new().unwrap();
+        let (local, lc) = fresh_db(&dir, "local.db");
+        let (src, sc) = fresh_db(&dir, "src.db");
+
+        insert_project(&lc, "p1", "P1", "2025-01-01T00:00:00Z", 1.0);
+        insert_project(&sc, "p1", "P1", "2025-01-01T00:00:00Z", 1.0);
+        insert_project(&lc, "p2", "P2", "2025-01-01T00:00:00Z", 2.0);
+        insert_project(&sc, "p2", "P2", "2025-01-01T00:00:00Z", 2.0);
+        insert_todo(&lc, "t1", Some("p1"), "local", "new", "2025-01-01T00:00:00Z", 7.0);
+        // Negative foreign order.
+        insert_todo(&sc, "t2", Some("p1"), "foreign", "new", "2025-01-02T00:00:00Z", -50.0);
+        drop(lc);
+        drop(sc);
+
+        merge_dbs(&local, &src).unwrap();
+
+        let conn = Connection::open(&local).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id FROM todos WHERE project_id='p1' ORDER BY sort_order ASC")
+            .unwrap();
+        let order: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(order, ["t1", "t2"], "the foreign row must follow the local one");
+    }
+
+    #[test]
+    fn foreign_rows_of_each_group_are_appended_to_their_own_group() {
+        // Ordering is per group: a project's todos must not be pushed down by
+        // another project's, and the Inbox (project_id IS NULL) is its own
+        // group.
+        let dir = TempDir::new().unwrap();
+        let (local, lc) = fresh_db(&dir, "local.db");
+        let (src, sc) = fresh_db(&dir, "src.db");
+
+        for (c, p) in [(&lc, "p1"), (&sc, "p1"), (&lc, "p2"), (&sc, "p2")] {
+            insert_project(c, p, p, "2025-01-01T00:00:00Z", if p == "p1" { 1.0 } else { 2.0 });
+        }
+        insert_todo(&lc, "a1", Some("p1"), "p1 local", "new", "2025-01-01T00:00:00Z", 1.0);
+        insert_todo(&sc, "a2", Some("p1"), "p1 foreign", "new", "2025-01-02T00:00:00Z", 9.0);
+        insert_todo(&lc, "b1", Some("p2"), "p2 local", "new", "2025-01-01T00:00:00Z", 5.0);
+        insert_todo(&sc, "b2", Some("p2"), "p2 foreign", "new", "2025-01-02T00:00:00Z", 1.0);
+        insert_todo(&lc, "i1", None, "inbox local", "new", "2025-01-01T00:00:00Z", 2.0);
+        insert_todo(&sc, "i2", None, "inbox foreign", "new", "2025-01-02T00:00:00Z", 2.0);
+        drop(lc);
+        drop(sc);
+
+        merge_dbs(&local, &src).unwrap();
+
+        let conn = Connection::open(&local).unwrap();
+        let order_of = |pid: Option<&str>| -> Vec<String> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id FROM todos WHERE project_id IS ?1 ORDER BY sort_order ASC",
+                )
+                .unwrap();
+            stmt.query_map(params![pid], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(order_of(Some("p1")), ["a1", "a2"]);
+        assert_eq!(order_of(Some("p2")), ["b1", "b2"]);
+        assert_eq!(order_of(None), ["i1", "i2"]);
+    }
+
+    #[test]
+    fn updates_are_respaced_to_one_based_ranks() {
+        // The re-spacing pass is what makes the relative comparisons above
+        // sufficient; pin it for updates too.
+        let dir = TempDir::new().unwrap();
+        let (local, lc) = fresh_db(&dir, "local.db");
+        let (src, sc) = fresh_db(&dir, "src.db");
+        insert_project(&lc, "p1", "P1", "2025-01-01T00:00:00Z", 1.0);
+        insert_project(&sc, "p1", "P1", "2025-01-01T00:00:00Z", 1.0);
+        for (id, order) in [("L1", 0.0), ("L2", -1.0)] {
+            lc.execute(
+                "INSERT INTO updates (id, project_id, label, body, sort_order, created_at, updated_at)
+                 VALUES(?1,'p1','','',?2,'2025-01-01T00:00:00Z','2025-01-01T00:00:00Z')",
+                params![id, order],
+            )
+            .unwrap();
+        }
+        sc.execute(
+            "INSERT INTO updates (id, project_id, label, body, sort_order, created_at, updated_at)
+             VALUES('R1','p1','','',0.0,'2025-01-02T00:00:00Z','2025-01-02T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        drop(lc);
+        drop(sc);
+
+        merge_dbs(&local, &src).unwrap();
+
+        let conn = Connection::open(&local).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id, sort_order FROM updates ORDER BY sort_order ASC")
+            .unwrap();
+        let rows: Vec<(String, f64)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("L2".to_string(), 1.0),
+                ("L1".to_string(), 2.0),
+                ("R1".to_string(), 3.0),
+            ],
+            "every group is re-spaced to distinct 1..N ranks in display order"
+        );
     }
 }

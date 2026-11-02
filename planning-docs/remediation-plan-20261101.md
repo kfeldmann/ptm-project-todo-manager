@@ -10,7 +10,7 @@
 |---|---|---|---|---|
 | **A** | DONE | `ptm-sync` WAL safety | **1, 2** | `ptm_sync/db.rs`, `ops.rs`, `archive.rs` |
 | **B** | DONE | Sync state machine & failure semantics | **3, 12**, exit-code half of 2 | `ptm_sync/ops.rs`, `main.rs`, `merge.rs` (1 line) |
-| **C** | | `merge` robustness | **7, 8, 9** | `ptm_sync/merge.rs` |
+| **C** | DONE | `merge` robustness | **7, 8, 9** | `ptm_sync/merge.rs` |
 | **D** | | Crash fixes | **4, 5, 13** | `views/overlay.rs`, `ptm_sync/main.rs`, `bin/enc/main.rs`, `crypto.rs`, `views/{mod,project_list,todo_list,project_detail}.rs` |
 | **E** | | Key handling & render purity | **6, 14, 15, 23** | `app.rs`, `views/project_detail.rs`, `views/overlay.rs` |
 | **F** | | Data-layer correctness & perf | **10, 11** | `data/repo.rs` |
@@ -146,6 +146,74 @@ in one place.
   and the merge section no longer claims `.db_hash` is deleted.
 
 ---
+
+### C — `merge` robustness — **done**
+
+Findings #7, #8 and #9 fixed; `merge.rs` is the only file touched.
+
+- **#7 — the legacy *local* database.** `merge_dbs` now runs
+  `ensure_schema_compat` on the local connection before `BEGIN IMMEDIATE`.
+  The merge SQL writes columns a database predating the migrations does not
+  have, so the first statement aborted with `no such column` (in practice
+  `table todos has no column named archived`, not `updates.label` as the review
+  states — the note below is right). Migrating before the transaction keeps the
+  guarded `ALTER TABLE`s out of it.
+- **#8 — dangling foreign references.** Resolved in the `SELECT`, not with
+  `INSERT OR IGNORE`: an FK violation is an *error*, not a conflict, so
+  `OR IGNORE` does not suppress it (verified — it still raises). `todos`
+  resolves `project_id` against the local `projects` table and nulls it when it
+  dangles (the todo lands in the Inbox); `updates.project_id` is `NOT NULL`, so
+  such a row is skipped; tag memberships whose owning project/reference is
+  missing are skipped. Both counts are printed and logged. The LWW `UPDATE`
+  path needed the same treatment — it rewrites `project_id` too, so a *shared*
+  todo whose incoming project dangles keeps its local project instead of
+  aborting the merge.
+- **#9 — `sort_order` policy.** Foreign rows are now ranked *after* the local
+  block with `local_max + rank`, never `local_max + sort_order`. Two defects
+  came from the old form: `updates` are stored newest-first
+  (`create_update` prepends with `MIN(sort_order) - 1.0`), so a group runs
+  `0, -1, -2, …` and `MAX()` is the *first* rendered row; and foreign
+  `sort_order` values are arbitrary (they can be negative), so adding them to
+  the local offset could sort a foreign row before every local one. The
+  per-group local maxima are captured into temp tables *before* any insert, so
+  an offset never depends on how many foreign rows were already written. The
+  same policy is applied to `projects`, `todos`, `updates` and
+  `references_table`; the final `ROW_NUMBER()` re-spacing (ordered by
+  `sort_order, created_at`) is unchanged.
+- Tests: 450 → **459**, all green (36 + 82 + 214 + 127). Eight new `merge.rs`
+  tests: a legacy-shaped local db merges; a dangling todo project is imported
+  into the Inbox; a dangling update project is skipped and counted; dangling
+  tag memberships are skipped; a shared todo keeps its local project when the
+  incoming one dangles; foreign updates are appended after the local block;
+  foreign sort orders are ranked rather than added (negative values); foreign
+  rows are appended to their own group (per-project and Inbox); updates are
+  re-spaced to 1..N. Each was confirmed to fail against the unfixed tree.
+- `merge-robust.py` went from 0/3 to **6/6**, and was re-run against the
+  unfixed tree (**1/4**) to confirm it still catches all three findings.
+- **The harness had to change shape, which the procedure requires be
+  justified.** Its #9 expectation was `L1, L2, L3, R1, R2`, justified by a
+  comment claiming *"the visible order is L1 (0), L2 (-1), L3 (-2)"*. That is
+  backwards: `list_updates` is `ORDER BY sort_order ASC`, the Updates tab
+  iterates forward with no `rev()`, and `create_update` prepends — so ascending
+  `sort_order` is the on-screen order and the fixture displays as `L3, L2, L1`.
+  Replaying the *old* algorithm by hand yields `L3, L2, R2, L1, R1`, which is
+  exactly the interleaved output the README records, so the review and README
+  both measured display order as ascending `sort_order`; only the harness's
+  expected list disagreed. Keeping it would have required the merge to *reverse*
+  the local block to pass. The check now asserts the display-order
+  concatenation and adds a companion invariant (neither history reordered
+  internally), which is labelled as a companion because it also holds for the
+  buggy result.
+- One existing test changed meaning: `failed_merge_rolls_back` used a dangling
+  FK as its failure trigger, which #8 deliberately makes non-fatal. It now uses
+  a `CHECK` violation (a bogus todo status), which no resolution rule can
+  repair, so the rollback path stays covered.
+- `wal-safety.py` **23/23**, `sync-state.py` **20/20**,
+  `s3-roundtrip.py` **12/12** — unchanged. `panics.py` and
+  `search-highlight.py` still fail; their findings are sessions D and G.
+- AGENTS.md's merge section now states the `sort_order` policy, the dangling-
+  reference rules (including that `INSERT OR IGNORE` does not help) and that
+  the **local** schema is migrated too.
 
 ## Grouping principle
 
@@ -421,9 +489,9 @@ any finding.
 | 4 | `panics.py`, `keyhelp-widths.py` | FAIL — live |
 | 5 | `panics.py` | FAIL — live |
 | 6 | — | not covered (needs a terminal) |
-| 7 | `merge-robust.py` | FAIL — live |
-| 8 | `merge-robust.py` | FAIL — live |
-| 9 | `merge-robust.py` | FAIL — live |
+| 7 | `merge-robust.py` | PASS — fixed in C |
+| 8 | `merge-robust.py` | PASS — fixed in C |
+| 9 | `merge-robust.py` | PASS — fixed in C |
 | 10 | — | not covered (add a `repo` unit test) |
 | 11 | — | not covered (add a `repo` unit test) |
 | 12 | `sync-state.py` | PASS — fixed in B |

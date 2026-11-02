@@ -129,13 +129,34 @@ crashed `ptm` leaves behind. Two consequences worth knowing before editing it:
   harness SKIPs without it (exit 0). `s3-roundtrip.py` covers the same ground
   for the happy path; `wal-safety.py` is the authority for the failure modes.
 
-## Verification status (2026-11-01, after session B — sync state machine)
+## Verification status (2026-11-01, after session C — merge robustness)
 
 Session A fixed findings 1b, 1c and 2's snapshot half; session B fixed 3 and 12
-and settled 2's exit-code half. `wal-safety.py` is **23/23**, `sync-state.py`
-**20/20**, `s3-roundtrip.py` **12/12**. `merge-robust.py`, `panics.py` and
-`search-highlight.py` are unchanged and still fail, because their findings
-belong to sessions C, D and G.
+and settled 2's exit-code half; session C fixed 7, 8 and 9. `wal-safety.py` is
+**23/23**, `sync-state.py` **20/20**, `merge-robust.py` **6/6**,
+`s3-roundtrip.py` **12/12**. `panics.py` and `search-highlight.py` are
+unchanged and still fail, because their findings belong to sessions D and G.
+
+### Why `merge-robust.py`'s #9 check changed shape in session C
+
+Its original expectation was `["L1", "L2", "L3", "R1", "R2"]`, justified by the
+comment *"the visible order is L1 (0), L2 (-1), L3 (-2)"*. That comment is
+backwards. `repo::create_update` prepends with `MIN(sort_order) - 1.0`,
+`repo::list_updates` is `ORDER BY sort_order ASC`, and the Updates tab iterates
+`pd_updates` forward with no `rev()` — so **ascending `sort_order` is the
+on-screen order** and the fixture's local block displays as `L3, L2, L1`.
+(Cross-check: replaying the *old* `MAX() + sort_order` algorithm by hand gives
+`L3, L2, R2, L1, R1`, exactly the interleaved output this README records, which
+is only possible if display order is ascending `sort_order`.)
+
+Asserting the creation-order list therefore would have required the merge to
+*reverse* the local block to pass — the opposite of the documented promise. The
+check now compares against the display-order concatenation `L3, L2, L1, R2, R1`
+and adds a companion invariant (neither history reordered internally). It was
+re-run against the unfixed tree (1/4) to confirm it still catches all three
+findings, and that the companion check alone does **not** detect #9 — it also
+holds for the buggy interleaved result, which is why it is labelled as a
+companion rather than a detector.
 
 ### Why `sync-state.py` changed shape in session B
 
@@ -161,9 +182,9 @@ reproductions were not preserved.
 | 3 (`.db_hash` seeding) | **reproduces; fixed in session B** | `--merge` deleted `.db_hash` to force a push, but `--start` re-created it from the current db, so the merged state became the sync baseline and the next `--end` logged "No changes detected". Replaced with a `.needs_push` marker that `--start` never touches. The harness now drives the real `--merge` and asserts the merged state reaches S3. |
 | 4 (key-help panic) | **reproduces** | Panics at `desc_width` **1, 2, 5, 6, 19, 20** (the review quotes terminal widths 21/22/25/26/39/40; the panic depends on the computed description width, so the fix's test should sweep `desc_width`, not terminal width). Only 3 of the 62 descriptions contain multi-byte characters, all involving `→`. |
 | 5 (`~` key path) | **reproduces** | `--encryption-key '~'` panics: `start byte index 2 is out of bounds for string of length 1`. `'~x'` silently resolves to `$HOME/`. |
-| 7 (legacy local db) | **reproduces** | Merge aborts with `table todos has no column named archived` — note the first failing column is `todos.archived`, not `updates.label` as the review states. |
-| 8 (dangling FK) | **reproduces** | `FOREIGN KEY constraint failed`, whole merge rolled back. |
-| 9 (updates ordering) | **reproduces** | Local `L1(0), L2(-1), L3(-2)` + foreign `R1(0), R2(-1)` renders `L3, L2, R2, L1, R1` — interleaved, not `L1..L3, R1..R2`. |
+| 7 (legacy local db) | **reproduces; fixed in session C** | Merge aborts with `table todos has no column named archived` — note the first failing column is `todos.archived`, not `updates.label` as the review states. The local connection is now migrated by `ensure_schema_compat` before the merge transaction. |
+| 8 (dangling FK) | **reproduces; fixed in session C** | `FOREIGN KEY constraint failed`, whole merge rolled back. Resolved in the `SELECT`: `todos.project_id` is nulled (Inbox) and counted, an `updates` row whose `project_id` dangles is skipped and counted (the column is `NOT NULL`), and memberships whose owning row is missing are skipped. `INSERT OR IGNORE` does not help — FK violations are errors, not conflicts. |
+| 9 (updates ordering) | **reproduces; fixed in session C** | Local `L1(0), L2(-1), L3(-2)` + foreign `R1(0), R2(-1)` rendered `L3, L2, R2, L1, R1` — interleaved. Now `L3, L2, L1, R2, R1`: the local block stays intact and the foreign rows follow it. See "Why `merge-robust.py`'s #9 check changed shape" above for the display-order question. |
 | 12 (non-TTY abort) | **reproduces; fixed in session B** | `--start` exited 1 with "Network error and no interactive terminal; cannot pull" when stdin was a pipe. It now continues with a warning and leaves the local data untouched, so `ptm` still launches. |
 | 13 (byte-sliced dates) | **reproduces** | `&s[..10]` panics on `"2025-01-1é"` (`not a char boundary`). Note `"→2025-01-01"` does *not* panic — the boundary has to land mid-character. |
 | 17 (`split_span`) | **reproduces** | Searching `İ` in `İstanbul` highlights `İs` instead of `İ`. Searching `i` highlights `İ` correctly. |

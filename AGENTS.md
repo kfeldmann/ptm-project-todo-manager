@@ -173,10 +173,28 @@ Merges a diverged ptm data directory into the local one.  Implemented in
   with `INSERT OR IGNORE`.
 - **`sort_order`**: shared rows keep the local ranking; foreign-only rows
   are appended after the local rows of their ordering group; every group is
-  then re-spaced to 1.0, 2.0, … with `ROW_NUMBER()`.
-- **Schema drift**: both databases are brought up to date before the merge
-  (guarded `ALTER TABLE` migrations mirroring `src/data/db.rs`; the source
-  copy is snapshotted with `VACUUM INTO` and migrated in a temp dir).
+  then re-spaced to 1.0, 2.0, … with `ROW_NUMBER()` over
+  `(sort_order, created_at)`.  "After the local rows" is a rank *greater than
+  the group's local maximum*, never `local_max + sort_order` — foreign
+  `sort_order` values are another database's own numbering and may be
+  negative, and `updates` are stored newest-first (`create_update` prepends
+  with `MIN(sort_order) - 1.0`, so a group runs `0, -1, -2, …` in display
+  order).  The per-group local maxima are captured into temp tables before
+  any insert, so an offset never depends on how many foreign rows were
+  written first.
+- **Dangling references**: a source row whose reference does not resolve
+  locally does not abort the merge.  `todos.project_id` is nulled (the todo
+  lands in the Inbox) and counted; `updates.project_id` is `NOT NULL`, so such
+  an update is skipped and counted; tag memberships whose owning row is
+  missing are skipped.  The counts are printed and logged.  Note
+  `INSERT OR IGNORE` does **not** suppress FK violations — they are errors,
+  not conflicts — so the resolution happens in the `SELECT`.
+- **Schema drift**: both databases are brought up to date before the merge —
+  including the **local** one (`ensure_schema_compat` runs before
+  `BEGIN IMMEDIATE`), because the merge SQL writes columns a database
+  predating the migrations does not have.  Guarded `ALTER TABLE` migrations
+  mirror `src/data/db.rs`; the source copy is snapshotted with `VACUUM INTO`
+  and migrated in a temp dir.
 - **Safety**: local WAL is checkpointed first (abort if another process has
   the db open); a `VACUUM INTO` snapshot is written to
   `local-backups/ptm-premerge-<ts>.db` (5 kept) before any change; the
