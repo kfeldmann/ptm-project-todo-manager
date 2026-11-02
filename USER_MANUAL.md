@@ -225,14 +225,16 @@ The Project Detail screen is organized into four **tabs**, switched with single-
 └──────────────────────────────────────────────────────────┘
 ```
 
-### Universal keys (work in every tab)
+### Universal keys (work in every tab, and in the update viewer)
 
 | Key | Action |
 |---|---|
-| `ESC` | Return to Project List |
+| `ESC` | Close the update viewer if one is open, otherwise return to Project List |
 | `E` (Shift+e) | Edit project title inline |
 | `T` (Shift+t) | Open Tag Picker to edit tags on this project |
 | `/` | Search / highlight text across all tabs |
+| `n` / `N` | Next / previous search match (Description tab and update viewer only) |
+| `d` / `u` / `t` / `f` | Switch tab (closes the update viewer if it is open) |
 
 ### Editing the project title
 
@@ -289,10 +291,17 @@ Press `Enter` on a selected update to open it in a scrollable full-screen viewer
 |---|---|
 | `j` / `↓` | Scroll down |
 | `k` / `↑` | Scroll up |
+| `^F` / `^B` | Half-page scroll (PgDn / PgUp too) |
+| `g` / `G` | Jump to top / bottom (Home / End too) |
+| `n` / `N` | Next / previous search match (wraps) |
 | `e` | Edit this update in `$EDITOR` |
 | `S` (Shift+s) | Spell check this update |
 | `/` | Search / highlight text within the viewer |
+| `E` | Edit the project title |
+| `T` | Open the tag editor |
+| `d` / `u` / `t` / `f` | Switch tab (closes the viewer) |
 | `ESC` | Close viewer, return to Updates list |
+| `?` | Key help |
 
 ---
 
@@ -777,10 +786,17 @@ If `$EDITOR` is not set, ptm falls back to `vi`.
 |---|---|
 | `j` / `↓` | Scroll down |
 | `k` / `↑` | Scroll up |
+| `^F` / `^B` | Half-page scroll (PgDn / PgUp too) |
+| `g` / `G` | Jump to top / bottom (Home / End too) |
+| `n` / `N` | Next / previous search match (wraps) |
 | `e` | Edit this update in `$EDITOR` |
 | `S` | Spell check this update |
 | `/` | Search / highlight |
+| `E` | Edit the project title |
+| `T` | Open the tag editor |
+| `d` / `u` / `t` / `f` | Switch tab (closes the viewer) |
 | `ESC` | Close viewer |
+| `?` | Key help |
 
 ---
 

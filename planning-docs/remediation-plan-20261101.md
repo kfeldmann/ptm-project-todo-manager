@@ -12,7 +12,7 @@
 | **B** | DONE | Sync state machine & failure semantics | **3, 12**, exit-code half of 2 | `ptm_sync/ops.rs`, `main.rs`, `merge.rs` (1 line) |
 | **C** | DONE | `merge` robustness | **7, 8, 9** | `ptm_sync/merge.rs` |
 | **D** | DONE | Crash fixes | **4, 5, 13** | `views/overlay.rs`, `ptm_sync/main.rs`, `bin/enc/main.rs`, `paths.rs`, `views/{mod,project_list,todo_list,project_detail}.rs` |
-| **E** | | Key handling & render purity | **6, 14, 15, 23** | `app.rs`, `views/project_detail.rs`, `views/overlay.rs` |
+| **E** | DONE | Key handling & render purity | **6, 14, 15, 23** | `app.rs`, `views/project_detail.rs`, `views/overlay.rs`, `dev-harness/update-viewer.py` |
 | **F** | | Data-layer correctness & perf | **10, 11** | `data/repo.rs` |
 | **G** | | Unicode/display-width consistency | **16, 17** | `views/mod.rs`, `views/*.rs`, `bin/md/main.rs` |
 | **H** | | Dedup, permissions, docs sweep | **18, 19, 20, 21, 22, 24** | `app.rs`, `crypto.rs`, `log.rs`, `bin/md/log.rs`, `Cargo.toml`, `AGENTS.md` |
@@ -20,7 +20,7 @@
 ## Status at the time of writing
 
 - `cargo test --all-targets` → **408 tests, 0 failures** (36 + 82 + 214 + 76).
-  (After session D: **478**, all green.)
+  (After session D: **478**, all green. After session E: **495**, i.e. 37 + 82 + 244 + 132.)
 - `cargo check --all-targets` clean.
 - All 24 findings are still live at the lines the review cites.
 - **11 of the findings have been reproduced by the harnesses in `dev-harness/`**
@@ -281,6 +281,91 @@ different kinds of fix.
   a note that `--encryption-key` / `--from` resolve through `expand_tilde`.
   §enc's "Shared implementation" now covers `paths.rs` too.
 
+### E — Key handling & render purity — **done**
+
+Findings #6, #14, #15 and #23 fixed; all three of the session's files are
+touched.
+
+- **#6 / #23 — the update viewer was not a key scope, it was a trap.** The
+  `pd_open_update` guard ran *above* the universal-key block, so every key in
+  that block was dead while an update was open: `n`/`N` (match navigation)
+  fell through to nothing, `E` and `T` were swallowed, and the `N` arm could
+  never be reached (its `n` sibling's `pd_open_update.is_some()` condition was
+  dead for the same reason). The guard now sits **below** the universal block,
+  so the viewer keeps only what the block does not claim (`j`/`k`, `^f`/`^b`,
+  `g`/`G`, `e`, `S`). `ESC` became "close the viewer, else go back" via a
+  `close_update_viewer` helper, and switching to another tab closes the viewer
+  so the next `u` does not silently reopen one.
+- **A second, latent instance of the same bug.** The unguarded `f` tab-switch
+  arm matched `^F` before the Description/viewer handlers could treat it as
+  half-page scroll, so `^F` switched to the Files tab and `^B` did nothing. The
+  four tab arms now carry `if !key.modifiers.contains(KeyModifiers::CONTROL)`.
+  Not in the review; found while writing the tests.
+- **`?` was never broken.** The review lists it with `n`/`N`, but it is handled
+  globally in `App::handle_key` *before* the screen dispatch, so it worked in
+  the unfixed tree. Recorded here (and in the harness README) so a future
+  session does not "fix" it twice or use it as a probe that passes for the
+  wrong reason.
+- **#14 — render-time publishing: documented, not removed.** The exception is
+  kept and made explicit. The `Cell`/`RefCell` fields scattered across `App`
+  are consolidated into one `PublishedMetrics` struct with a written contract:
+  renderers own it, values are one frame old and must be treated as hints, and
+  a zeroed value must degrade to "no scrolling". That is the reason
+  `nudge_scroll_into_view`'s `.max(1)` and the `.min(max_scroll)` clamps exist,
+  which the review read as noise. The alternative — a separate measure pass —
+  would run the markdown/layout code twice per frame to avoid a `Cell`; the
+  decision and its rationale are recorded on the type and in AGENTS.md, which
+  is the session's stated exit criterion.
+- **#15 — `Warn` no longer eats the key.** The notice still closes on any key,
+  but a *safe* key is now replayed through `App::handle_key`, so a reflexive
+  second `e` at the edit-conflict warning opens the editor. Replay is a closed
+  allow-list (`is_redispatchable`): plain navigation/editing characters plus
+  `Esc`. Keys that open an overlay (`i`, `?`, `n`, `T`, `D`, `/`, `r`, `m`,
+  `S`, `Enter`) are excluded — replaying one would raise a new overlay while
+  the caller is still unwinding from the old one, and the nesting would have no
+  bound.
+- **Hint bar and Key Help made truthful.** The hint strings moved into a
+  testable `hints_for(app)`; `n/N` is no longer advertised on the Todos tab
+  (where `n` adds a todo); the viewer's string names the keys the viewer
+  actually accepts. `key_help_lines()` gained an update-viewer section, lost
+  the "Update viewer" qualifier from the tab-level `j/k`/`^f`/`g` rows, and
+  says what `ESC` does in each place.
+- **A third dead binding, found while making the hint bar truthful.** The
+  manual documents `e` **or** `n` as "edit the description" on the Description
+  tab, but the universal `n` arm consumed `n` for match navigation
+  unconditionally and `handle_key_pd_description` has no `n` arm, so with no
+  search running `n` did nothing. `n` now navigates matches when the query has
+  any, edits the description on the Description tab otherwise, and still falls
+  through to "new update"/"new todo" on the other tabs.
+- Tests: 478 → **495**, all green (37 + 82 + 244 + 132). The first tests in
+  `app.rs` (16) and `project_detail.rs` (5). They build a real `App` on an
+  in-memory database (`App::with_conn`, newly factored out of `App::new`) and
+  drive real `KeyEvent`s; `draw()` renders through `TestBackend` so the
+  render-published metrics are populated exactly as in the TUI. Covered: `n`/`N`
+  in the viewer, `?` in the viewer, `ESC` closing the viewer without leaving
+  Project Detail, tab switches closing the viewer, `E`/`T` in the viewer, `^F`
+  scrolling rather than switching tabs, `n` in all three of its meanings
+  (next match / edit description / new item), `Warn` redispatch and its two
+  negative cases, and the hint-bar strings. Each fix's test was confirmed to
+  fail against the unfixed tree.
+- **New harness `dev-harness/update-viewer.py` (#6/#23), 4/4.** This finding
+  had no harness because it needs a terminal; the harness drives the real
+  binary in a **pty**, answers the `ESC[6n` cursor-position query (without which
+  ratatui aborts), and asserts on markers in the rendered screen. Re-run
+  against the unfixed tree: **2/4**, failing exactly the `d` and `E` checks.
+  #14 and #15 have no external symptom and are covered by the unit tests
+  instead; `?` is deliberately not used as a probe (see above).
+- `wal-safety.py` **23/23**, `sync-state.py` **20/20**, `merge-robust.py`
+  **6/6**, `s3-roundtrip.py` **12/12**, `panics.py` **9/9** — unchanged.
+  `search-highlight.py` still fails; its finding is session G.
+- `AGENTS.md` gains §The exception: `PublishedMetrics`, §Key scopes in Project
+  Detail (with the ordering diagram and the Ctrl-modifier rule), and §Overlay
+  dismissal and redispatch; §Rendering flow no longer claims rendering is
+  unconditionally pure, §How to Add a Keybinding gains the scope and hint-bar
+  rules, and §Warn documents the replay.
+
+---
+
 ## Grouping principle
 
 Three rules drive the split:
@@ -321,9 +406,10 @@ user-visible value, no interaction with anything else. #5's *fix* is "reuse
 shared module — the same move H wants for #19/#21, so D establishes the pattern
 and H generalizes it.
 
-**E belongs together because #6 and #23 are the same bug** — `n`/`N`/`?` are
+**E belongs together because #6 and #23 are the same bug** — `n`/`N` are
 dead in the update viewer because the `pd_open_update` early return at
-`app.rs:1088` precedes the universal-key block. The correct fix (move the
+`app.rs:1088` precedes the universal-key block. (`?` is *not* affected — it is
+handled globally, before the screen dispatch; the session log records this.) The correct fix (move the
 viewer guard below universal keys) immediately raises #14: `n`/`N` depend on
 `pd_match_marks`, which the renderer publishes via `RefCell`. You cannot sanely
 reorder those key paths without deciding what the publish/consume contract is.
@@ -426,9 +512,11 @@ rather than repairing it, and it needs justifying in the commit message.
   not terminal width. `expand_tilde` handles `~`, `~/`, `~x` and unset `$HOME`;
   `enc`'s tests were not "ported" but **moved** into `src/paths.rs`, where all
   three binaries run them.
-- **E** — `?`, `n`, `N` work inside the update viewer; hint bar and
-  `key_help_lines()` match reality; the render-purity decision (document the
-  exception, or move to a measure pass) is recorded in AGENTS.md.
+- **E** — *met.* `n`, `N`, `E`, `T` and the tab switches work inside the
+  update viewer (`?` already did — see the session log). The hint bar and
+  `key_help_lines()` are asserted against each other by a test. The
+  render-purity decision — keep the exception, document it — is recorded on
+  `PublishedMetrics` and in AGENTS.md. `update-viewer.py` is the harness.
 - **F** — query-count assertion for `list_projects` / `list_todos_global`
   (e.g. a `Connection` wrapper that counts `prepare` calls).
 - **G** — `search-highlight.py` fully green; width test with CJK/emoji titles.
@@ -558,7 +646,7 @@ any finding.
 | 3 | `sync-state.py` | PASS — fixed in B |
 | 4 | `panics.py`, `keyhelp-widths.py` | PASS — fixed in D |
 | 5 | `panics.py` | PASS — fixed in D |
-| 6 | — | not covered (needs a terminal) |
+| 6 | `update-viewer.py` | PASS — fixed in E (pty harness) |
 | 7 | `merge-robust.py` | PASS — fixed in C |
 | 8 | `merge-robust.py` | PASS — fixed in C |
 | 9 | `merge-robust.py` | PASS — fixed in C |
@@ -566,9 +654,10 @@ any finding.
 | 11 | — | not covered (add a `repo` unit test) |
 | 12 | `sync-state.py` | PASS — fixed in B |
 | 13 | `panics.py` | PASS — fixed in D |
-| 14, 15 | — | judgement calls |
+| 14 | — | documented (unit-tested via the handlers that read it) |
+| 15 | — | PASS — fixed in E (unit test; no external symptom) |
 | 16 | — | not covered |
 | 17 | `search-highlight.py` | FAIL — live |
 | 2, 3, 1c (partial) | `s3-roundtrip.py` | **12/12 passing** (happy path; #1c race not asserted — see above) |
 | 2 (exit code) | `sync-state.py`, `wal-safety.py` | PASS — fixed in A, marker added in B |
-| 18–24 | — | polish / docs |
+| 18–24 | — | polish / docs (23 fixed in E) |

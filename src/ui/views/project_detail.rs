@@ -203,16 +203,47 @@ fn current_match(app: &App, marks: &[MatchLoc]) -> Option<MatchLoc> {
 use crate::ui::theme::Theme;
 use super::reminder_date_style;
 
-/// Register `marks` in `app.pd_match_marks` so key handlers can navigate
-/// with n / N.
+/// Register `marks` in [`crate::app::PublishedMetrics::match_marks`] so key
+/// handlers can navigate with n / N.
+///
+/// This and the `.set(..)` calls below are the documented exception to
+/// "rendering does not mutate state": the key handlers cannot compute wrapped
+/// line positions or the viewport height themselves.  See
+/// [`crate::app::PublishedMetrics`].
 fn publish_match_marks(app: &App, marks: &[MatchLoc]) {
-    *app.pd_match_marks.borrow_mut() = marks.iter().map(|m| (m.line, m.occ)).collect();
+    *app.metrics.match_marks.borrow_mut() = marks.iter().map(|m| (m.line, m.occ)).collect();
 }
 
 // Left column: 11-char date/label; leading indent: 2 spaces; gap between cols: 2 spaces.
 const INDENT: usize = 2;
 const DATE_COL_WIDTH: usize = 11;
 const COL_GAP: usize = 2;
+
+/// The Project Detail hint bar for the current mode.
+///
+/// Kept as a function (rather than inline in `render`) so the strings can be
+/// asserted against the key handlers: the hint bar drives the layout height,
+/// so an inaccurate string is both a lie and a rendering bug.  Every key named
+/// here must be one the handlers accept in that mode, and `n/N` must only be
+/// advertised where match marks exist — the Description tab and the update
+/// viewer.  On the Todos tab `n` adds a todo, so advertising match navigation
+/// there is wrong.
+fn hints_for(app: &App) -> String {
+    if app.pd_adding_todo.is_some()
+        || app.pd_editing_title.is_some()
+        || app.pd_editing_todo.is_some()
+    {
+        "  Enter:save  ESC:cancel".into()
+    } else if app.pd_searching {
+        "  Enter:keep  ESC:clear".into()
+    } else if app.pd_tab == PdTab::Updates && app.pd_open_update.is_some() {
+        "  ESC:close  j/k:scroll  e:edit  S:spell  /:search  n/N:match  ?:help".into()
+    } else if app.pd_tab == PdTab::Description {
+        "  ESC:back  d/u/t/f:tabs  e/n:edit description  /:search  n/N:match  ?:help".into()
+    } else {
+        "  ESC:back  d/u/t/f:tabs  /:search  ?:help".into()
+    }
+}
 
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let theme = Theme::default();
@@ -222,27 +253,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         None => return,
     };
 
-    // Hint bar text depends on mode and active tab.
-    let hints: String = if app.pd_adding_todo.is_some()
-        || app.pd_editing_title.is_some()
-        || app.pd_editing_todo.is_some()
-    {
-        "  Enter:save  ESC:cancel".into()
-    } else if app.pd_searching {
-        "  Enter:keep  ESC:clear".into()
-    } else {
-        match app.pd_tab {
-            PdTab::Updates if app.pd_open_update.is_some() => {
-                "  ESC:close  n/N:next/prev match  ?:help".into()
-            }
-            PdTab::Description => {
-                "  ESC:back  d/u/t/f:tabs  e:edit description  n/N:next/prev match  ?:help".into()
-            }
-            _ => {
-                "  ESC:back  d/u/t/f:tabs  n/N:next/prev match  ?:help".into()
-            }
-        }
-    };
+    let hints = hints_for(app);
 
     // Outer layout: content block + hint bar.
     let outer = Layout::default()
@@ -413,8 +424,8 @@ fn render_description_tab(frame: &mut Frame, area: Rect, app: &App, theme: &Them
 
     // Publish max_scroll so the key handler can clamp immediately and avoid
     // the overshoot-freeze (needing many k-presses to recover after j at bottom).
-    app.pd_desc_max_scroll.set(max_scroll as u16);
-    app.pd_desc_view_height.set(view_height as u16);
+    app.metrics.desc_max_scroll.set(max_scroll as u16);
+    app.metrics.desc_view_height.set(view_height as u16);
 
     // Register match positions for n/N navigation.
     publish_match_marks(app, &marks);
@@ -709,8 +720,8 @@ fn render_update_viewer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme,
     let view_height = if needs_scroll { content_height.saturating_sub(1) } else { content_height };
     let max_scroll = total_lines.saturating_sub(view_height);
 
-    app.pd_update_view_max_scroll.set(max_scroll as u16);
-    app.pd_update_view_height.set(view_height as u16);
+    app.metrics.update_view_max_scroll.set(max_scroll as u16);
+    app.metrics.update_view_height.set(view_height as u16);
 
     let scroll = (app.pd_update_view_scroll as usize).min(max_scroll);
     let has_above = scroll > 0;
@@ -997,5 +1008,83 @@ fn status_style(status: &TodoStatus, theme: &Theme) -> Style {
         TodoStatus::InProgress => Style::default().fg(theme.in_progress_fg),
         TodoStatus::Done       => Style::default().fg(theme.done_fg),
         TodoStatus::Canceled   => Style::default().fg(theme.canceled_fg),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{App, PdTab};
+
+    fn mk_app() -> App {
+        let conn = crate::data::db::open_in_memory().unwrap();
+        App::with_conn(conn, None).unwrap()
+    }
+
+    // ── finding #6: the hint bar must match the key handlers ────────────────
+
+    #[test]
+    fn the_updates_hint_does_not_advertise_match_navigation_on_other_tabs() {
+        let mut app = mk_app();
+        // No project needed: `hints_for` only reads the tab/mode fields.
+        app.pd_tab = PdTab::Todos;
+        let hints = hints_for(&app);
+        assert!(
+            !hints.contains("n/N"),
+            "n/N must not be advertised on the Todos tab (n adds a todo): {hints:?}"
+        );
+    }
+
+    #[test]
+    fn the_viewer_hint_names_the_keys_the_viewer_accepts() {
+        let mut app = mk_app();
+        app.pd_tab = PdTab::Updates;
+        app.pd_open_update = Some("update-id".into());
+        let hints = hints_for(&app);
+        // The hint bar for the viewer used to advertise n/N and ? while the
+        // key handler accepted neither.
+        for expected in ["ESC:close", "n/N:match", "?:help", "/:search", "j/k"] {
+            assert!(hints.contains(expected), "{hints:?} is missing {expected:?}");
+        }
+        assert!(hints.contains("S:spell"), "S works in the viewer: {hints:?}");
+        assert!(hints.contains("e:edit"), "e works in the viewer: {hints:?}");
+    }
+
+    #[test]
+    fn inline_edit_modes_take_over_the_hint_bar() {
+        let mut app = mk_app();
+        app.pd_adding_todo = Some(crate::input::InputState::new());
+        assert_eq!(hints_for(&app), "  Enter:save  ESC:cancel");
+        app.pd_adding_todo = None;
+        app.pd_searching = true;
+        assert_eq!(hints_for(&app), "  Enter:keep  ESC:clear");
+    }
+
+    // ── the hint bar and the Key Help agree ─────────────────────────────────
+
+    /// Every key the hint bar advertises for a mode must also be listed in the
+    /// `?` Key Help, and vice versa for the keys that mode accepts.  This is
+    /// the "hint bar and `key_help_lines()` match reality" exit criterion for
+    /// session E, made checkable.
+    #[test]
+    fn hint_bar_keys_appear_in_the_key_help() {
+        let key_help: String = crate::ui::views::overlay::key_help_text(60);
+        let mut app = mk_app();
+        app.pd_tab = PdTab::Updates;
+        app.pd_open_update = Some("update-id".into());
+
+        // Tokens like "ESC:close", "n/N:match", "/:search", "?:help".
+        for token in hints_for(&app).split_whitespace() {
+            let Some((keys, _)) = token.split_once(':') else { continue };
+            for k in keys.split('/') {
+                if k.is_empty() || k == "j" {
+                    continue; // covered by the "j / k" row
+                }
+                assert!(
+                    key_help.contains(k),
+                    "the hint bar advertises {k:?} but Key Help never mentions it"
+                );
+            }
+        }
     }
 }

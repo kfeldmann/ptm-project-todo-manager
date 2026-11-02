@@ -23,6 +23,7 @@ HARNESSES = [
     ("merge-robust.py", "findings 7, 8, 9"),
     ("panics.py", "findings 4, 5, 13"),
     ("keyhelp-widths.py", "finding 4 (diagnostic, always passes)"),
+    ("update-viewer.py", "findings 6, 23 (pty; the viewer swallowed universal keys)"),
     ("search-highlight.py", "finding 17"),
     ("s3-roundtrip.py", "end-to-end S3 (skips without /etc/hosts)"),
 ]

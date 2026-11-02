@@ -94,7 +94,11 @@ pub enum Overlay {
         scroll: u16,
     },
     /// Generic dismissible warning/error notice.
-    /// Dismissed by any key press.
+    ///
+    /// Dismissed by **any** key press.  The key that dismisses it is *not*
+    /// swallowed: once the notice is gone the same key is handled normally, so
+    /// a user who reflexively presses `e` again at an edit-conflict warning
+    /// gets the editor instead of nothing (finding #15).
     Warn {
         title: String,
         body: String,
@@ -131,6 +135,35 @@ pub enum ArchiveTarget {
     Todo(String),
 }
 
+/// Whether a key that dismissed an [`Overlay::Warn`] may be handed back to
+/// [`App::handle_key`].
+///
+/// The rule is a closed allow-list of *safe* keys rather than a deny-list of
+/// dangerous ones: a key that opens an overlay (`i`, `?`, `n`, `T`, `D`, `/`,
+/// `r`, `m`, `Enter`, `S`) must not be redispatched, because the redispatch
+/// would raise a new overlay while the caller is still unwinding from the old
+/// one, and the nesting has no bound.  Only plain character and `Esc` keys can
+/// be safely replayed, and of those only the ones that never open anything.
+fn is_redispatchable(key: KeyEvent) -> bool {
+    if !key.modifiers.is_empty() {
+        return false;
+    }
+    match key.code {
+        KeyCode::Esc => true,
+        KeyCode::Char(c) => matches!(
+            c,
+            // Navigation, scrolling, tab switches, reordering, and the
+            // in-place toggles.  `e` / `E` open $EDITOR (via `pending_editor`,
+            // not an overlay) so they are safe to replay — and replaying `e`
+            // is precisely the case finding #15 is about.
+            'j' | 'k' | 'g' | 'G' | 'n' | 'N'
+            | 'e' | 'E' | 's' | 'a' | 'A' | 'C' | 'Q'
+            | 'd' | 'u' | 't' | 'f' | 'p'
+        ),
+        _ => false,
+    }
+}
+
 // ─── Pending $EDITOR ──────────────────────────────────────────────────────────
 
 pub struct PendingEditor {
@@ -145,6 +178,60 @@ pub enum EditorTarget {
     ProjectDescription,
     AddUpdate,
     EditUpdate(String),    // update_id
+}
+
+// ─── Render-published metrics ─────────────────────────────────────────────────
+
+/// Values the **renderers** publish for the **key handlers**, and the one
+/// deliberate exception to the "rendering is pure" rule (finding #14).
+///
+/// ## Why this exists
+///
+/// Key handling needs two things only the renderer can know:
+///
+/// * **Geometry** — how many lines the content has, how tall the viewport is,
+///   and therefore the largest legal scroll offset.  That depends on the
+///   terminal width (markdown re-wrapping, hint-bar height) and on the tab
+///   layout, so recomputing it in the key handler would mean duplicating the
+///   layout code and letting the two drift.
+/// * **Search-match positions** — where each match landed in the *wrapped*
+///   output, which again depends on the width.
+///
+/// So the views write into this struct while they draw, and the key handlers
+/// read it.  It is `Cell`/`RefCell` because views take `&App` (they must not
+/// mutate application state) and `ui::render` therefore only has a shared
+/// reference.
+///
+/// ## The contract
+///
+/// * **Renderers own it.** Nothing else writes these fields; a key handler
+///   never sets them.
+/// * **Values are one frame old.** A key event is handled after the frame that
+///   preceded it, so a handler always sees the geometry of the *last drawn*
+///   frame.  Handlers must therefore treat every value as a hint, not a
+///   guarantee: clamp against it, never assume it is non-zero, and never
+///   assume it is still valid for state the handler itself just changed.
+///   `nudge_scroll_into_view`'s `.max(1)` and the `.min(max_scroll)` clamps are
+///   the concrete expressions of that rule, not defensive noise.
+/// * **Losing it is harmless.** A zeroed value (nothing drawn yet, or a
+///   different screen drawn last) must degrade to "no scrolling" rather than a
+///   panic or a stuck cursor.  `App::default_metrics()` is exactly that state.
+#[derive(Debug, Default)]
+pub struct PublishedMetrics {
+    /// Largest legal scroll offset for the Description tab, in lines.
+    pub desc_max_scroll: std::cell::Cell<u16>,
+    /// Visible content height of the Description tab, in rows.
+    pub desc_view_height: std::cell::Cell<u16>,
+    /// Largest legal scroll offset for the open update viewer, in lines.
+    pub update_view_max_scroll: std::cell::Cell<u16>,
+    /// Visible content height of the update viewer, in rows.
+    pub update_view_height: std::cell::Cell<u16>,
+    /// Largest legal scroll offset for the Key Help overlay, in lines.
+    pub key_help_max_scroll: std::cell::Cell<u16>,
+    /// Flat positions of every search match in the currently rendered PD
+    /// buffer: `(rendered line index, occurrence within that line)`, in
+    /// document order.  Empty when the query has no matches.
+    pub match_marks: std::cell::RefCell<Vec<(usize, usize)>>,
 }
 
 // ─── App ──────────────────────────────────────────────────────────────────────
@@ -181,20 +268,10 @@ pub struct App {
     pub pd_update_cursor: usize,
     /// Scroll offset (lines) for the Description tab.
     pub pd_desc_scroll: u16,
-    /// Max scroll for the Description tab; set by render so the key handler can clamp.
-    pub pd_desc_max_scroll: std::cell::Cell<u16>,
-    /// Visible height of the Description tab content; set by render for half-page scroll.
-    pub pd_desc_view_height: std::cell::Cell<u16>,
     /// ID of the update currently open in full-screen viewer (`None` = list view).
     pub pd_open_update: Option<String>,
     /// Scroll offset for the open update viewer.
     pub pd_update_view_scroll: u16,
-    /// Max scroll for the open update viewer; set by render so the key handler can clamp.
-    pub pd_update_view_max_scroll: std::cell::Cell<u16>,
-    /// Visible height of the update viewer content; set by render for half-page scroll.
-    pub pd_update_view_height: std::cell::Cell<u16>,
-    /// Max scroll for the Key Help overlay; set by render so the key handler can clamp.
-    pub key_help_max_scroll: std::cell::Cell<u16>,
     /// `Some(state)` when adding a todo inline.
     pub pd_adding_todo: Option<InputState>,
     /// `Some(state)` when editing the title inline.
@@ -207,14 +284,13 @@ pub struct App {
     pub pd_search: String,
     /// `true` while the user is actively typing the PD search query.
     pub pd_searching: bool,
-    /// Index of the "current" search match within `pd_match_marks` (n/N
-    /// navigation).  Marks are recomputed by the renderers each frame.
+    /// Index of the "current" search match within
+    /// [`PublishedMetrics::match_marks`] (n/N navigation).  Marks are
+    /// recomputed by the renderers each frame.
     pub pd_match_idx: usize,
-    /// Published by the PD renderers each frame: flat positions of all
-    /// matches (rendered line index + occurrence within line), in document
-    /// order.  Empty between frames if the query has no matches.  A `RefCell`
-    /// so renderers (which take `&App`) can publish while key handlers read.
-    pub pd_match_marks: std::cell::RefCell<Vec<(usize, usize)>>,
+    /// Geometry and search-match positions published by the renderers for the
+    /// key handlers.  See [`PublishedMetrics`] for the contract.
+    pub metrics: PublishedMetrics,
 
     // ── Global Todo List state ───────────────────────────────────────────────
     pub tl_groups: Vec<TodoGroup>,
@@ -253,13 +329,20 @@ impl App {
     pub fn new() -> Result<Self> {
         let path = data_path();
         let conn = db::open(&path)?;
+        // Try to load the spell checker; failure is non-fatal.
+        let data_dir = path.parent().unwrap_or(&path).to_path_buf();
+        Self::with_conn(conn, crate::spell::SpellChecker::new(&data_dir))
+    }
 
+    /// Build an `App` around an already-open connection.
+    ///
+    /// `new` uses this with the on-disk database and the real spell checker;
+    /// the tests use it with an in-memory database and no checker, which is
+    /// the only way to exercise the key handlers without a terminal.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn with_conn(conn: Connection, spell: Option<crate::spell::SpellChecker>) -> Result<Self> {
         let projects       = repo::list_projects(&conn, false, None, None)?;
         let archived_count = repo::count_archived(&conn)?;
-
-        // Try to load the spell checker; failure is non-fatal.
-        let data_dir = path.parent().unwrap_or(&path);
-        let spell = crate::spell::SpellChecker::new(data_dir);
 
         Ok(App {
             conn,
@@ -286,13 +369,8 @@ impl App {
             pd_tab: PdTab::Todos,
             pd_update_cursor: 0,
             pd_desc_scroll: 0,
-            pd_desc_max_scroll: std::cell::Cell::new(0),
-            pd_desc_view_height: std::cell::Cell::new(0),
             pd_open_update: None,
             pd_update_view_scroll: 0,
-            pd_update_view_max_scroll: std::cell::Cell::new(0),
-            pd_update_view_height: std::cell::Cell::new(0),
-            key_help_max_scroll: std::cell::Cell::new(0),
             pd_adding_todo: None,
             pd_editing_title: None,
             pd_editing_todo: None,
@@ -300,7 +378,7 @@ impl App {
             pd_search: String::new(),
             pd_searching: false,
             pd_match_idx: 0,
-            pd_match_marks: std::cell::RefCell::new(Vec::new()),
+            metrics: PublishedMetrics::default(),
 
             tl_groups: Vec::new(),
             tl_cursor: 0,
@@ -318,6 +396,21 @@ impl App {
 
     // ─── Top-level key handler ─────────────────────────────────────────────
 
+    /// Handle one key event.
+    ///
+    /// ## Redispatch rule
+    ///
+    /// A handler may dismiss an overlay and hand the *same* key to this method
+    /// again — that is how `Overlay::Warn` keeps a reflexive key press from
+    /// being swallowed (finding #15).  Redispatch is deliberately narrow:
+    ///
+    /// * only [`Overlay::Warn`] does it, because it is the only overlay that
+    ///   closes on a key it does not consume;
+    /// * a redispatch never returns to an overlay, so at most one extra level
+    ///   is taken.  Anything that can put an overlay up again would make the
+    ///   nesting unbounded, which is why [`is_redispatchable`] excludes every
+    ///   key that opens one (`i`, `?`, `n`, `T`, `D`, `/`, `r`, `m`, `Enter`)
+    ///   as well as every non-`Char`/`Esc` key code.
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         // If an overlay is active, send all keys there first.
         if self.overlay.is_some() {
@@ -384,7 +477,13 @@ impl App {
                 )?;
             }
             Overlay::Warn { .. } => {
+                // Any key dismisses.  The press is then re-dispatched so it is
+                // not silently eaten — see `Overlay::Warn`'s doc comment and
+                // `handle_key`'s single redispatch rule.
                 self.overlay = None;
+                if is_redispatchable(key) {
+                    return self.handle_key(key);
+                }
             }
         }
         Ok(())
@@ -1084,20 +1183,31 @@ impl App {
             return Ok(());
         }
 
-        // ── Update viewer mode ──
-        if self.pd_open_update.is_some() {
-            return self.handle_key_pd_update_viewer(key);
-        }
-
-        // ── Universal keys (work in every tab) ──
+        // ── Universal keys (work in every tab *and* in the update viewer) ──
+        //
+        // These run before the viewer guard on purpose.  They used to run
+        // after it, which made every key in this block dead while an update
+        // was open: `n`/`N` (match navigation) fell through to nothing, `E`
+        // and `T` were swallowed, and the `N` arm below could never be
+        // reached.  The viewer's hint bar advertises `n/N`, so the ordering
+        // was simply wrong (findings #6 and #23).
+        //
+        // Anything not matched here still goes to the viewer handler when one
+        // is open — see the guard after this block.
         match key.code {
             KeyCode::Esc => {
-                self.screen = Screen::ProjectList;
-                self.pd_project = None;
-                self.pd_search.clear();
-                self.pd_searching = false;
-                self.pd_match_idx = 0;
-                self.reload_project_list()?;
+                // ESC means "back one level": close the viewer when one is
+                // open, otherwise leave Project Detail for the Project List.
+                if self.pd_open_update.is_some() {
+                    self.close_update_viewer();
+                } else {
+                    self.screen = Screen::ProjectList;
+                    self.pd_project = None;
+                    self.pd_search.clear();
+                    self.pd_searching = false;
+                    self.pd_match_idx = 0;
+                    self.reload_project_list()?;
+                }
                 return Ok(());
             }
             KeyCode::Char('E') => {
@@ -1120,27 +1230,65 @@ impl App {
                 return Ok(());
             }
             KeyCode::Char('/') => {
-                self.pd_searching = true;
-                self.pd_search.clear();
-                self.pd_match_idx = 0;
+                self.begin_pd_search();
                 return Ok(());
             }
-            KeyCode::Char('n') if self.pd_open_update.is_some()
-                           || matches!(self.pd_tab, PdTab::Description) =>
+            // `n` is ambiguous: "next match" where a search buffer exists
+            // (Description tab, update viewer) and "new item" elsewhere (new
+            // update, new todo).  Resolve it the way a user reads it:
+            //
+            // * a query with matches  → navigate them;
+            // * Description tab        → edit the description (the manual
+            //   documents `e` *or* `n`, and this tab has no other use for
+            //   `n`, so without this the documented key did nothing);
+            // * anything else          → fall through to the tab handler.
+            //
+            // The arm is still scoped to the Description tab and the viewer,
+            // so a stale query cannot steal `n` from the Updates/Todos tabs.
+            KeyCode::Char('n')
+                if self.pd_open_update.is_some() || self.pd_tab == PdTab::Description =>
             {
-                // Where a search buffer exists (Description tab, update
-                // viewer), n navigates matches.  In other tabs it falls
-                // through to the tab handler (new update / new todo).
-                self.jump_pd_match(1);
+                if !self.metrics.match_marks.borrow().is_empty() {
+                    self.jump_pd_match(1);
+                    return Ok(());
+                }
+                if self.pd_tab == PdTab::Description && self.pd_open_update.is_none() {
+                    return self.edit_pd_description();
+                }
                 return Ok(());
             }
-            KeyCode::Char('N') => { self.jump_pd_match(-1); return Ok(()); }
-            // Tab switching
-            KeyCode::Char('d') => { self.pd_tab = PdTab::Description; self.pd_desc_scroll = 0; return Ok(()); }
-            KeyCode::Char('u') => { self.pd_tab = PdTab::Updates;       return Ok(()); }
-            KeyCode::Char('t') => { self.pd_tab = PdTab::Todos;         return Ok(()); }
-            KeyCode::Char('f') => { self.pd_tab = PdTab::Files;         return Ok(()); }
+            KeyCode::Char('N') if !self.metrics.match_marks.borrow().is_empty() => {
+                self.jump_pd_match(-1);
+                return Ok(());
+            }
+            KeyCode::Char('N') => return Ok(()),
+            // Tab switching.  Guarded on the CONTROL modifier: the Description
+            // tab and the update viewer use ^F / ^B for half-page scrolling,
+            // and without the guard the plain-`f` arm below matched first and
+            // switched to the Files tab instead of scrolling.
+            KeyCode::Char('d') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.switch_pd_tab(PdTab::Description); return Ok(());
+            }
+            KeyCode::Char('u') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.switch_pd_tab(PdTab::Updates); return Ok(());
+            }
+            KeyCode::Char('t') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.switch_pd_tab(PdTab::Todos); return Ok(());
+            }
+            KeyCode::Char('f') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.switch_pd_tab(PdTab::Files); return Ok(());
+            }
             _ => {}
+        }
+
+        // ── Update viewer mode ──
+        //
+        // Everything the universal block did not claim is the viewer's: its
+        // own scrolling, `e` / `S`, and the search entry.  This guard has to
+        // stay above the tab dispatch so `j`/`k` scroll the viewer instead of
+        // moving the (hidden) Updates list cursor.
+        if self.pd_open_update.is_some() {
+            return self.handle_key_pd_update_viewer(key);
         }
 
         // ── Dispatch to tab-specific handler ──
@@ -1154,21 +1302,22 @@ impl App {
 
     // ─── Project Detail – search-match navigation ────────────────────────
 
-    /// Infallible current-match location, or `None` when the current query
-    /// has no matches.  Marks are published each frame by the active PD
-    /// renderer into `pd_match_marks`.
-    /// Move the current-match pointer by `delta` (wrapping) and scroll the
-    /// active PD sub-view (Description tab or update viewer) so the match is
-    /// visible.
+    /// Location of the "current" search match, or `None` when the current
+    /// query has no matches.  The marks are published each frame by the active
+    /// PD renderer into [`PublishedMetrics::match_marks`], so this reflects the
+    /// last drawn frame — see that type's contract.
     fn current_marker(&self) -> Option<(usize, usize)> {
-        self.pd_match_marks
+        self.metrics.match_marks
             .borrow()
             .get(self.pd_match_idx)
             .copied()
     }
 
+    /// Move the current-match pointer by `delta` (wrapping, vim-style) and
+    /// scroll the active PD sub-view (Description tab or update viewer) so the
+    /// match is visible.
     fn jump_pd_match(&mut self, delta: isize) {
-        let n = self.pd_match_marks.borrow().len();
+        let n = self.metrics.match_marks.borrow().len();
         if n == 0 {
             return;
         }
@@ -1179,7 +1328,7 @@ impl App {
     }
 
     /// Scroll whichever PD scroll buffer is active so the current match line
-    /// (`pd_match_marks[pd_match_idx].0`) is inside the viewport.
+    /// (`metrics.match_marks[pd_match_idx].0`) is inside the viewport.
     fn scroll_pd_to_match(&mut self) {
         let Some((line, _)) = self.current_marker() else {
             return;
@@ -1189,13 +1338,13 @@ impl App {
         // marks come from the Description tab renderer.
         if self.pd_open_update.is_some() {
             let (max, view_h) =
-                (self.pd_update_view_max_scroll.get(), self.pd_update_view_height.get());
+                (self.metrics.update_view_max_scroll.get(), self.metrics.update_view_height.get());
             let mut field = self.pd_update_view_scroll;
             Self::nudge_scroll_into_view(line, max, view_h, &mut field);
             self.pd_update_view_scroll = field;
         } else {
             let (max, view_h) =
-                (self.pd_desc_max_scroll.get(), self.pd_desc_view_height.get());
+                (self.metrics.desc_max_scroll.get(), self.metrics.desc_view_height.get());
             let mut field = self.pd_desc_scroll;
             Self::nudge_scroll_into_view(line, max, view_h, &mut field);
             self.pd_desc_scroll = field;
@@ -1217,20 +1366,54 @@ impl App {
 
     /// Scroll the given scroll field down by `n` lines, clamped to `max`.
     fn scroll_field_down(field: &mut u16, n: u16, max: u16) {
-        *field = (*field).saturating_add(n).min(max.max(0));
+        *field = (*field).saturating_add(n).min(max);
+    }
+
+    /// Switch Project Detail tabs from a universal key.
+    ///
+    /// Switching away from the update viewer closes it: the viewer belongs to
+    /// the Updates tab, and leaving it "open" while another tab is drawn would
+    /// leave `pd_open_update` set, so the next `u` would silently reopen a
+    /// viewer the user never asked for.
+    fn switch_pd_tab(&mut self, tab: PdTab) {
+        if tab != PdTab::Updates {
+            self.close_update_viewer();
+        }
+        if tab == PdTab::Description {
+            self.pd_desc_scroll = 0;
+        }
+        self.pd_tab = tab;
+    }
+
+    /// Close the update viewer, if open.  The search query is kept so that
+    /// reopening an update re-applies the highlights.
+    fn close_update_viewer(&mut self) {
+        self.pd_open_update = None;
+        self.pd_update_view_scroll = 0;
+    }
+
+    /// Start a Project Detail search session.
+    fn begin_pd_search(&mut self) {
+        self.pd_searching = true;
+        self.pd_search.clear();
+        self.pd_match_idx = 0;
+    }
+
+    /// Open the project description in `$EDITOR` (no-op with no project).
+    fn edit_pd_description(&mut self) -> Result<()> {
+        if let Some(ref p) = self.pd_project {
+            self.pending_editor = Some(PendingEditor {
+                content: p.description.clone(),
+                target: EditorTarget::ProjectDescription,
+                slot: format!("desc_{}", p.id),
+            });
+        }
+        Ok(())
     }
 
     fn handle_key_pd_description(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
-            KeyCode::Char('e') => {
-                if let Some(ref p) = self.pd_project {
-                    self.pending_editor = Some(PendingEditor {
-                        content: p.description.clone(),
-                        target: EditorTarget::ProjectDescription,
-                        slot: format!("desc_{}", p.id),
-                    });
-                }
-            }
+            KeyCode::Char('e') => return self.edit_pd_description(),
             KeyCode::Char('S') => {
                 if let Some(ref p) = self.pd_project {
                     let desc = p.description.clone();
@@ -1238,7 +1421,7 @@ impl App {
                 }
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                let max = self.pd_desc_max_scroll.get();
+                let max = self.metrics.desc_max_scroll.get();
                 if self.pd_desc_scroll < max {
                     self.pd_desc_scroll += 1;
                 }
@@ -1248,26 +1431,26 @@ impl App {
             }
             // Half-page via Ctrl+F / Ctrl+B (vi style).
             KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let half = (self.pd_desc_view_height.get() / 2).max(1);
-                let max = self.pd_desc_max_scroll.get();
+                let half = (self.metrics.desc_view_height.get() / 2).max(1);
+                let max = self.metrics.desc_max_scroll.get();
                 Self::scroll_field_down(&mut self.pd_desc_scroll, half, max);
             }
             KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let half = (self.pd_desc_view_height.get() / 2).max(1);
+                let half = (self.metrics.desc_view_height.get() / 2).max(1);
                 self.pd_desc_scroll = self.pd_desc_scroll.saturating_sub(half);
             }
             KeyCode::PageDown => {
-                let half = (self.pd_desc_view_height.get() / 2).max(1);
-                let max = self.pd_desc_max_scroll.get();
+                let half = (self.metrics.desc_view_height.get() / 2).max(1);
+                let max = self.metrics.desc_max_scroll.get();
                 Self::scroll_field_down(&mut self.pd_desc_scroll, half, max);
             }
             KeyCode::PageUp => {
-                let half = (self.pd_desc_view_height.get() / 2).max(1);
+                let half = (self.metrics.desc_view_height.get() / 2).max(1);
                 self.pd_desc_scroll = self.pd_desc_scroll.saturating_sub(half);
             }
             // Go to top / bottom.
             KeyCode::Char('g') | KeyCode::Home => self.pd_desc_scroll = 0,
-            KeyCode::Char('G') | KeyCode::End => self.pd_desc_scroll = self.pd_desc_max_scroll.get(),
+            KeyCode::Char('G') | KeyCode::End => self.pd_desc_scroll = self.metrics.desc_max_scroll.get(),
             _ => {}
         }
         Ok(())
@@ -1275,21 +1458,17 @@ impl App {
 
     // ─── Project Detail – Update viewer ────────────────────────────────────
 
+    /// Keys that apply **only** inside the update viewer.
+    ///
+    /// The viewer is *not* a separate key scope: `ESC`, `E`, `T`, `/`, `n`,
+    /// `N` and the tab switches are handled by the universal block in
+    /// [`App::handle_key_project_detail`], which runs first.  Everything left
+    /// here is viewer-specific: scrolling, editing the open update, and spell
+    /// checking it.
     fn handle_key_pd_update_viewer(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
-            KeyCode::Esc => {
-                self.pd_open_update = None;
-                self.pd_update_view_scroll = 0;
-                // Keep pd_search so highlights re-apply if the user reopens a viewer;
-                // the user can clear it with / → ESC while inside the viewer.
-            }
-            KeyCode::Char('/') => {
-                self.pd_searching = true;
-                self.pd_search.clear();
-                self.pd_match_idx = 0;
-            }
             KeyCode::Char('j') | KeyCode::Down => {
-                let max = self.pd_update_view_max_scroll.get();
+                let max = self.metrics.update_view_max_scroll.get();
                 if self.pd_update_view_scroll < max {
                     self.pd_update_view_scroll += 1;
                 }
@@ -1299,25 +1478,25 @@ impl App {
             }
             // Half-page via Ctrl+F / Ctrl+B (vi style).
             KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let half = (self.pd_update_view_height.get() / 2).max(1);
-                let max = self.pd_update_view_max_scroll.get();
+                let half = (self.metrics.update_view_height.get() / 2).max(1);
+                let max = self.metrics.update_view_max_scroll.get();
                 Self::scroll_field_down(&mut self.pd_update_view_scroll, half, max);
             }
             KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let half = (self.pd_update_view_height.get() / 2).max(1);
+                let half = (self.metrics.update_view_height.get() / 2).max(1);
                 self.pd_update_view_scroll = self.pd_update_view_scroll.saturating_sub(half);
             }
             KeyCode::PageDown => {
-                let half = (self.pd_update_view_height.get() / 2).max(1);
-                let max = self.pd_update_view_max_scroll.get();
+                let half = (self.metrics.update_view_height.get() / 2).max(1);
+                let max = self.metrics.update_view_max_scroll.get();
                 Self::scroll_field_down(&mut self.pd_update_view_scroll, half, max);
             }
             KeyCode::PageUp => {
-                let half = (self.pd_update_view_height.get() / 2).max(1);
+                let half = (self.metrics.update_view_height.get() / 2).max(1);
                 self.pd_update_view_scroll = self.pd_update_view_scroll.saturating_sub(half);
             }
             KeyCode::Char('g') | KeyCode::Home => self.pd_update_view_scroll = 0,
-            KeyCode::Char('G') | KeyCode::End => self.pd_update_view_scroll = self.pd_update_view_max_scroll.get(),
+            KeyCode::Char('G') | KeyCode::End => self.pd_update_view_scroll = self.metrics.update_view_max_scroll.get(),
             KeyCode::Char('e') => {
                 let open_id = self.pd_open_update.clone();
                 if let Some(ref id) = open_id {
@@ -2124,7 +2303,7 @@ impl App {
         match key.code {
             KeyCode::Esc | KeyCode::Char('?') => Ok(None),
             KeyCode::Char('j') | KeyCode::Down => {
-                let max = self.key_help_max_scroll.get();
+                let max = self.metrics.key_help_max_scroll.get();
                 if scroll < max { scroll += 1; }
                 Ok(Some(Overlay::KeyHelp { scroll }))
             }
@@ -2224,4 +2403,223 @@ fn parse_update_template(content: &str) -> (String, String) {
         parts.join("\n")
     };
     (label, body)
+}
+
+
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn key(code: KeyCode) -> KeyEvent { KeyEvent::new(code, KeyModifiers::NONE) }
+
+    /// An `App` on an in-memory database with no spell checker.  This is the
+    /// first unit-test coverage in this file (finding #6/#14/#15/#23 live
+    /// here); the key handlers need no terminal, only an `App`.
+    fn mk_app() -> App {
+        let conn = crate::data::db::open_in_memory().expect("in-memory db");
+        App::with_conn(conn, None).expect("app")
+    }
+
+    /// Render one frame at `w`×`h` so the views publish their metrics.
+    fn draw(app: &mut App, w: u16, h: u16) {
+        let mut term = Terminal::new(TestBackend::new(w, h)).expect("test terminal");
+        term.draw(|frame| crate::ui::render(frame, app)).expect("draw");
+    }
+
+    /// A project with one update whose body contains three search hits.
+    fn app_with_open_update() -> App {
+        let mut app = mk_app();
+        let p = repo::create_project(&app.conn, "Proj").unwrap();
+        repo::create_update(&app.conn, &p.id, "2025-01-01", "alpha\n\nalpha alpha\n").unwrap();
+        app.open_project_detail(&p.id).unwrap();
+        app.pd_tab = PdTab::Updates;
+        app.pd_open_update = Some(app.pd_updates[0].id.clone());
+        app.pd_search = "alpha".to_string();
+        app.pd_match_idx = 0;
+        draw(&mut app, 80, 24);
+        app
+    }
+
+    // ── finding #6 / #23: keys dead inside the update viewer ────────────────
+
+    #[test]
+    fn n_and_shift_n_navigate_matches_inside_the_update_viewer() {
+        let mut app = app_with_open_update();
+        let marks = app.metrics.match_marks.borrow().len();
+        assert!(marks >= 3, "expected 3 matches, got {marks} (query not applied?)");
+
+        app.handle_key(key(KeyCode::Char('n'))).unwrap();
+        assert_eq!(app.pd_match_idx, 1, "n must advance to the next match");
+        app.handle_key(key(KeyCode::Char('n'))).unwrap();
+        assert_eq!(app.pd_match_idx, 2);
+        app.handle_key(key(KeyCode::Char('N'))).unwrap();
+        assert_eq!(app.pd_match_idx, 1, "N must step back to the previous match");
+    }
+
+    // ── finding #15: the Warn overlay must not eat the key ──────────────────
+
+    #[test]
+    fn warn_is_dismissed_and_a_safe_key_is_redispatched() {
+        let mut app = app_with_open_update();
+        app.overlay = Some(Overlay::Warn {
+            title: " Notice ".into(),
+            body: "something happened".into(),
+        });
+
+        // `e` on an open update starts an $EDITOR session.  Before the fix the
+        // Warn overlay swallowed it and the user got nothing.
+        app.handle_key(key(KeyCode::Char('e'))).unwrap();
+        assert!(app.overlay.is_none(), "the warning must be dismissed");
+        assert!(
+            matches!(app.pending_editor.as_ref().map(|p| &p.target),
+                     Some(EditorTarget::EditUpdate(_))),
+            "e must be replayed after the warning closes"
+        );
+    }
+
+    #[test]
+    fn warn_does_not_replay_a_key_that_opens_another_overlay() {
+        let mut app = mk_app();
+        app.overlay = Some(Overlay::Warn {
+            title: " Notice ".into(),
+            body: "something happened".into(),
+        });
+        // `?` opens Key Help.  Replaying it would raise an overlay while the
+        // caller is still unwinding from the Warn overlay, so it is dropped.
+        app.handle_key(key(KeyCode::Char('?'))).unwrap();
+        assert!(app.overlay.is_none(), "? must not reopen an overlay");
+    }
+
+    #[test]
+    fn warn_swallows_non_replayable_key_codes() {
+        let mut app = mk_app();
+        app.overlay = Some(Overlay::Warn { title: " T ".into(), body: "b".into() });
+        app.handle_key(key(KeyCode::Enter)).unwrap();
+        assert!(app.overlay.is_none());
+        assert!(app.pending_editor.is_none(), "Enter must not be replayed");
+    }
+
+    // ── the viewer is not a separate key scope ─────────────────────────────
+
+    #[test]
+    fn esc_in_the_viewer_closes_it_without_leaving_project_detail() {
+        let mut app = app_with_open_update();
+        app.handle_key(key(KeyCode::Esc)).unwrap();
+        assert!(app.pd_open_update.is_none(), "ESC must close the viewer");
+        assert_eq!(app.screen, Screen::ProjectDetail, "ESC must not go further back");
+    }
+
+    #[test]
+    fn esc_outside_the_viewer_returns_to_the_project_list() {
+        let mut app = app_with_open_update();
+        app.pd_open_update = None;
+        app.handle_key(key(KeyCode::Esc)).unwrap();
+        assert_eq!(app.screen, Screen::ProjectList);
+    }
+
+    #[test]
+    fn switching_tabs_from_the_viewer_closes_it() {
+        let mut app = app_with_open_update();
+        app.handle_key(key(KeyCode::Char('t'))).unwrap();
+        assert_eq!(app.pd_tab, PdTab::Todos);
+        assert!(
+            app.pd_open_update.is_none(),
+            "leaving Updates must not leave a viewer armed for the next u"
+        );
+    }
+
+    #[test]
+    fn e_and_shift_t_work_inside_the_viewer() {
+        let mut app = app_with_open_update();
+        app.handle_key(key(KeyCode::Char('E'))).unwrap();
+        assert!(app.pd_editing_title.is_some(), "E must edit the project title");
+
+        let mut app = app_with_open_update();
+        app.handle_key(key(KeyCode::Char('T'))).unwrap();
+        assert!(
+            matches!(app.overlay, Some(Overlay::TagPicker { .. })),
+            "T must open the tag editor, got {:?}", app.overlay
+        );
+    }
+
+    /// `^F` is half-page scroll on the Description tab.  It used to switch to
+    /// the Files tab instead, because the unguarded `f` arm matched first.
+    #[test]
+    fn ctrl_f_scrolls_the_description_tab_instead_of_switching_tabs() {
+        let mut app = mk_app();
+        let p = repo::create_project(&app.conn, "Proj").unwrap();
+        let body = (1..=200).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n\n");
+        repo::update_project_description(&app.conn, &p.id, &body).unwrap();
+        app.open_project_detail(&p.id).unwrap();
+        app.pd_tab = PdTab::Description;
+        draw(&mut app, 80, 24);
+
+        let ctrl_f = KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL);
+        app.handle_key(ctrl_f).unwrap();
+        assert_eq!(app.pd_tab, PdTab::Description, "^F must not switch tabs");
+        assert!(app.pd_desc_scroll > 0, "^F must scroll the description");
+    }
+
+    // ── `n` is ambiguous: next match, or new item ───────────────────────────
+
+    #[test]
+    fn n_opens_the_description_editor_when_no_search_is_running() {
+        let mut app = mk_app();
+        let p = repo::create_project(&app.conn, "Proj").unwrap();
+        repo::update_project_description(&app.conn, &p.id, "hello").unwrap();
+        app.open_project_detail(&p.id).unwrap();
+        app.pd_tab = PdTab::Description;
+        draw(&mut app, 80, 24);
+
+        app.handle_key(key(KeyCode::Char('n'))).unwrap();
+        assert!(
+            matches!(app.pending_editor.as_ref().map(|p| &p.target),
+                     Some(EditorTarget::ProjectDescription)),
+            "with no query, n must open the description editor"
+        );
+    }
+
+    #[test]
+    fn n_navigates_matches_on_the_description_tab_when_a_search_is_running() {
+        let mut app = mk_app();
+        let p = repo::create_project(&app.conn, "Proj").unwrap();
+        repo::update_project_description(&app.conn, &p.id, "alpha alpha alpha").unwrap();
+        app.open_project_detail(&p.id).unwrap();
+        app.pd_tab = PdTab::Description;
+        app.pd_search = "alpha".into();
+        draw(&mut app, 80, 24);
+        assert!(app.metrics.match_marks.borrow().len() >= 2);
+
+        app.handle_key(key(KeyCode::Char('n'))).unwrap();
+        assert_eq!(app.pd_match_idx, 1, "n must navigate matches, not open $EDITOR");
+        assert!(app.pending_editor.is_none());
+    }
+
+    #[test]
+    fn n_still_adds_a_todo_on_the_todos_tab() {
+        let mut app = mk_app();
+        let p = repo::create_project(&app.conn, "Proj").unwrap();
+        app.open_project_detail(&p.id).unwrap();
+        app.pd_tab = PdTab::Todos;
+        // A stale search must not hijack `n` on the Todos tab.
+        app.pd_search = "anything".into();
+        draw(&mut app, 80, 24);
+
+        app.handle_key(key(KeyCode::Char('n'))).unwrap();
+        assert!(app.pd_adding_todo.is_some(), "n must add a todo on the Todos tab");
+    }
+
+    #[test]
+    fn question_mark_opens_key_help_inside_the_update_viewer() {
+        let mut app = app_with_open_update();
+        app.handle_key(key(KeyCode::Char('?'))).unwrap();
+        assert!(
+            matches!(app.overlay, Some(Overlay::KeyHelp { .. })),
+            "? must open the key help overlay, got {:?}", app.overlay
+        );
+    }
 }

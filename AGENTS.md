@@ -461,8 +461,80 @@ ui::render(frame, app)
   └─ views::overlay::render_overlay  (if overlay.is_some())
 ```
 
-Each view function is a pure render; it reads from `app` and writes to
-`frame`. No state is mutated during rendering.
+Each view function reads from `app` and writes to `frame`. Application state is
+not mutated during rendering — with **one** deliberate, documented exception.
+
+#### The exception: `PublishedMetrics`
+
+Key handling needs two things only the renderer can know:
+
+* **Geometry** — how many lines the content has, how tall the viewport is, and
+  therefore the largest legal scroll offset. That depends on the terminal
+  width (markdown re-wrapping, hint-bar height) and on the tab layout.
+* **Search-match positions** — where each match landed in the *wrapped*
+  output, which again depends on the width.
+
+Recomputing either in the key handler would duplicate the layout code and let
+the two drift. So the views publish them into `app.metrics`
+(`PublishedMetrics`, in `app.rs`) while they draw, and the key handlers read
+them. It is `Cell`/`RefCell` because views take `&App` and `ui::render` only
+has a shared reference.
+
+The contract (also on the type itself):
+
+* **Renderers own it.** Nothing else writes those fields; a key handler never
+  sets them.
+* **Values are one frame old.** A key event is handled after the frame that
+  preceded it. Handlers must treat every value as a hint — clamp against it,
+  never assume it is non-zero. `nudge_scroll_into_view`'s `.max(1)` and the
+  `.min(max_scroll)` clamps are that rule, not defensive noise.
+* **Losing it is harmless.** A zeroed value must degrade to "no scrolling",
+  never to a panic or a stuck cursor.
+
+Adding a field here is the right move only for a value the renderer genuinely
+computes. Anything derivable from `App` (a list length, a cursor) belongs in
+the key handler.
+
+### Key scopes in Project Detail
+
+```
+handle_key_project_detail
+  ├─ inline-edit guards   (editing todo / adding todo / editing title) — intercept all
+  ├─ pd_searching         — intercepts all (so `n` types into the query)
+  ├─ UNIVERSAL keys       — Esc E T / n N d u t f
+  ├─ update-viewer guard  — handle_key_pd_update_viewer
+  └─ tab dispatch         (Description / Updates / Todos / Files)
+```
+
+The **update viewer is not a separate key scope**. The universal block runs
+before the viewer guard, so `ESC` (close), `E`, `T`, `/`, `n`/`N` and the tab
+switches all work while an update is open; everything the block does not claim
+(`j`/`k`, `^f`/`^b`, `e`, `S`) falls through to the viewer handler. Putting the
+viewer guard *above* the universal block (as it was) makes every universal key
+dead in the viewer, including the `N` arm, whose condition is then unreachable
+(findings #6/#23).
+
+Two rules that follow:
+
+* **Guard modifier keys.** `^F`/`^B` are half-page scroll in the Description
+  tab and the viewer, but `f`/`b` alone also mean "switch to Files" (and are
+  otherwise unbound). The tab-switch arms therefore carry
+  `if !key.modifiers.contains(KeyModifiers::CONTROL)`.
+* **Closing the viewer is not "back".** `ESC` closes the viewer when one is
+  open and otherwise leaves Project Detail. Switching to a tab other than
+  Updates also closes it — see `App::switch_pd_tab` / `close_update_viewer`.
+
+### Overlay dismissal and redispatch
+
+`Overlay::Warn` closes on **any** key press, but the key is not swallowed: once
+the notice is gone, a *safe* key is handed back to `App::handle_key` so a user
+who reflexively presses `e` again at the edit-conflict warning gets the editor
+instead of nothing (finding #15). Redispatch is deliberately narrow —
+`is_redispatchable` is a closed allow-list of plain navigation/editing
+characters plus `Esc`. Keys that open an overlay (`i`, `?`, `n`, `T`, `D`, `/`,
+`r`, `m`, `S`, `Enter`) are excluded: replaying one would raise a new overlay
+while the caller is still unwinding from the old one, and the nesting would
+have no bound.
 
 ### External editor (`$EDITOR`)
 
@@ -584,7 +656,7 @@ The overlay intercepts **all** key events until dismissed.
 | `D` (Shift) | delete selected item (always with a confirm dialog) |
 | `Q` (Shift) | quit (Project List, Todo List) |
 | `n` | new item in context (project inline in PL, todo inline in PD/TL, update in `$EDITOR` in Updates tab, quick-capture in Todo List) |
-| `n` / `N` | next / previous search match (Project Detail Description tab and update viewer; wraps like vim) |
+| `n` / `N` | next / previous search match (Project Detail Description tab and update viewer; wraps like vim). With no query, `n` on the Description tab edits the description and `n` on the Updates/Todos tabs creates a new item |
 | `e` | edit selected item (project title inline in PL; todo title inline in PD/TL; description in `$EDITOR` in PD Description tab; selected update in `$EDITOR` in Updates tab) |
 | `E` (Shift) | edit project title inline (Project Detail) |
 | `d` / `u` / `t` / `f` | switch Project Detail tab (Description / Updates / Todos / Files) |
@@ -613,10 +685,33 @@ The overlay intercepts **all** key events until dismissed.
    reflect the change. This is the content shown by the `?` Key Help modal.
 
 For Project Detail, decide whether the key should work in a specific tab handler
-(`handle_key_pd_description`, `handle_key_pd_updates`, `handle_key_pd_todos`) or
-as a **universal key** (runs before tab dispatch). Keys like `E` and `T` that act
-on the project itself are universal and live in the universal-keys block in
-`handle_key_project_detail`.
+(`handle_key_pd_description`, `handle_key_pd_updates`, `handle_key_pd_todos`), in
+the **update viewer** (`handle_key_pd_update_viewer`), or as a **universal key**
+(runs before both). Keys like `E` and `T` that act on the project itself are
+universal and live in the universal-keys block in
+`handle_key_project_detail` — which means they also work while an update is
+open. A key that should scroll or edit *the open update* goes in the viewer
+handler instead. See §Key scopes in Project Detail for the ordering and why the
+viewer guard must stay below the universal block.
+
+Two more checks before you finish:
+
+* If the key is a letter that is also a tab switch (`d`/`u`/`t`/`f`) and you
+  bind a Ctrl variant of it for scrolling, guard the tab-switch arm on
+  `!key.modifiers.contains(KeyModifiers::CONTROL)`. The universal block runs
+  first, so an unguarded arm wins and the Ctrl key appears to do nothing.
+* If the key's meaning depends on state (`n` is "next match", "edit
+  description" or "new item" depending on the tab and whether a query is
+  running), put the disambiguation in one place with a comment saying which
+  case wins, and test all of them. Silent dead bindings are the failure mode
+  here: `n` was documented as "edit description" and did nothing, and
+  `^F`/`^B` were advertised in the Key Help while a tab switch ate the key.
+* Add the key to the hint-bar string **only** for the modes that accept it.
+  `n`/`N` in particular mean "next/previous match" on the Description tab and
+  in the update viewer but "new item" on the Todos tab. The hint bar's height
+  drives the layout, so a wrong string is both a lie and a rendering bug; the
+  tests in `project_detail.rs` assert the advertised keys against
+  `key_help_lines()`.
 
 ## Warn / Error Modal (`Overlay::Warn`)
 
@@ -630,7 +725,9 @@ self.overlay = Some(Overlay::Warn {
 });
 ```
 
-- Dismissed by **any key press**.
+- Dismissed by **any key press**. The dismissing key is **not** swallowed when
+  it is safe to replay (see §Overlay dismissal and redispatch), so a reflexive
+  second `e` at an edit-conflict warning still opens the editor.
 - Border is rendered in yellow via `Color::Yellow`.
 - Body text is word-wrapped; keep lines under ~58 characters for best fit.
 - Use this instead of `crate::log::warn` whenever the condition is

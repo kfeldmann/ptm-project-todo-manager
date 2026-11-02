@@ -369,7 +369,8 @@ fn render_key_help(frame: &mut Frame, area: Rect, scroll: u16, app: &App) {
     let content_height = lines.len() as u16;
     let visible = chunks[0].height;
     let max_scroll = content_height.saturating_sub(visible);
-    app.key_help_max_scroll.set(max_scroll);
+    // Render-published geometry for the key handler; see `PublishedMetrics`.
+    app.metrics.key_help_max_scroll.set(max_scroll);
     let clamped = scroll.min(max_scroll);
 
     frame.render_widget(
@@ -517,14 +518,14 @@ fn key_help_lines(desc_width: usize) -> Vec<Line<'static>> {
     row!("Q",       "Quit");
     out.push(Line::raw(""));
     section!(" PROJECT DETAIL");
-    row!("j / k",   "Move cursor (Todos/Updates tabs) or scroll (Description/Update viewer)");
-    row!("^f / ^b", "Half-page scroll (Description / Update viewer); PgDn / PgUp too");
-    row!("g / G",   "Top / bottom (Description / Update viewer); Home / End too");
+    row!("j / k",   "Move cursor (Todos/Updates tabs) or scroll (Description tab)");
+    row!("^f / ^b", "Half-page scroll (Description tab); PgDn / PgUp too");
+    row!("g / G",   "Top / bottom (Description tab); Home / End too");
     row!("J / K",   "Reorder todo / update");
     row!("Enter",   "Open update in viewer (Updates tab)");
     row!("t/d/u/f", "Switch tabs");
     row!("T",       "Tag editor  (r:rename tag)");
-    row!("e",       "Edit todo title inline (or open description $EDITOR in Description tab)");
+    row!("e / n",   "Edit todo title inline (or the description in $EDITOR in the Description tab)");
     row!("s",       "Cycle todo status");
     row!("S",       "Spell check selected item (todo / update / description)");
     row!("r",       "Set / clear reminder");
@@ -536,7 +537,19 @@ fn key_help_lines(desc_width: usize) -> Vec<Line<'static>> {
     row!("D",       "Delete");
     row!("/",       "Search / highlight (all tabs + update viewer)");
     row!("n / N",   "Next / previous search match (wraps)  [Description tab & update viewer]");
-    row!("ESC",     "Back to Project List (clears search if active)");
+    row!("ESC",     "Close the update viewer, else back to Project List");
+    out.push(Line::raw(""));
+    section!(" PROJECT DETAIL — UPDATE VIEWER");
+    row!("j / k",   "Scroll down / up");
+    row!("^f / ^b", "Half-page scroll; PgDn / PgUp too");
+    row!("g / G",   "Top / bottom; Home / End too");
+    row!("e",       "Edit this update in $EDITOR");
+    row!("S",       "Spell check this update");
+    row!("/",       "Search / highlight within the viewer");
+    row!("n / N",   "Next / previous search match (wraps)");
+    row!("E / T",   "Edit project title / tag editor (universal keys)");
+    row!("t/d/u/f", "Switch tabs (closes the viewer)");
+    row!("ESC",     "Close the viewer");
     out.push(Line::raw(""));
     section!(" TODO LIST");
     row!("j / k",   "Move cursor");
@@ -565,6 +578,20 @@ fn key_help_lines(desc_width: usize) -> Vec<Line<'static>> {
     row!("ESC/q",   "Finish and save corrections");
 
     out
+}
+
+/// The Key Help content as plain text, one row per line.
+///
+/// Used by the tests that cross-check the hint bar against this list; the
+/// overlay itself renders [`key_help_lines`] so the two cannot disagree about
+/// content.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn key_help_text(desc_width: usize) -> String {
+    key_help_lines(desc_width)
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // ─── Reminder Input ───────────────────────────────────────────────────────────

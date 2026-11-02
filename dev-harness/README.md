@@ -79,6 +79,7 @@ the `/etc/hosts` entry, which is host state — `s3-roundtrip.py` will print
 | `sync-state.py` | 3, 12, 2 (exit code) | `--merge` → `--start` → `--end` uploads the merged state; a refused `--end` exits non-zero and queues the work; non-TTY network-failure behaviour |
 | `merge-robust.py` | 7, 8, 9 | legacy local db, dangling FK, `sort_order` policy for `updates` |
 | `panics.py` | 4, 5, 13 | key-help wrap at every `desc_width` 0..=60 (real source), `~` key path, non-ASCII date truncation (real helper) |
+| `update-viewer.py` | 6, 23 | drives the real TUI in a pty and asserts that universal keys (`d`, `E`) work inside the update viewer |
 | `keyhelp-widths.py` | 4 | exhaustive width sweep over the real `key_help_lines()` strings |
 | `search-highlight.py` | 17 | `split_span` index drift under case-folding |
 | `s3-roundtrip.py` | 2, 3, 1c (partial) | true `--end`/`--start` round trip (needs the hosts entry below) |
@@ -129,14 +130,49 @@ crashed `ptm` leaves behind. Two consequences worth knowing before editing it:
   harness SKIPs without it (exit 0). `s3-roundtrip.py` covers the same ground
   for the happy path; `wal-safety.py` is the authority for the failure modes.
 
-## Verification status (2026-11-01, after session D — crash fixes)
+## Verification status (2026-11-01, after session E — key handling)
 
 Session A fixed findings 1b, 1c and 2's snapshot half; session B fixed 3 and 12
 and settled 2's exit-code half; session C fixed 7, 8 and 9; session D fixed
-4, 5 and 13. `wal-safety.py` is **23/23**, `sync-state.py` **20/20**,
-`merge-robust.py` **6/6**, `s3-roundtrip.py` **12/12**, `panics.py` **9/9**.
+4, 5 and 13; session E fixed 6, 14, 15 and 23. `wal-safety.py` is **23/23**,
+`sync-state.py` **20/20**, `merge-robust.py` **6/6**, `s3-roundtrip.py`
+**12/12**, `panics.py` **9/9**, `update-viewer.py` **4/4**.
 `search-highlight.py` is unchanged and still fails, because its finding
 belongs to session G.
+
+### Why `update-viewer.py` is a pty harness (session E)
+
+Finding #6 is "a key press produces no visible change". Nothing observable
+happens on disk, and the code path is only reachable from the TUI, so the
+harness drives the **real binary inside a pty** (`pty.openpty`) and scrapes the
+rendered screen:
+
+* It seeds a project whose description contains `DESCRIPTION-MARKER-42` and an
+  update whose body contains `UPDATE-BODY-MARKER-99`, so "which tab is
+  showing" is a substring check rather than an escape-code guess.
+* It answers the terminal's cursor-position query (`ESC [ 6 n`). ratatui sends
+  one before drawing and aborts with *"The cursor position could not be read
+  within a normal duration"* if nothing replies — that is what a bare pipe
+  does, and it is why this cannot be a plain `subprocess.run` like the other
+  harnesses.
+* The probes are `d` (switch to the Description tab from inside the viewer) and
+  `E` (start an inline project-title edit). Both are universal keys, both were
+  swallowed by the viewer guard, and both produce an unmistakable screen
+  change once fixed.
+
+`?` is **not** a probe, although the review names it. It is handled globally in
+`App::handle_key`, before the screen dispatch, so it worked even in the unfixed
+tree — using it would have produced a check that passes for the wrong reason.
+`n`/`N` are covered by unit tests in `src/app.rs` instead, because asserting
+"the current-match pointer moved" from a screen scrape would mean scraping the
+highlight colour.
+
+Re-run against the unfixed tree: **2/4**, failing exactly the `d` and `E`
+checks.
+
+#14 (render-time publishing) and #15 (`Warn` eating the key) are internal
+contracts with no external symptom, so they are covered by unit tests in
+`src/app.rs`; `PublishedMetrics`' doc comment records the #14 decision.
 
 ### Why `panics.py` changed shape in session D
 
@@ -214,9 +250,12 @@ reproductions were not preserved.
 | 12 (non-TTY abort) | **reproduces; fixed in session B** | `--start` exited 1 with "Network error and no interactive terminal; cannot pull" when stdin was a pipe. It now continues with a warning and leaves the local data untouched, so `ptm` still launches. |
 | 13 (byte-sliced dates) | **reproduces; fixed in session D** | `&s[..10]` panicked on `"2025-01-1é"` (`not a char boundary`). Note `"→2025-01-01"` did *not* panic — the boundary has to land mid-character. Every display site now uses `views::date_prefix`. |
 | 17 (`split_span`) | **reproduces** | Searching `İ` in `İstanbul` highlights `İs` instead of `İ`. Searching `i` highlights `İ` correctly. |
+| 6 / 23 (viewer swallows keys) | **reproduces; fixed in session E** | The viewer guard ran before the universal-key block, so `d`/`E`/`T`/`n`/`N` were dead inside the update viewer. `?` was **not** affected (it is handled globally) — see "Why `update-viewer.py` is a pty harness". Re-run against the unfixed tree: 2/4. |
+| 14 (render mutates state) | **documented, not a defect** | Renderers publish geometry and match positions into `PublishedMetrics`; the decision to keep that (rather than add a measure pass) is recorded on the type and in AGENTS.md. Unit-tested through the key handlers that read it. |
+| 15 (`Warn` eats the key) | **reproduces; fixed in session E** | Any key dismissed the notice *and* was discarded. A safe key is now replayed after the notice closes; keys that would open an overlay are not. Unit tests in `src/app.rs`. |
 
-Not covered by a harness yet (need a terminal or are judgement calls): #6, #10,
-#11, #14, #15, #16, #18–#24. #10 (N+1 queries) and #11 (`rename_tag` error
+Not covered by a harness yet (need a terminal or are judgement calls): #10,
+#11, #16, #18–#22, #24. #10 (N+1 queries) and #11 (`rename_tag` error
 swallowing) are worth adding as `repo`-level unit tests in the sessions that
 fix them, since `repo.rs` is already well covered by `cargo test`.
 
