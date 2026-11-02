@@ -21,7 +21,7 @@ pub fn reminder_date_style(date_str: &str, is_done_or_canceled: bool) -> Style {
     if is_done_or_canceled {
         return Style::default().fg(Color::DarkGray);
     }
-    let trimmed = &date_str[..date_str.len().min(10)];
+    let trimmed = date_prefix(date_str);
     let offset_minutes = crate::tz::get_tz_offset_minutes();
     let today = (DateTime::<Utc>::from(SystemTime::now()) + Duration::minutes(offset_minutes)).date_naive();
     match NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
@@ -37,6 +37,24 @@ pub fn reminder_date_style(date_str: &str, is_done_or_canceled: bool) -> Style {
             Style::default().bg(bg).fg(Color::White).add_modifier(Modifier::BOLD)
         }
         Err(_) => Style::default().fg(Color::DarkGray),
+    }
+}
+
+/// Number of characters kept when a date is displayed: `YYYY-MM-DD`.
+pub const DATE_LEN: usize = 10;
+
+/// Truncate a date/reminder string to its display prefix (see [`DATE_LEN`]).
+///
+/// Slicing a `&str` at a **byte** offset panics when the offset is not a char
+/// boundary (finding #13).  `reminder` is a plain `TEXT` column with no format
+/// constraint: the app's own input and `util/import_projects.py` validate
+/// `%Y-%m-%d`, but `--merge` copies whatever another database holds, and a
+/// display helper must not be the thing that enforces a storage invariant.
+/// This one counts characters, so any value renders.
+pub fn date_prefix(s: &str) -> &str {
+    match s.char_indices().nth(DATE_LEN) {
+        Some((idx, _)) => &s[..idx],
+        None => s,
     }
 }
 
@@ -305,7 +323,57 @@ pub fn word_wrap(text: &str, width: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{char_wrap, hint_height, list_window, list_window_reserved, word_wrap};
+    use super::{
+        char_wrap, date_prefix, hint_height, list_window, list_window_reserved, reminder_date_style,
+        word_wrap,
+    };
+
+    // ── date_prefix (finding #13) ─────────────────────────────────────────────
+
+    #[test]
+    fn date_prefix_keeps_a_full_ascii_date() {
+        assert_eq!(date_prefix("2025-01-01"), "2025-01-01");
+    }
+
+    #[test]
+    fn date_prefix_truncates_a_timestamp_to_the_date() {
+        assert_eq!(date_prefix("2025-01-01T09:30:00Z"), "2025-01-01");
+        assert_eq!(date_prefix("2025-01-01 09:30"), "2025-01-01");
+    }
+
+    #[test]
+    fn date_prefix_handles_short_and_empty_strings() {
+        assert_eq!(date_prefix(""), "");
+        assert_eq!(date_prefix("2025"), "2025");
+        // Exactly ten characters: no truncation, no panic.
+        assert_eq!(date_prefix("0123456789"), "0123456789");
+    }
+
+    /// The regression: `&s[..s.len().min(10)]` panics when byte 10 is not a
+    /// char boundary.  These values can reach the views from `--merge` or
+    /// `util/import_projects.py`, neither of which validates `%Y-%m-%d`.
+    #[test]
+    fn date_prefix_never_splits_a_multibyte_character() {
+        assert_eq!(date_prefix("2025-01-1é"), "2025-01-1é");
+        assert_eq!(date_prefix("2025-01-01é extra"), "2025-01-01");
+        // Exactly ten characters where the tenth is multi-byte: kept whole.
+        assert_eq!(date_prefix("2025-01-0→"), "2025-01-0→");
+        // A wide character straddling the boundary is dropped, not split.
+        assert_eq!(date_prefix("2025-01-01→"), "2025-01-01");
+        // Fewer than ten characters but multi-byte throughout.
+        assert_eq!(date_prefix("→→→"), "→→→");
+        // Nothing here may panic.
+        for s in ["2025-01-1é", "→2025-01-01", "𝄞𝄞𝄞𝄞𝄞", "é"] {
+            let _ = date_prefix(s);
+        }
+    }
+
+    #[test]
+    fn reminder_date_style_tolerates_a_non_ascii_date() {
+        // Finding #13: this used to panic before reaching the parse.
+        let _ = reminder_date_style("2025-01-1é", false);
+        let _ = reminder_date_style("2025-01-1é", true);
+    }
 
     // ── word_wrap ─────────────────────────────────────────────────────────────
 

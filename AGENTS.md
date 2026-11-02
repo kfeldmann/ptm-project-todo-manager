@@ -41,6 +41,9 @@ src/
 │                      the `ptm-sync` and `enc` binaries (path-included, like
 │                      spell.rs — edit this file, not a copy)
 ├── spell.rs         — spell checker; shared by `ptm` and `md` (path-included)
+├── paths.rs         — `expand_tilde` (`~` / `~/` → `$HOME`, error when unset);
+│                      shared by all three binaries (path-included — edit this
+│                      file, never a copy)
 ├── data/
 │   ├── mod.rs       — re-exports db, models, repo
 │   ├── db.rs        — SQLite connection, schema (CREATE TABLE IF NOT EXISTS)
@@ -129,6 +132,12 @@ both binaries (`#[path = "../../crypto.rs"] mod crypto;`), the same pattern
 `crypto.rs` provides `load_key`, `generate_key`, `write_key`,
 `check_key_permissions`, `encode_key_base64`, `decode_key_base64`,
 `encrypt`, and `decrypt`.
+
+Path handling is shared the same way: `src/paths.rs` is path-included by `enc`
+and `ptm-sync` (and compiled into `ptm` as a normal module) and provides
+`expand_tilde`. Do not re-implement `~` expansion per binary — the copy that
+used to live in `ptm_sync/main.rs` sliced at byte 2, which panicked on a bare
+`"~"` and turned `"~x"` into `$HOME/` (finding #5).
 
 ---
 
@@ -249,6 +258,11 @@ Generate a key with:
 enc keygen                      # writes ~/.encryption_key
 python3 util/encrypt.py keygen  # equivalent (Python tool)
 ```
+
+`--encryption-key` and `--from` are resolved by `paths::expand_tilde` — the
+same helper `enc` uses (see §enc). Only a leading `~` or `~/` is expanded;
+`~x` stays a literal relative path, and an unset `$HOME` is an error rather
+than a fallback to the current directory.
 
 ### Archive Contents
 
@@ -520,15 +534,37 @@ not set in this environment.
   ignored by this terminal, producing no color change.
 
 ### Reminder display
-Reminder dates are stored as `YYYY-MM-DD` strings and truncated to 10 chars
-on display. They are rendered with a leading two-space pad:
+Reminder dates are stored as `YYYY-MM-DD` strings and truncated to 10
+characters on display. They are rendered with a leading two-space pad:
 
 ```rust
-.map(|r| format!("  {}", &r[..r.len().min(10)]))
+.map(|r| format!("  {}", views::date_prefix(r)))
 ```
+
+Always truncate through `views::date_prefix` (in `ui/views/mod.rs`), never
+with a byte slice like `&r[..r.len().min(10)]`: that panics when byte 10
+lands inside a multi-byte character. `reminder` is a free-text `TEXT` column —
+the app's input and `util/import_projects.py` validate `%Y-%m-%d`, but
+`--merge` copies whatever the source database holds, so a display helper must
+not assume ASCII.
 
 Do **not** add emoji or icons before reminder dates (spacing issues on some
 terminals).
+
+### Key Help wrapping
+`wrap_key_row` (in `overlay.rs`) wraps a key-help description into the column
+budget `desc_width = inner_width - KEY_COL_WIDTH` (14). Two rules:
+
+- **`desc_width` is a column count, so count characters, not bytes.** The
+  rows contain `→`; slicing a `&str` at a column offset panics when it lands
+  inside a character.
+- **`desc_width == 0` means "do not wrap"** — render the row unwrapped and let
+  the paragraph clip it. A hard break at column 0 makes no progress and loops
+  forever.
+
+`overlay.rs`'s unit tests sweep `desc_width` 0..=60 over every real
+`key_help_lines()` row, so adding a description with wide characters is
+covered automatically.
 
 ### Overlays
 All overlays are rendered centered over the full terminal area by

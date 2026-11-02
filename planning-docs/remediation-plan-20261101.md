@@ -11,7 +11,7 @@
 | **A** | DONE | `ptm-sync` WAL safety | **1, 2** | `ptm_sync/db.rs`, `ops.rs`, `archive.rs` |
 | **B** | DONE | Sync state machine & failure semantics | **3, 12**, exit-code half of 2 | `ptm_sync/ops.rs`, `main.rs`, `merge.rs` (1 line) |
 | **C** | DONE | `merge` robustness | **7, 8, 9** | `ptm_sync/merge.rs` |
-| **D** | | Crash fixes | **4, 5, 13** | `views/overlay.rs`, `ptm_sync/main.rs`, `bin/enc/main.rs`, `crypto.rs`, `views/{mod,project_list,todo_list,project_detail}.rs` |
+| **D** | DONE | Crash fixes | **4, 5, 13** | `views/overlay.rs`, `ptm_sync/main.rs`, `bin/enc/main.rs`, `paths.rs`, `views/{mod,project_list,todo_list,project_detail}.rs` |
 | **E** | | Key handling & render purity | **6, 14, 15, 23** | `app.rs`, `views/project_detail.rs`, `views/overlay.rs` |
 | **F** | | Data-layer correctness & perf | **10, 11** | `data/repo.rs` |
 | **G** | | Unicode/display-width consistency | **16, 17** | `views/mod.rs`, `views/*.rs`, `bin/md/main.rs` |
@@ -20,6 +20,7 @@
 ## Status at the time of writing
 
 - `cargo test --all-targets` → **408 tests, 0 failures** (36 + 82 + 214 + 76).
+  (After session D: **478**, all green.)
 - `cargo check --all-targets` clean.
 - All 24 findings are still live at the lines the review cites.
 - **11 of the findings have been reproduced by the harnesses in `dev-harness/`**
@@ -215,6 +216,71 @@ Findings #7, #8 and #9 fixed; `merge.rs` is the only file touched.
   reference rules (including that `INSERT OR IGNORE` does not help) and that
   the **local** schema is migrated too.
 
+### D — Crash fixes — **done**
+
+Findings #4, #5 and #13 fixed. All three were the same shape of bug — a **byte
+offset used as a column index on a UTF-8 string** — but they needed three
+different kinds of fix.
+
+- **#4 — `wrap_key_row`.** `max_desc` is a column budget, yet the code sliced
+  `&d[pos..pos + cut]` with it as a byte offset, so any break landing inside a
+  multi-byte character panicked (the rows contain `→`). It now collects the
+  description into `Vec<char>` and slices that, so a character is one column
+  wherever it sits in the string. Two further defects came out of the rewrite:
+  `desc_width == 0` was an **infinite loop** (cut 0 → `pos += 1`, remaining
+  still longer than 0) — it now means "do not wrap", which is what the old
+  early return intended; and the hard-break path skipped a character
+  (`pos += cut + 1` past a non-space), which is gone. The key column is now
+  the `KEY_COL_WIDTH` constant, used by both the wrapper and
+  `render_key_help`'s `desc_width` arithmetic so the two cannot drift.
+- **#5 — `expand_tilde`.** Rather than fix `ptm-sync`'s copy, it was extracted
+  into `src/paths.rs`, path-included by `enc` and `ptm-sync` and compiled
+  normally into `ptm` — the pattern `crypto.rs`/`spell.rs` already established.
+  `Args::key_path` and `--from` both use it and both now return a `Result`:
+  an unset `$HOME` is an error rather than a silent fallback to `.`, which is
+  the *other* half of #5 (the old code fell back to the current directory, so
+  a missing key was reported as "insecure permissions" on `./`).
+- **#13 — date truncation.** (Note: the review says the value can arrive from
+  `util/import_projects.py`, which in fact validates `%Y-%m-%d`. The
+  unvalidated path is `--merge`, which copies the source database's `reminder`
+  text verbatim into a column the schema does not constrain. The fix is the
+  same either way.) A `date_prefix` helper in `ui/views/mod.rs`
+  (with a `DATE_LEN` constant) counts characters via `char_indices`. Every
+  display site now uses it: `reminder_date_style`, the Project List and Todo
+  List reminder columns, the Todos-tab reminder column, and the three
+  `upd.created_at` fallbacks in the Updates tab and viewer (which were already
+  using `.chars().take(10)` — safe, but a second convention; they now share
+  the helper).
+- Tests: 459 → **478**, all green (37 + 82 + 227 + 132, one `#[ignore]`d child
+  helper per binary). New tests: `paths.rs` (4, shared by all three binaries;
+  the unset-`$HOME` case spawns a **child process**, because `remove_var` is
+  process-wide and the harness runs tests on several threads), `overlay.rs`
+  (8 — the first tests in that file: a 0..=60 `desc_width` sweep over the real
+  `key_help_lines()` rows, `desc_width == 0` termination, word/character
+  breaking, continuation alignment, multi-byte column counting), `views/mod.rs`
+  (7 for `date_prefix`, including the exact `"2025-01-1é"` regression), and
+  `ptm_sync/main.rs` (bare `~`, `~x`).
+- `panics.py` went from 2/6 to **9/9**.
+- **The harness had to change shape, which the procedure requires be
+  justified.** Its #4 and #13 checks compiled *hand-written copies* of the
+  buggy code — a `fn wrap_key_row` retyped into a scratch file, `s[..n]` typed
+  out inline. That is a test of the copy: it cannot go green when the source is
+  fixed, and it would pass for any change that left the copy alone. Both now
+  extract the **real functions out of `src/`** (`slice_between` between two
+  markers) and compile those. #13 gained a companion check that the historical
+  `&s[..len().min(10)]` still panics on the same fixtures, so the assertion is
+  demonstrably not vacuous. #5 gained a check that a bare `~` resolves to
+  `$HOME` (not just "does not panic", which a `.` fallback would also pass).
+  Re-run against the unfixed tree: **3/9**, failing exactly 4, 5 and 13.
+- `wal-safety.py` **23/23**, `sync-state.py` **20/20**, `merge-robust.py`
+  **6/6**, `s3-roundtrip.py` **12/12** — unchanged. `search-highlight.py`
+  still fails; its finding is session G.
+- `AGENTS.md` gains `src/paths.rs` in the tree, a §Key Help wrapping note
+  (columns not bytes; `desc_width == 0` means no wrap), a correction to the
+  §Reminder display snippet (which taught the panicking `&r[..10]` form), and
+  a note that `--encryption-key` / `--from` resolve through `expand_tilde`.
+  §enc's "Shared implementation" now covers `paths.rs` too.
+
 ## Grouping principle
 
 Three rules drive the split:
@@ -355,9 +421,11 @@ rather than repairing it, and it needs justifying in the commit message.
   returns non-zero.
 - **C** — `merge-robust.py` fully green: legacy local db merges, dangling-FK
   source merges, `updates` ordering is `L1, L2, L3, R1, R2`.
-- **D** — `panics.py` fully green. The key-help test must sweep `desc_width`
-  1..=60 (panics at 1, 2, 5, 6, 19, 20), not terminal width. `expand_tilde`
-  must handle `~`, `~/`, `~x`, and unset `$HOME`; port `enc`'s tests over.
+- **D** — *met.* `panics.py` fully green (9/9). The key-help test sweeps
+  `desc_width` **0..=60** (0 added: it looped forever rather than panicking),
+  not terminal width. `expand_tilde` handles `~`, `~/`, `~x` and unset `$HOME`;
+  `enc`'s tests were not "ported" but **moved** into `src/paths.rs`, where all
+  three binaries run them.
 - **E** — `?`, `n`, `N` work inside the update viewer; hint bar and
   `key_help_lines()` match reality; the render-purity decision (document the
   exception, or move to a measure pass) is recorded in AGENTS.md.
@@ -411,7 +479,9 @@ variant, which is deterministic.
 
 - **#4**: the panic depends on the computed `desc_width`, not the terminal
   width. The observed panicking `desc_width`s are **1, 2, 5, 6, 19, 20**. Write
-  the regression test against `desc_width`.
+  the regression test against `desc_width`. Session D also found that
+  `desc_width == 0` **looped forever** (not a panic), so the sweep covers
+  `0..=60`, not `1..=60`.
 - **#7**: the first column to fail on a legacy local db is `todos.archived`,
   not `updates.label` (`table todos has no column named archived`). The fix —
   call `ensure_schema_compat` on the local connection — is unchanged, but the
@@ -486,8 +556,8 @@ any finding.
 | 1c | `wal-safety.py` | PASS — fixed in A (lost-pull variant) |
 | 2 | `wal-safety.py` | PASS — fixed in A (snapshot), exit code in A+B |
 | 3 | `sync-state.py` | PASS — fixed in B |
-| 4 | `panics.py`, `keyhelp-widths.py` | FAIL — live |
-| 5 | `panics.py` | FAIL — live |
+| 4 | `panics.py`, `keyhelp-widths.py` | PASS — fixed in D |
+| 5 | `panics.py` | PASS — fixed in D |
 | 6 | — | not covered (needs a terminal) |
 | 7 | `merge-robust.py` | PASS — fixed in C |
 | 8 | `merge-robust.py` | PASS — fixed in C |
@@ -495,7 +565,7 @@ any finding.
 | 10 | — | not covered (add a `repo` unit test) |
 | 11 | — | not covered (add a `repo` unit test) |
 | 12 | `sync-state.py` | PASS — fixed in B |
-| 13 | `panics.py` | FAIL — live |
+| 13 | `panics.py` | PASS — fixed in D |
 | 14, 15 | — | judgement calls |
 | 16 | — | not covered |
 | 17 | `search-highlight.py` | FAIL — live |

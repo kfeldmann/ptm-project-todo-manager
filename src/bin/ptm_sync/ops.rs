@@ -51,7 +51,7 @@ fn current_db_bytes(paths: &Paths) -> Vec<u8> {
 
 pub fn run_start(args: &Args, paths: &Paths) -> Result<()> {
     require_s3_args(args)?;
-    let key_path = args.key_path();
+    let key_path = args.key_path()?;
     crypto::check_key_permissions(&key_path)?;
 
     // ── Determine initial pull intent ─────────────────────────────────────
@@ -308,7 +308,7 @@ fn do_pull(args: &Args, paths: &Paths, s3: &S3Client, remote_etag: &str) -> Resu
 
     // Decrypt.
     log_entry(paths, "Decrypting backup");
-    let key = crypto::load_key(&args.key_path())?;
+    let key = crypto::load_key(&args.key_path()?)?;
     let zip_bytes =
         crypto::decrypt(&encrypted, &key).context("Decryption failed")?;
 
@@ -521,7 +521,7 @@ pub fn run_end(args: &Args, paths: &Paths) -> Result<()> {
         );
     }
 
-    let key_path = args.key_path();
+    let key_path = args.key_path()?;
     crypto::check_key_permissions(&key_path)?;
 
     // ── --remote-is-master: skip push ─────────────────────────────────────

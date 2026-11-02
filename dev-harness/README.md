@@ -78,7 +78,7 @@ the `/etc/hosts` entry, which is host state — `s3-roundtrip.py` will print
 | `wal-safety.py` | 1a, 1b, 1c, 2 | WAL liveness probe, checkpoint return value, non-atomic install, stale-snapshot push (drives the real binary against the fake S3 — needs the hosts entry) |
 | `sync-state.py` | 3, 12, 2 (exit code) | `--merge` → `--start` → `--end` uploads the merged state; a refused `--end` exits non-zero and queues the work; non-TTY network-failure behaviour |
 | `merge-robust.py` | 7, 8, 9 | legacy local db, dangling FK, `sort_order` policy for `updates` |
-| `panics.py` | 4, 5, 13 | key-help wrap at narrow widths, `~` key path, non-ASCII date truncation |
+| `panics.py` | 4, 5, 13 | key-help wrap at every `desc_width` 0..=60 (real source), `~` key path, non-ASCII date truncation (real helper) |
 | `keyhelp-widths.py` | 4 | exhaustive width sweep over the real `key_help_lines()` strings |
 | `search-highlight.py` | 17 | `split_span` index drift under case-folding |
 | `s3-roundtrip.py` | 2, 3, 1c (partial) | true `--end`/`--start` round trip (needs the hosts entry below) |
@@ -129,13 +129,39 @@ crashed `ptm` leaves behind. Two consequences worth knowing before editing it:
   harness SKIPs without it (exit 0). `s3-roundtrip.py` covers the same ground
   for the happy path; `wal-safety.py` is the authority for the failure modes.
 
-## Verification status (2026-11-01, after session C — merge robustness)
+## Verification status (2026-11-01, after session D — crash fixes)
 
 Session A fixed findings 1b, 1c and 2's snapshot half; session B fixed 3 and 12
-and settled 2's exit-code half; session C fixed 7, 8 and 9. `wal-safety.py` is
-**23/23**, `sync-state.py` **20/20**, `merge-robust.py` **6/6**,
-`s3-roundtrip.py` **12/12**. `panics.py` and `search-highlight.py` are
-unchanged and still fail, because their findings belong to sessions D and G.
+and settled 2's exit-code half; session C fixed 7, 8 and 9; session D fixed
+4, 5 and 13. `wal-safety.py` is **23/23**, `sync-state.py` **20/20**,
+`merge-robust.py` **6/6**, `s3-roundtrip.py` **12/12**, `panics.py` **9/9**.
+`search-highlight.py` is unchanged and still fails, because its finding
+belongs to session G.
+
+### Why `panics.py` changed shape in session D
+
+Its #4 and #13 checks compiled **hand-written copies** of the buggy code — a
+`fn wrap_key_row` retyped into a scratch file, and `s[..n]` written out inline
+in a `main()`. A copy cannot see a fix: it keeps panicking after the source is
+repaired, so the check could never go green, and it would have passed for any
+change that did not touch the copy. They now **extract the real functions out
+of `src/`** (`slice_between` between two markers) and compile those, so the
+check reports what the tree actually does:
+
+- #4 lifts `wrap_key_row` out of `overlay.rs` and sweeps the real
+  `key_help_lines()` descriptions at every `desc_width` **0..=60**, plus a
+  whole-overlay smoke test. `0` is included because the old loop never
+  terminated there — the harness would hang, which is why the child process is
+  run under a timeout.
+- #13 lifts `date_prefix` out of `views/mod.rs` and asserts it is safe on
+  non-ASCII dates. A **companion** check compiles the historical
+  `&s[..s.len().min(10)]` on the same fixtures and asserts it *does* still
+  panic, so the check is demonstrably not vacuous.
+- #5 gained a fourth check that a bare `~` resolves to `$HOME` (previously
+  only "does not panic" was asserted, which a fallback to `.` would also pass).
+
+Both were re-run against the unfixed tree: `panics.py` is **3/9** there, and
+the checks that fail are exactly findings 4, 5 and 13.
 
 ### Why `merge-robust.py`'s #9 check changed shape in session C
 
@@ -180,13 +206,13 @@ reproductions were not preserved.
 | 2 (`--end` packs WAL-less db) | **reproduces; fixed in session A** | The bytes `std::fs::read(&paths.db)` returns contain **zero** committed rows while the live connection sees all 50. |
 | 2 (skipped push exit code) | **fixed in sessions A + B** | A skipped push exited **0**, so `trap 'ptm-sync --end' EXIT` saw success. A now exits non-zero; B additionally leaves a `.needs_push` marker, because the trap discards the code. |
 | 3 (`.db_hash` seeding) | **reproduces; fixed in session B** | `--merge` deleted `.db_hash` to force a push, but `--start` re-created it from the current db, so the merged state became the sync baseline and the next `--end` logged "No changes detected". Replaced with a `.needs_push` marker that `--start` never touches. The harness now drives the real `--merge` and asserts the merged state reaches S3. |
-| 4 (key-help panic) | **reproduces** | Panics at `desc_width` **1, 2, 5, 6, 19, 20** (the review quotes terminal widths 21/22/25/26/39/40; the panic depends on the computed description width, so the fix's test should sweep `desc_width`, not terminal width). Only 3 of the 62 descriptions contain multi-byte characters, all involving `→`. |
-| 5 (`~` key path) | **reproduces** | `--encryption-key '~'` panics: `start byte index 2 is out of bounds for string of length 1`. `'~x'` silently resolves to `$HOME/`. |
+| 4 (key-help panic) | **reproduces; fixed in session D** | Panicked at `desc_width` **1, 2, 5, 6, 19, 20** (the review quotes terminal widths 21/22/25/26/39/40; the panic depends on the computed description width, so the fix's test sweeps `desc_width`, not terminal width). Only 3 of the 62 descriptions contain multi-byte characters, all involving `→`. `desc_width == 0` was an infinite loop, not a panic. `wrap_key_row` now counts characters. |
+| 5 (`~` key path) | **reproduces; fixed in session D** | `--encryption-key '~'` panicked: `start byte index 2 is out of bounds for string of length 1`. `'~x'` silently resolved to `$HOME/`. Both now go through the shared `src/paths.rs::expand_tilde`. |
 | 7 (legacy local db) | **reproduces; fixed in session C** | Merge aborts with `table todos has no column named archived` — note the first failing column is `todos.archived`, not `updates.label` as the review states. The local connection is now migrated by `ensure_schema_compat` before the merge transaction. |
 | 8 (dangling FK) | **reproduces; fixed in session C** | `FOREIGN KEY constraint failed`, whole merge rolled back. Resolved in the `SELECT`: `todos.project_id` is nulled (Inbox) and counted, an `updates` row whose `project_id` dangles is skipped and counted (the column is `NOT NULL`), and memberships whose owning row is missing are skipped. `INSERT OR IGNORE` does not help — FK violations are errors, not conflicts. |
 | 9 (updates ordering) | **reproduces; fixed in session C** | Local `L1(0), L2(-1), L3(-2)` + foreign `R1(0), R2(-1)` rendered `L3, L2, R2, L1, R1` — interleaved. Now `L3, L2, L1, R2, R1`: the local block stays intact and the foreign rows follow it. See "Why `merge-robust.py`'s #9 check changed shape" above for the display-order question. |
 | 12 (non-TTY abort) | **reproduces; fixed in session B** | `--start` exited 1 with "Network error and no interactive terminal; cannot pull" when stdin was a pipe. It now continues with a warning and leaves the local data untouched, so `ptm` still launches. |
-| 13 (byte-sliced dates) | **reproduces** | `&s[..10]` panics on `"2025-01-1é"` (`not a char boundary`). Note `"→2025-01-01"` does *not* panic — the boundary has to land mid-character. |
+| 13 (byte-sliced dates) | **reproduces; fixed in session D** | `&s[..10]` panicked on `"2025-01-1é"` (`not a char boundary`). Note `"→2025-01-01"` did *not* panic — the boundary has to land mid-character. Every display site now uses `views::date_prefix`. |
 | 17 (`split_span`) | **reproduces** | Searching `İ` in `İstanbul` highlights `İs` instead of `İ`. Searching `i` highlights `İ` correctly. |
 
 Not covered by a harness yet (need a terminal or are judgement calls): #6, #10,

@@ -100,8 +100,8 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
             format!("  [{}]", p.tags.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", "))
         };
 
-        let reminder_str = p.soonest_reminder.as_ref()
-            .map(|r| r[..r.len().min(10)].to_string())
+        let reminder_str = p.soonest_reminder.as_deref()
+            .map(|r| super::date_prefix(r).to_string())
             .unwrap_or_default();
 
         let title_base = if p.archived {

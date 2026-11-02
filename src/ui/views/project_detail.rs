@@ -465,7 +465,7 @@ fn update_content_lines(
     lower_query: &[char],
 ) -> Vec<Line<'static>> {
     let display_label = if upd.label.is_empty() {
-        upd.created_at.chars().take(10).collect::<String>()
+        super::date_prefix(&upd.created_at).to_string()
     } else {
         upd.label.clone()
     };
@@ -559,7 +559,7 @@ fn render_updates_tab(frame: &mut Frame, area: Rect, app: &App, theme: &Theme, l
     // Rendered height of each entry: content rows (capped) + 1 blank separator.
     let item_heights: Vec<usize> = app.pd_updates.iter().map(|upd| {
         let label_lines = super::char_wrap(
-            if upd.label.is_empty() { &upd.created_at[..upd.created_at.len().min(10)] }
+            if upd.label.is_empty() { super::date_prefix(&upd.created_at) }
             else { &upd.label },
             DATE_COL_WIDTH,
         );
@@ -679,7 +679,7 @@ fn render_update_viewer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme,
     };
 
     let label: String = if upd.label.is_empty() {
-        upd.created_at.chars().take(10).collect()
+        super::date_prefix(&upd.created_at).to_string()
     } else {
         upd.label.clone()
     };
@@ -798,8 +798,8 @@ fn render_todos_tab(frame: &mut Frame, area: Rect, app: &App, theme: &Theme, low
             } else {
                 Style::default()
             };
-            let reminder    = t.reminder.as_ref()
-                .map(|r| r[..r.len().min(10)].to_string())
+            let reminder    = t.reminder.as_deref()
+                .map(|r| super::date_prefix(r).to_string())
                 .unwrap_or_default();
             let is_done_or_canceled = matches!(t.status, TodoStatus::Done | TodoStatus::Canceled);
             let reminder_style = t.reminder.as_deref()

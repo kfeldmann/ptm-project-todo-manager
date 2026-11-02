@@ -23,6 +23,12 @@
 #[allow(dead_code)] // shared module: each binary uses a different subset
 mod crypto;
 
+/// Shared path helpers (path-included from the main ptm source so that
+/// `expand_tilde` exists once for all three binaries).
+#[path = "../../paths.rs"]
+#[allow(dead_code)] // shared module: each binary uses a different subset
+mod paths;
+
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
@@ -107,27 +113,8 @@ struct CommonArgs {
 impl CommonArgs {
     /// Resolve a leading `~` to `$HOME`.
     fn key_path(&self) -> Result<PathBuf> {
-        expand_tilde(&self.key_file)
+        paths::expand_tilde(&self.key_file)
     }
-}
-
-/// Resolve a leading `~` / `~/` to `$HOME`.
-///
-/// If `$HOME` is unset and `path` needs it, this is an error rather than a
-/// silent fallback to the current directory: writing a private key into
-/// whatever directory happens to be current is not a safe default.
-fn expand_tilde(path: &str) -> Result<PathBuf> {
-    if path == "~" || path.starts_with("~/") {
-        let home = std::env::var("HOME").map_err(|_| {
-            anyhow::anyhow!(
-                "HOME is not set, so '{}' cannot be resolved; pass --key-file with an explicit path",
-                path
-            )
-        })?;
-        let rest = path.strip_prefix("~/").unwrap_or("");
-        return Ok(PathBuf::from(home).join(rest));
-    }
-    Ok(PathBuf::from(path))
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
@@ -427,35 +414,8 @@ mod tests {
         assert_eq!(default_dec_output(Path::new(".enc")), PathBuf::from(".enc.dec"));
     }
 
-    #[test]
-    fn expand_tilde_expands_home() {
-        let home = std::env::var("HOME").unwrap();
-        assert_eq!(expand_tilde("~/key").unwrap(), PathBuf::from(&home).join("key"));
-        assert_eq!(expand_tilde("~").unwrap(), PathBuf::from(&home));
-        assert_eq!(expand_tilde("/abs/key").unwrap(), PathBuf::from("/abs/key"));
-        assert_eq!(
-            expand_tilde("relative/key").unwrap(),
-            PathBuf::from("relative/key")
-        );
-        // A bare "~" inside a name must not be expanded.
-        assert_eq!(expand_tilde("a/~/b").unwrap(), PathBuf::from("a/~/b"));
-    }
-
-    #[test]
-    fn expand_tilde_errors_when_home_is_unset() {
-        // Only meaningful when the variable is actually absent; otherwise
-        // exercise the error branch by temporarily unsetting it.
-        let saved = std::env::var("HOME").ok();
-        // SAFETY: single-threaded test process for this variable's use below.
-        unsafe { std::env::remove_var("HOME") };
-        let result = expand_tilde("~/key");
-        let plain = expand_tilde("/abs/key");
-        if let Some(home) = saved {
-            unsafe { std::env::set_var("HOME", home) };
-        }
-        assert!(result.is_err(), "expected an error when HOME is unset");
-        assert!(plain.is_ok(), "absolute paths must not need HOME");
-    }
+    // `expand_tilde`'s own tests live with it in `src/paths.rs`; they run for
+    // this binary too, because the module is path-included.
 
     #[test]
     fn same_path_detects_identical_paths() {

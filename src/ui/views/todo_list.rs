@@ -115,8 +115,8 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
             } else {
                 Style::default()
             };
-            let reminder = todo.reminder.as_ref()
-                .map(|r| r[..r.len().min(10)].to_string())
+            let reminder = todo.reminder.as_deref()
+                .map(|r| super::date_prefix(r).to_string())
                 .unwrap_or_default();
 
             let is_done_or_canceled = matches!(todo.status, TodoStatus::Done | TodoStatus::Canceled);

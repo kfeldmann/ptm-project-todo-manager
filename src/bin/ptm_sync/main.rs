@@ -17,6 +17,12 @@ mod s3client;
 #[allow(dead_code)] // shared module: each binary uses a different subset
 mod crypto;
 
+/// Shared path helpers (path-included from the main ptm source so that
+/// `expand_tilde` exists once for all three binaries).
+#[path = "../../paths.rs"]
+#[allow(dead_code)] // shared module: each binary uses a different subset
+mod paths;
+
 use anyhow::{Context, Result};
 use chrono::DateTime;
 use clap::{ArgGroup, Parser};
@@ -81,27 +87,16 @@ pub struct Args {
     pub from: Option<String>,
 }
 
-/// Expand a leading `~` to `$HOME` (shared by key path and --from).
-pub fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        PathBuf::from(home).join(rest)
-    } else if path == "~" {
-        PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
-    } else {
-        PathBuf::from(path)
-    }
-}
-
 impl Args {
-    /// Resolve the `~` in `--encryption-key` and return an absolute PathBuf.
-    pub fn key_path(&self) -> PathBuf {
-        if self.encryption_key.starts_with('~') {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            PathBuf::from(home).join(&self.encryption_key[2..])
-        } else {
-            PathBuf::from(&self.encryption_key)
-        }
+    /// Resolve the `~` in `--encryption-key` (and `--from`) to a `PathBuf`.
+    ///
+    /// `paths::expand_tilde` is the shared implementation used by `enc` too;
+    /// the local copy this replaced sliced at byte 2, which panicked on a bare
+    /// `"~"` and turned `"~x"` into `$HOME/` (finding #5).  It returns a
+    /// `Result` because `$HOME` may be unset — the caller must say so rather
+    /// than quietly looking in the current directory.
+    pub fn key_path(&self) -> Result<PathBuf> {
+        paths::expand_tilde(&self.encryption_key)
     }
 }
 
@@ -377,7 +372,13 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        let from_dir = expand_tilde(from);
+        let from_dir = match paths::expand_tilde(from) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Error: {:#}", e);
+                std::process::exit(1);
+            }
+        };
         merge::run_merge(&paths, &from_dir, args.dry_run)
     } else if args.start {
         ops::run_start(&args, &paths)
@@ -614,19 +615,35 @@ mod tests {
     fn key_path_tilde_is_expanded_to_home() {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
         let args = make_args("~/.encryption_key");
-        let path = args.key_path();
+        let path = args.key_path().unwrap();
         assert_eq!(path, PathBuf::from(&home).join(".encryption_key"));
     }
 
     #[test]
     fn key_path_absolute_path_is_returned_unchanged() {
         let args = make_args("/etc/ptm/key.bin");
-        assert_eq!(args.key_path(), PathBuf::from("/etc/ptm/key.bin"));
+        assert_eq!(args.key_path().unwrap(), PathBuf::from("/etc/ptm/key.bin"));
     }
 
     #[test]
     fn key_path_relative_path_is_returned_unchanged() {
         let args = make_args("keys/my.key");
-        assert_eq!(args.key_path(), PathBuf::from("keys/my.key"));
+        assert_eq!(args.key_path().unwrap(), PathBuf::from("keys/my.key"));
+    }
+
+    /// Finding #5: a bare "~" must resolve to $HOME, not panic on `&path[2..]`.
+    #[test]
+    fn key_path_bare_tilde_is_the_home_directory() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+        let args = make_args("~");
+        assert_eq!(args.key_path().unwrap(), PathBuf::from(&home));
+    }
+
+    /// Finding #5: "~x" is not a home reference; it must stay literal rather
+    /// than silently becoming "$HOME/".
+    #[test]
+    fn key_path_tilde_without_separator_is_literal() {
+        let args = make_args("~x");
+        assert_eq!(args.key_path().unwrap(), PathBuf::from("~x"));
     }
 }

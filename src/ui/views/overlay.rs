@@ -363,8 +363,8 @@ fn render_key_help(frame: &mut Frame, area: Rect, scroll: u16, app: &App) {
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(inner);
 
-    // Key column is "  {:12}" = 14 chars; remaining width is for descriptions.
-    let desc_width = chunks[0].width.saturating_sub(14) as usize;
+    // Key column is "  {:12}" = 14 columns; the rest is for descriptions.
+    let desc_width = (chunks[0].width as usize).saturating_sub(KEY_COL_WIDTH);
     let lines = key_help_lines(desc_width);
     let content_height = lines.len() as u16;
     let visible = chunks[0].height;
@@ -390,9 +390,23 @@ fn render_key_help(frame: &mut Frame, area: Rect, scroll: u16, app: &App) {
     );
 }
 
+/// Column the description starts at: the key column is `"  {:12}"` (14 cols)
+/// and continuation lines use 14 spaces so the text stays aligned.
+const KEY_COL_WIDTH: usize = 14;
+
 /// Word-wraps a key binding row into one or more `Line`s.
-/// The key column is always "  {:12}" (14 chars); continuation lines use
-/// 14 spaces so the description text stays aligned.
+///
+/// `max_desc` is a **column** count, so every length here is counted in
+/// characters, never bytes: slicing a `&str` at a byte offset that lands
+/// inside a multi-byte character panics, and three of the key-help rows
+/// contain `→` (finding #4).
+///
+/// `max_desc == 0` (a terminal narrower than the key column) disables
+/// wrapping entirely.  It used to mean "hard-break at column 0", which looped
+/// forever: `cut` became 0, `pos += 0 + 1` skipped one character, and the
+/// remaining string could still be longer than 0, so the loop never ended.
+/// Rendering the row unwrapped is what the old `d.len() <= max_desc` early
+/// return intended for the ordinary case — let the paragraph clip it.
 fn wrap_key_row(
     k: &'static str,
     d: &'static str,
@@ -400,7 +414,8 @@ fn wrap_key_row(
     key_sty: Style,
     desc_sty: Style,
 ) -> Vec<Line<'static>> {
-    if max_desc == 0 || d.len() <= max_desc {
+    let chars: Vec<char> = d.chars().collect();
+    if max_desc == 0 || chars.len() <= max_desc {
         return vec![Line::from(vec![
             Span::styled(format!("  {:12}", k), key_sty),
             Span::styled(d, desc_sty),
@@ -411,40 +426,47 @@ fn wrap_key_row(
     let mut pos = 0usize;
     let mut first = true;
 
-    while pos < d.len() {
-        let remaining = &d[pos..];
-        if remaining.len() <= max_desc {
-            let prefix = if first {
-                format!("  {:12}", k)
-            } else {
-                format!("  {:12}", "")
-            };
-            out.push(Line::from(vec![
-                Span::styled(prefix, key_sty),
-                Span::styled(remaining, desc_sty),
-            ]));
-            break;
-        }
-
-        // Find the last space within max_desc chars so we break on a word boundary.
-        let cut = remaining[..=max_desc]
-            .rfind(' ')
-            .unwrap_or(max_desc); // hard-break if no space found
-
-        let chunk: &'static str = &d[pos..pos + cut];
+    while pos < chars.len() {
         let prefix = if first {
             format!("  {:12}", k)
         } else {
             format!("  {:12}", "")
         };
+        let remaining = chars.len() - pos;
+
+        if remaining <= max_desc {
+            let chunk: String = chars[pos..].iter().collect();
+            out.push(Line::from(vec![
+                Span::styled(prefix, key_sty),
+                Span::styled(chunk, desc_sty),
+            ]));
+            break;
+        }
+
+        // Look one column past the budget for a space to break on; fall back
+        // to a hard break when the budget holds no space (one long word).
+        let window = &chars[pos..pos + max_desc + 1];
+        let (cut, next) = match window.iter().rposition(|&c| c == ' ') {
+            // Break on the space: it is dropped, not part of either line.
+            Some(i) => (i, pos + i + 1),
+            // Hard break: nothing is skipped, so no character is lost.
+            None => (max_desc, pos + max_desc),
+        };
+
+        if cut == 0 {
+            // The window starts with whitespace — skip it instead of emitting
+            // a line that contains nothing.
+            pos = next.max(pos + 1);
+            continue;
+        }
+
+        let chunk: String = chars[pos..pos + cut].iter().collect();
         out.push(Line::from(vec![
             Span::styled(prefix, key_sty),
             Span::styled(chunk, desc_sty),
         ]));
         first = false;
-
-        // Skip past the space we broke on.
-        pos += cut + 1;
+        pos = next;
     }
 
     out
@@ -928,4 +950,114 @@ fn render_warn(frame: &mut Frame, area: Rect, title: &str, body: &str) {
 
     let content = Paragraph::new(paragraph_lines).wrap(Wrap { trim: false });
     frame.render_widget(content, inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{key_help_lines, wrap_key_row, KEY_COL_WIDTH};
+    use ratatui::style::Style;
+    use ratatui::text::Line;
+
+    fn plain(s: &'static str, w: usize) -> Vec<Line<'static>> {
+        wrap_key_row("x", s, w, Style::default(), Style::default())
+    }
+
+    /// The text of a rendered line, with the key column and its padding removed.
+    fn desc_of(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    // ── finding #4: byte-slicing the description panicked ────────────────────
+
+    /// The original defect: `max_desc` is a column budget, but the code sliced
+    /// `&d[pos..pos + cut]` on it as a byte offset, so a break that landed
+    /// inside a multi-byte character panicked.  The observed panicking widths
+    /// for the real key-help strings were 1, 2, 5, 6, 19 and 20.
+    #[test]
+    fn no_desc_width_panics_on_the_real_key_help_rows() {
+        for w in 1..=60usize {
+            let lines = key_help_lines(w);
+            assert!(!lines.is_empty(), "desc_width {w} produced no lines");
+        }
+    }
+
+    #[test]
+    fn wrap_key_row_never_panics_on_a_multibyte_description() {
+        for w in 1..=60usize {
+            let lines = plain("Quick capture todo → Inbox", w);
+            assert!(!lines.is_empty(), "desc_width {w} produced no lines");
+        }
+    }
+
+    /// `desc_width == 0` used to loop forever (cut = 0, pos advanced by 1, the
+    /// remaining string still longer than 0).  It must terminate and keep the
+    /// whole description.
+    #[test]
+    fn zero_desc_width_terminates_and_keeps_the_text() {
+        let lines = plain("Quick capture todo → Inbox", 0);
+        assert_eq!(lines.len(), 1);
+        assert!(desc_of(&lines[0]).contains("Quick capture todo → Inbox"));
+    }
+
+    // ── wrapping behaviour ──────────────────────────────────────────────────
+
+    #[test]
+    fn a_short_description_is_one_line() {
+        let lines = plain("Save", 20);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(desc_of(&lines[0]), format!("  {:12}Save", "x"));
+    }
+
+    #[test]
+    fn a_long_description_wraps_on_spaces() {
+        let lines = plain("alpha beta gamma delta", 11);
+        assert!(lines.len() > 1);
+        // Every line fits the column budget (the hard-break case aside).
+        for line in &lines {
+            let text = desc_of(line);
+            let desc = &text[KEY_COL_WIDTH..];
+            assert!(desc.chars().count() <= 11, "{desc:?} exceeds the budget");
+        }
+        // No character is lost or duplicated across the wrap.
+        let joined: String = lines
+            .iter()
+            .map(|l| desc_of(l)[KEY_COL_WIDTH..].to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(joined.split_whitespace().collect::<Vec<_>>(),
+                   ["alpha", "beta", "gamma", "delta"]);
+    }
+
+    #[test]
+    fn continuation_lines_keep_the_description_column() {
+        let lines = plain("alpha beta gamma delta", 11);
+        assert!(lines.len() > 1);
+        // The first line starts with the key column, the rest with 14 spaces.
+        assert!(desc_of(&lines[0]).starts_with(&format!("  {:12}", "x")));
+        for line in &lines[1..] {
+            assert!(desc_of(line).starts_with(&" ".repeat(KEY_COL_WIDTH)));
+        }
+    }
+
+    #[test]
+    fn a_word_longer_than_the_budget_is_hard_broken() {
+        // No space to break on: the row is split at the budget.
+        let lines = plain("abcdefghijklmnop", 5);
+        let chunks: Vec<String> = lines.iter().map(|l| desc_of(l)[KEY_COL_WIDTH..].to_string()).collect();
+        assert_eq!(chunks, vec!["abcde", "fghij", "klmno", "p"]);
+    }
+
+    /// Multi-byte characters must be counted as one column each, not as their
+    /// byte length — otherwise the row wraps far too early (or panics).
+    #[test]
+    fn multibyte_characters_count_as_one_column() {
+        // Five `→` fit a budget of five; byte-wise they would need 15.
+        let lines = plain("→→→→→ x", 5);
+        let first = desc_of(&lines[0]);
+        assert_eq!(&first[KEY_COL_WIDTH..], "→→→→→");
+    }
 }
