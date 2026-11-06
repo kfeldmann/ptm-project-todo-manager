@@ -36,28 +36,36 @@ automatically at `~/.local/share/ptm/ptm.db` (or `$XDG_DATA_HOME/ptm/ptm.db`).
 src/
 ├── main.rs          — terminal setup, event loop, $EDITOR suspension
 ├── app.rs           — App struct (all state), handle_key_* methods
-├── log.rs           — file-based logger (see Logging section below)
+├── log.rs           — file-based logger (see Logging section below); shared by
+│                      `ptm` and `md` (path-included — `md` selects its own
+│                      directory with `set_app_name("md")`)
 ├── crypto.rs        — AES-256-GCM encrypt/decrypt + key helpers; shared by
 │                      the `ptm-sync` and `enc` binaries (path-included, like
 │                      spell.rs — edit this file, not a copy)
 ├── spell.rs         — spell checker; shared by `ptm` and `md` (path-included)
-├── paths.rs         — `expand_tilde` (`~` / `~/` → `$HOME`, error when unset);
-│                      shared by all three binaries (path-included — edit this
-│                      file, never a copy)
+├── tz.rs            — local UTC offset in minutes, cached for 24h (a `date +%z`
+│                      spawn per cache miss, never per render)
+├── paths.rs         — `expand_tilde` (`~` / `~/` → `$HOME`, error when unset),
+│                      plus the XDG lookup (`data_home`, `app_data_dir`,
+│                      `optional_app_data_dir`, `app_data_file`); shared by all
+│                      four binaries (path-included — edit this file, never a
+│                      copy)
 ├── data/
 │   ├── mod.rs       — re-exports db, models, repo
 │   ├── db.rs        — SQLite connection, schema (CREATE TABLE IF NOT EXISTS)
 │   ├── models.rs    — plain data structs: Project, Todo, Update, Tag, TodoStatus
 │   └── repo.rs      — all database reads/writes; no UI dependencies
 ├── input/
-│   └── mod.rs       — cursor-aware single-line `InputState` struct + `handle_input_key`
+│   └── mod.rs       — cursor-aware single-line `InputState` (insert / delete /
+│                      cursor movement, column-budgeted `display`) plus
+│                      `handle_input_key`; fully implemented, not a placeholder
 ├── ui/
 │   ├── mod.rs       — top-level render() dispatcher
 │   ├── theme.rs     — Theme struct (Color palette); always used as Theme::default()
-│   ├── text.rs      — width-aware text helpers: display_width, char_wrap,
-│   │                  word_wrap, wrap_rows, split_at_width, pad_to_width,
-│   │                  ellipsize, hint_height, find_matches/split_matches;
-│   │                  shared with `md`
+│   ├── text.rs      — width-aware text helpers: display_width,
+│   │                  char_display_width, char_wrap, word_wrap, wrap_rows,
+│   │                  split_at_width, pad_to_width, ellipsize, hint_height,
+│   │                  find_matches/split_matches; shared with `md`
 │   │                  (path-included — edit this file, never a copy)
 │   ├── markdown.rs  — Markdown → ratatui renderer; shared with `md` (path-included)
 │   └── views/
@@ -65,7 +73,6 @@ src/
 │       ├── project_list.rs      — Project List screen renderer
 │       ├── project_detail.rs    — Project Detail screen renderer
 │       ├── todo_list.rs         — Global Todo List screen renderer
-│       ├── reference_library.rs — Reference Library screen (placeholder)
 │       └── overlay.rs           — all overlay renderers
 └── bin/
     ├── enc/         — enc binary (file encryption CLI; see §enc below)
@@ -73,7 +80,8 @@ src/
     ├── md/          — md binary (Markdown viewer + spell check)
     │   ├── main.rs     — TUI viewer: scroll, incremental search, $EDITOR, S:spell
     │   ├── ui.rs       — path-includes src/ui/{theme,markdown,text}.rs
-    │   └── log.rs      — file logger → $XDG_DATA_HOME/md/md.log
+    │   └── log.rs      — thin wrapper over the shared src/log.rs (selects the
+    │                     `md` directory → $XDG_DATA_HOME/md/md.log)
     └── ptm_sync/    — ptm-sync binary (S3 backup sync; see §ptm-sync below)
         ├── main.rs     — CLI args (clap), Paths struct, shared utilities, entry point
         ├── ops.rs      — high-level --start and --end flows
@@ -138,11 +146,23 @@ both binaries (`#[path = "../../crypto.rs"] mod crypto;`), the same pattern
 `check_key_permissions`, `encode_key_base64`, `decode_key_base64`,
 `encrypt`, and `decrypt`.
 
-Path handling is shared the same way: `src/paths.rs` is path-included by `enc`
-and `ptm-sync` (and compiled into `ptm` as a normal module) and provides
-`expand_tilde`. Do not re-implement `~` expansion per binary — the copy that
-used to live in `ptm_sync/main.rs` sliced at byte 2, which panicked on a bare
-`"~"` and turned `"~x"` into `$HOME/` (finding #5).
+Path handling is shared the same way: `src/paths.rs` is path-included by `enc`,
+`ptm-sync` and `md` (and compiled into `ptm` as a normal module). It provides
+`expand_tilde` and the XDG data-directory lookup (`data_home`, `app_data_dir`,
+`optional_app_data_dir`, `app_data_file`). Do not re-implement either per
+binary:
+
+- The `~` copy that used to live in `ptm_sync/main.rs` sliced at byte 2, which
+  panicked on a bare `"~"` and turned `"~x"` into `$HOME/` (finding #5).
+- The XDG lookup had four copies with three different `$HOME` fallbacks (`.`,
+  an error, and a silent skip), so `ptm`, `ptm-sync` and `md` could disagree
+  about where the data directory is — fatal for `ptm-sync`, which hashes and
+  packs the file `ptm` writes (finding #19).
+
+`app_data_dir` is deliberately lenient (falls back to `./.local/share` when
+neither variable is set) because a TUI with nowhere to put its database is
+worse than one in an odd directory; `expand_tilde` is deliberately strict for
+the same reason in reverse — a private key must not land in `.`.
 
 ---
 
@@ -823,8 +843,11 @@ corrupt the display and must never be used**. Use `crate::log::warn(msg)` instea
 crate::log::warn("something unexpected happened");
 ```
 
-Lines are appended to `$XDG_DATA_HOME/ptm/ptm.log` (default:
-`~/.local/share/ptm/ptm.log`) with a UTC timestamp:
+`src/log.rs` is shared by `ptm` and `md`: `ptm` writes
+`$XDG_DATA_HOME/ptm/ptm.log`, `md` writes `$XDG_DATA_HOME/md/md.log` after
+calling `log::set_app_name("md")` (its `bin/md/log.rs` is a two-line wrapper).
+Both create the directory on demand, so the first message of a fresh install is
+not lost. Lines carry a UTC timestamp:
 
 ```
 2025-01-15T10:23:45Z WARN  row_to_todo: unknown todo status: "bogus" — defaulting to New
@@ -834,7 +857,8 @@ Logging failures are silently swallowed — a log call must never crash the app.
 The log file can be monitored during development with:
 
 ```bash
-tail -f ~/.local/share/ptm/ptm.log
+tail -f ~/.local/share/ptm/ptm.log   # ptm
+tail -f ~/.local/share/md/md.log     # md
 ```
 
 ---
@@ -884,3 +908,12 @@ tail -f ~/.local/share/ptm/ptm.log
   `project_list.rs`, `todo_list.rs`, and `render_todos_tab` /
   `render_updates_tab` in `project_detail.rs`). Don't render a list widget
   straight into the full content area with raw `ListItem`s.
+- **Shared files are `#[path]`-included, never copied** — `crypto.rs`,
+  `spell.rs`, `paths.rs`, `log.rs`, `ui/text.rs`, `ui/markdown.rs` and
+  `ui/theme.rs` are compiled into more than one binary. Editing a "copy" under
+  `src/bin/…` is always wrong: there is no copy, only a `mod` declaration
+  pointing back at the shared file. Each `src/bin/<x>/` directory contains
+  only what is genuinely specific to that binary (its `main.rs`, plus `md`'s
+  thin `log.rs` wrapper and `ui.rs` module tree). When adding a helper that two
+  binaries need, put it in the shared file and path-include it — a per-binary
+  reimplementation is how findings #5, #19 and #21 happened.

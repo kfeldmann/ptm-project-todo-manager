@@ -50,7 +50,7 @@ pub fn generate_key() -> Result<[u8; KEY_SIZE]> {
 /// parent directories as needed.
 pub fn write_key(key_path: &Path, key: &[u8]) -> Result<()> {
     use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
     if key.len() != KEY_SIZE {
         anyhow::bail!(
@@ -75,6 +75,17 @@ pub fn write_key(key_path: &Path, key: &[u8]) -> Result<()> {
         .mode(0o600)
         .open(key_path)
         .with_context(|| format!("Cannot write key file: {}", key_path.display()))?;
+
+    // `mode()` is only consulted when the file is *created*, so an existing
+    // key keeps whatever mode it already had — `enc keygen --force` over a
+    // 0644 file used to leave it world-readable (finding #20).  Re-assert the
+    // mode on the open descriptor rather than by path, so there is no window in
+    // which the path could be swapped for a different file.
+    f.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .with_context(|| {
+            format!("Cannot set permissions on key file: {}", key_path.display())
+        })?;
+
     f.write_all(key)
         .with_context(|| format!("Cannot write key file: {}", key_path.display()))?;
     Ok(())
@@ -210,7 +221,7 @@ mod tests {
     fn load_key_rejects_file_shorter_than_32_bytes() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("short.bin");
-        fs::write(&path, &[0u8; 16]).unwrap();
+        fs::write(&path, [0u8; 16]).unwrap();
         assert!(load_key(&path).is_err());
     }
 
@@ -218,7 +229,7 @@ mod tests {
     fn load_key_rejects_file_longer_than_32_bytes() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("long.bin");
-        fs::write(&path, &[0u8; 64]).unwrap();
+        fs::write(&path, [0u8; 64]).unwrap();
         assert!(load_key(&path).is_err());
     }
 
@@ -376,6 +387,29 @@ mod tests {
         write_key(&path, &[1u8; KEY_SIZE]).unwrap();
         write_key(&path, &[2u8; KEY_SIZE]).unwrap();
         assert_eq!(fs::read(&path).unwrap(), vec![2u8; KEY_SIZE]);
+    }
+
+    /// Finding #20: `OpenOptions::mode()` is only honoured when the file is
+    /// created, so overwriting a 0644 key with `enc keygen --force` left it
+    /// world-readable.  The mode must be re-asserted on every write.
+    #[test]
+    fn write_key_restores_owner_only_mode_when_overwriting() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("key.bin");
+
+        // Pre-create the file world-readable, as a user's `cp` or `cat >`
+        // would.
+        fs::write(&path, [0u8; KEY_SIZE]).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o644);
+
+        write_key(&path, &[7u8; KEY_SIZE]).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "overwriting must restore owner-only permissions");
+        assert_eq!(fs::read(&path).unwrap(), vec![7u8; KEY_SIZE]);
+        assert!(check_key_permissions(&path).is_ok());
     }
 
     #[test]

@@ -220,8 +220,9 @@ fn find_dict_dir() -> Option<PathBuf> {
         PathBuf::from("/usr/local/share/hunspell"),
     ];
 
-    // 3. XDG user-local path.
-    if let Some(base) = xdg_data_home() {
+    // 3. XDG user-local path (`$XDG_DATA_HOME`, else `~/.local/share`) —
+    //    `paths::data_home` is the one implementation of that lookup (#19).
+    if let Some(base) = crate::paths::data_home() {
         candidates.push(base.join("hunspell"));
     }
 
@@ -243,10 +244,3 @@ fn has_dict_files(dir: &Path) -> bool {
         && dir.join(format!("{DICT_NAME}.dic")).exists()
 }
 
-fn xdg_data_home() -> Option<PathBuf> {
-    if let Ok(v) = std::env::var("XDG_DATA_HOME") {
-        return Some(PathBuf::from(v));
-    }
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".local").join("share"))
-}

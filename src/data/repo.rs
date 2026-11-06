@@ -323,9 +323,13 @@ pub fn create_update(conn: &Connection, project_id: &str, label: &str, body: &st
     })
 }
 
-/// Reset sort_order to 1.0, 2.0, … for all updates belonging to `project_id`.
 /// Swap the `sort_order` values of two updates so that J/K always reorders
 /// within the visible list.
+///
+/// (An earlier doc comment here described a "reset sort_order to 1.0, 2.0, …"
+/// routine that does not exist — finding #22.  Updates are *prepended*, so the
+/// sort order of a project's updates runs `0, -1, -2, …`; see
+/// `create_update`.)
 pub fn swap_update_order(conn: &Connection, id_a: &str, id_b: &str) -> Result<()> {
     let order_a: f64 = conn.query_row(
         "SELECT sort_order FROM updates WHERE id = ?1", params![id_a], |r| r.get(0),

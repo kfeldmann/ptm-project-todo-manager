@@ -100,7 +100,9 @@ def write_probe(root, name, body, call):
         + schema_const()
     )
     (crate / "src/main.rs").write_text(
-        f'''#[path = "{REPO_SRC}/log.rs"]
+        f'''#[path = "{REPO_SRC}/paths.rs"]
+mod paths;
+#[path = "{REPO_SRC}/log.rs"]
 mod log;
 #[path = "{REPO_SRC}/data/mod.rs"]
 mod data;

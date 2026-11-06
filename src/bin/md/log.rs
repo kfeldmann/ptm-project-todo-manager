@@ -1,31 +1,24 @@
-//! Minimal file-based logger — mirrors ptm's log.rs but appends to
-//! `$XDG_DATA_HOME/md/md.log` instead of the ptm log file.
+//! `md`'s logger.
+//!
+//! A thin wrapper over the shared logger in `src/log.rs` (finding #21): the two
+//! files used to be near-identical copies that had already drifted.  `md` logs
+//! to `$XDG_DATA_HOME/md/md.log`; this module selects that directory once and
+//! delegates everything else.
 
-use chrono::DateTime;
-use std::io::Write as _;
-use std::path::PathBuf;
-use std::time::SystemTime;
+#[path = "../../log.rs"]
+mod shared;
 
-fn log_path() -> PathBuf {
-    let base = std::env::var("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))
-                .join(".local")
-                .join("share")
-        });
-    base.join("md").join("md.log")
+/// Point the shared logger at `md`'s data directory.
+///
+/// `main` calls this before any warning can be emitted.  [`warn`] calls it too
+/// as belt and braces: it is idempotent, and it keeps a warning emitted during
+/// startup — before `main` reaches the call — from landing in `ptm`'s log.
+pub fn init() {
+    shared::set_app_name("md");
 }
 
-/// Append a `WARN` line to the log file.  Silently swallowed — log failures
-/// must never crash the TUI.
+/// Append a `WARN` line to `md.log`.
 pub fn warn(msg: &str) {
-    let path = log_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let ts = DateTime::<chrono::Utc>::from(SystemTime::now()).format("%Y-%m-%dT%H:%M:%SZ");
-        let _ = writeln!(f, "{ts} WARN  {msg}");
-    }
+    init();
+    shared::warn(msg);
 }

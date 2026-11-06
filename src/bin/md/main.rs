@@ -21,6 +21,12 @@
 
 mod log; // ./log.rs
 
+/// Shared path helpers (path-included from the main ptm source so that the XDG
+/// data-directory lookup exists once for all four binaries — finding #19).
+#[path = "../../paths.rs"]
+#[allow(dead_code)] // shared module: each binary uses a different subset
+mod paths;
+
 /// Shared spell-checker (path-included from the main ptm source).
 /// All `crate::log::warn` calls inside it resolve to this crate's `log` module.
 #[path = "../../spell.rs"]
@@ -174,19 +180,15 @@ impl App {
 }
 
 fn user_data_dir() -> PathBuf {
-    let base = std::env::var("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))
-                .join(".local")
-                .join("share")
-        });
-    base.join("md")
+    paths::app_data_dir("md")
 }
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
+    // Before anything can log: point the shared logger at `md`'s directory.
+    log::init();
+
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 2 || args[1] == "--help" || args[1] == "-h" {
         eprintln!("Usage: md <file.md>");

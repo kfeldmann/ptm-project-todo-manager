@@ -142,11 +142,10 @@ impl Paths {
 }
 
 fn resolve_data_dir() -> PathBuf {
-    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-        return PathBuf::from(xdg).join("ptm");
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".local").join("share").join("ptm")
+    // Same helper `ptm` uses for its own database (finding #19): the two must
+    // agree on the directory or `--end` would hash and pack a different file
+    // than the one `ptm` writes.
+    paths::app_data_dir("ptm")
 }
 
 // ── Shared utilities ──────────────────────────────────────────────────────────
@@ -336,14 +335,19 @@ pub fn prompt_continue_without_pull(paths: &Paths, reason: &str) -> Result<()> {
 
 /// Install the process-wide rustls `CryptoProvider`.
 ///
-/// rustls 0.23 refuses to pick one automatically when more than one is
-/// compiled in, and both `ring` and `aws-lc-rs` reach this binary through
-/// transitive dependencies, so every process that can reach the S3 client has
-/// to install one explicitly.  Doing it in `main()` alone is not enough: the
-/// `--end` tests drive `run_end` (and therefore the TLS handshake) without
-/// going through `main`, which made one of them panic on this environment.
-/// Idempotent — a provider that is already installed wins and the error is
-/// ignored.
+/// rustls 0.23 refuses to choose a provider automatically, and this is *not*
+/// only a "two backends compiled in" problem: `attohttpc`'s `tls-rustls`
+/// feature turns on `rustls/default`, which is itself an error state for
+/// rustls's auto-detection even when the graph contains just one backend.
+/// Verified by removing this call from a single-backend build — the first
+/// handshake aborts with "Could not automatically determine the
+/// process-level CryptoProvider from Rustls crate features".
+///
+/// Cargo.toml selects the backend (see the comment there, finding #24); this
+/// only registers it.  Doing it in `main()` alone is not enough: the `--end`
+/// tests drive `run_end` (and therefore the TLS handshake) without going
+/// through `main`, which is why `S3Client::new` calls it too.  Idempotent — a
+/// provider that is already installed wins and the error is ignored.
 pub fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
@@ -656,5 +660,24 @@ mod tests {
     fn key_path_tilde_without_separator_is_literal() {
         let args = make_args("~x");
         assert_eq!(args.key_path().unwrap(), PathBuf::from("~x"));
+    }
+
+    // ── finding #19: the data directory ──────────────────────────────────────
+
+    /// `ptm-sync` must operate on the same directory `ptm` writes its database
+    /// to.  The two used to derive it from separate copies of the XDG logic
+    /// with different `$HOME` fallbacks, so a missing `$XDG_DATA_HOME` could
+    /// make `--end` hash and pack a file `ptm` never touched.
+    #[test]
+    fn data_dir_matches_ptms_data_dir() {
+        let expected = paths::app_data_dir("ptm");
+        assert_eq!(resolve_data_dir(), expected);
+        // And `Paths::new` puts every file under it.
+        let paths = Paths::new().unwrap();
+        assert_eq!(paths.data_dir, expected);
+        assert_eq!(paths.db, expected.join("ptm.db"));
+        assert_eq!(paths.db_hash, expected.join(".db_hash"));
+        assert_eq!(paths.needs_push, expected.join(".needs_push"));
+        assert_eq!(paths.sync_log, expected.join("ptm-sync.log"));
     }
 }

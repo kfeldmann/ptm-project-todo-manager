@@ -15,16 +15,22 @@
 | **E** | DONE | Key handling & render purity | **6, 14, 15, 23** | `app.rs`, `views/project_detail.rs`, `views/overlay.rs`, `dev-harness/update-viewer.py` |
 | **F** | DONE | Data-layer correctness & perf | **10, 11** | `data/repo.rs`, `app.rs` (caller) |
 | **G** | DONE | Unicode/display-width consistency | **16, 17** | `ui/text.rs` (new), `ui/{mod,markdown}.rs`, `input/mod.rs`, `views/*.rs`, `bin/md/{main,ui}.rs` |
-| **H** | | Dedup, permissions, docs sweep | **18, 19, 20, 21, 22, 24** | `app.rs`, `crypto.rs`, `log.rs`, `bin/md/log.rs`, `Cargo.toml`, `AGENTS.md` |
+| **H** | DONE | Dedup, permissions, docs sweep | **18, 19, 20, 21, 22, 24** | `app.rs`, `crypto.rs`, `log.rs`, `bin/md/log.rs`, `paths.rs`, `bin/{md,ptm_sync}/main.rs`, `data/repo.rs`, `ui/views/{overlay,project_detail}.rs`, `Cargo.toml`, `AGENTS.md`, `dev-harness/query-count.py` |
 
 ## Status at the time of writing
+
+> **This section describes the starting state**, before session A. The
+> per-session sections under §Completed Session log carry the current numbers.
 
 - `cargo test --all-targets` → **651 tests, 0 failures** (37 + 145 + 337 + 132
   after session G; the starting point was 408 = 36 + 82 + 214 + 76).
   (After session D: **478**, all green. After session E: **495**, i.e. 37 + 82 + 244 + 132.
   After session F: **517**, i.e. 37 + 82 + 266 + 132. After session G: **651**,
-  i.e. 37 + 145 + 337 + 132, with 2 ignored.)
-- `cargo check --all-targets` clean.
+  i.e. 37 + 145 + 337 + 132, with 2 ignored. After session H: **679**,
+  i.e. 41 + 153 + 346 + 139, with 14 ignored — the ignored ones are child
+  processes spawned by their parent test, so the count is not a regression.)
+- `cargo check --all-targets` clean, and `cargo clippy --all-targets` at
+  **zero warnings** as of session H (it was 32 when the review was written).
 - All 24 findings are still live at the lines the review cites.
 - **15 of the findings have been reproduced by the harnesses in `dev-harness/`**
   (#1b, #1c, #2, #3, #4, #5, #7, #8, #9, #12, #13, #16, #17).
@@ -542,6 +548,97 @@ different ways", so the fix is one shared module rather than a patch per view.
   are the pre-existing set in `markdown.rs`, `crypto.rs`, `merge.rs` and
   `archive.rs` that session H owns.
 
+### H — Dedup, permissions, docs sweep — **done**
+
+Findings #18, #19, #20, #21 and #22 fixed; #24 measured and **documented as a
+known cost** rather than changed.  Clippy is now at zero warnings.
+
+- **#19 — one XDG lookup.**  There were four copies with three different
+  `$HOME` fallbacks (`.` in `app.rs` and `log.rs`, an error in `paths.rs`, a
+  silent skip in `spell.rs`), so `ptm` and `ptm-sync` could disagree about
+  where the database lives — fatal for `ptm-sync`, which hashes and packs the
+  file `ptm` writes.  `src/paths.rs` now owns `data_home` / `app_data_dir` /
+  `optional_app_data_dir` / `app_data_file`, and all four binaries use it
+  (`md` path-includes `paths.rs` now too).  Two deliberate asymmetries, both
+  documented in the file: `app_data_dir` falls back to `./.local/share` because
+  a TUI with nowhere to put its database is worse than one in an odd directory,
+  while `expand_tilde` still errors because a private key must not land in `.`.
+  A relative `$XDG_DATA_HOME` is ignored per the spec.
+- **#21 — one logger.**  `src/log.rs` is now the only implementation; `md`
+  path-includes it and selects its directory with `set_app_name("md")`, so
+  `bin/md/log.rs` is a five-line wrapper.  The two copies had already drifted:
+  only `md`'s created the log directory, so `ptm` silently dropped the first
+  warning of a fresh install.  `warn` now creates the directory on demand for
+  both.
+- **#20 — `write_key` re-asserts `0600`.**  `OpenOptions::mode()` only applies
+  at creation, so `enc keygen --force` over a `0644` key left it world-readable.
+  The mode is now re-applied with `File::set_permissions` on the open
+  descriptor (not by path, so there is no swap window).  The regression test
+  fails on the old code (`left: 420, right: 384`).
+- **#18 — the status cycle is documented.**  Both Key Help rows now read
+  `Cycle status: New → In Progress → Done → Canceled → New`, so nobody has to
+  press `s` three times to discover the order.
+- **#22 — stale comments and docs.**  `repo.rs`'s `swap_update_order` no longer
+  claims to reset sort orders (it swaps two; updates are prepended, so a group
+  runs `0, -1, -2, …`); `project_detail.rs`'s misplaced `current_marker` doc
+  now sits on `current_match` and explains the n/N contract; the three mid-file
+  `use` blocks in that file are hoisted to the top.  **`AGENTS.md` now matches
+  the tree**: `reference_library.rs` (which never existed) is gone, `tz.rs`
+  (which did exist) is listed, `input/mod.rs` is described as implemented, and
+  the shared-file rule is spelled out as a gotcha.  A new test,
+  `docs_tests::agents_md_tree_matches_the_source_tree`, parses the tree out of
+  `AGENTS.md` and diffs it against `src/`, so the next drift fails `cargo test`
+  instead of misdirecting a session.  It was confirmed to fail on the
+  `reference_library.rs` line.
+- **#24 — the duplicate crypto backend: measured, not changed.**  Two candidate
+  fixes were implemented and tested; both are worse than the status quo, so the
+  finding is now a documented decision in `Cargo.toml` and on
+  `install_crypto_provider`:
+  - *Keep `aws_lc_rs`, drop `ring`*: one backend, a 7 MB smaller binary,
+    verified against real S3 (a 403 from `head_object`, i.e. a completed
+    handshake).  Rejected because `aws-lc-sys` is C and needs cmake/nasm/perl,
+    which `build/Dockerfile*` does not install — it would break the macOS
+    zigbuild and musl cross-builds.
+  - *rust-s3 0.38 + `aws-creds/rustls-tls-ring`*: `cargo tree -i aws-lc-sys`
+    reports nothing.  Rejected because attohttpc 0.30.1 only understands
+    `__rustls`, not `__rustls-ring`, so the build silently compiles **TLS
+    out** — `head_object` fails with "TLS is disabled, activate one of the
+    tls- features", which is a silent production downgrade dressed as a fix.
+  - What *is* fixed is the panic: a test now pins that the provider is
+    installed before credentials are read, so a broken `~/.aws/credentials`
+    surfaces as an AWS error rather than a rustls abort.  The comment also
+    corrects a claim inherited from session G: the install is needed even with
+    a single backend, because `rustls/default` (via attohttpc) disables
+    rustls's auto-detection.  Verified by removing the call from a
+    single-backend build.
+- **Clippy to zero.**  The `--fix`-able set is applied by hand (redundant
+  closures in `markdown.rs`, `map_or` → `is_some_and` in `archive.rs` /
+  `merge.rs`, `mem::replace` → `mem::take`, a useless `anyhow::Error::from`,
+  needless borrows in `crypto.rs` tests).  The `md` build's seven "field is
+  never read" warnings for `Theme` are an `#[allow(dead_code)]` on the
+  path-include with a comment: `md` constructs a `Theme` because the markdown
+  renderer takes one, but reads none of it.
+- Tests: 651 → **679**, all green (41 + 153 + 346 + 139, 14 ignored — the
+  ignored ones are child processes their parent spawns, the same pattern
+  `paths.rs` already used for `$HOME`).  New coverage: the XDG lookup's three
+  cases (`$XDG_DATA_HOME` wins, relative is ignored, neither variable set),
+  `ptm`/`ptm-sync` agreeing on the data dir, `md` logging under `md/` and
+  creating the directory, `write_key` restoring `0600`, the provider being
+  installed before credentials are read, and the `AGENTS.md` tree check.
+  Every fix's test was confirmed to fail against the unfixed code.
+- Harnesses: **all 10 clean**.  `query-count.py` needed one line — its scratch
+  crate mirrors the module tree and now has to include `paths.rs`, because
+  `log.rs` depends on it.  That is the harness tracking a real source change,
+  not a check being weakened.
+- `s3-roundtrip.py` **skips** in this container: the `/etc/hosts` entry the
+  plan documents (`127.0.0.1  b.ptm-harness.localhost`) is host state and does
+  not survive a container rebuild.  The TLS path was therefore verified
+  directly instead: a scratch crate with the same `rust-s3` + provider setup
+  completes a real handshake against S3 (403 for bogus credentials), and a
+  probe with no provider installed reproduces the rustls abort — which is what
+  makes the `install_crypto_provider` comment's claim checkable rather than
+  asserted.
+
 ---
 
 ## Grouping principle
@@ -713,8 +810,18 @@ rather than repairing it, and it needs justifying in the commit message.
   that were genuinely wrong (`format!("{:<w$}")` label padding, the byte-sized
   group rule) are fixed as well, because "one shared width-aware helper used
   everywhere" is the exit criterion, not "the two cited functions".
-- **H** — `cargo clippy --all-targets` at zero warnings; AGENTS.md tree matches
-  `src/`.
+- **H** — *met.* `cargo clippy --all-targets` at **zero** warnings (from 32);
+  the AGENTS.md tree matches `src/` and is now **enforced** by a test rather
+  than by review — `docs_tests::agents_md_tree_matches_the_source_tree`
+  parses the tree block and diffs it against the filesystem, so a stale line
+  fails `cargo test`.  #19/#21 are met by deletion rather than by a rule:
+  there is one XDG lookup and one logger, and the three copies each replaced
+  are gone.  #20's `0600` re-assert is tested by creating a `0644` key and
+  overwriting it.  #24 is closed as a **documented decision**, not a code
+  change: both available fixes were implemented and measured, and both are
+  worse (one adds a C toolchain to the cross-build images; the other silently
+  compiles TLS out), so the finding is recorded in `Cargo.toml` with the
+  measurements and the panic is covered by a test instead.
 
 ## Findings that need correcting first
 
@@ -795,8 +902,9 @@ parses to `Region::Custom` (any unrecognised string does), giving
 The fake server in `dev-harness/lib/fakes3.py` handles HEAD/GET/PUT.
 `HOSTALIASES` is not a substitute — glibc ignores it for names containing dots.
 
-**Status: the entry is in place and `s3-roundtrip.py` passes 12/12** against
-the current tree. It verifies:
+**Status: with the entry present `s3-roundtrip.py` passes 12/12**; in a
+container that has been rebuilt since (the current one) it prints `SKIP` with
+the line to re-add.  It verifies:
 
 - `--end` uploads and records the ETag;
 - a second `--end` with nothing changed does not re-upload;
@@ -851,6 +959,12 @@ any finding.
 | 15 | — | PASS — fixed in E (unit test; no external symptom) |
 | 16 | `width-display.py` | PASS — fixed in G (columns everywhere) |
 | 17 | `search-highlight.py` | PASS — fixed in G (shared matcher) |
-| 2, 3, 1c (partial) | `s3-roundtrip.py` | **12/12 passing** (happy path; #1c race not asserted — see above) |
+| 2, 3, 1c (partial) | `s3-roundtrip.py` | 12/12 when the `/etc/hosts` entry is present; **skips** in a rebuilt container (happy path; #1c race not asserted — see above) |
 | 2 (exit code) | `sync-state.py`, `wal-safety.py` | PASS — fixed in A, marker added in B |
-| 18–24 | — | polish / docs (23 fixed in E) |
+| 18 | — | documented (Key Help names the cycle order) |
+| 19 | — | fixed in H (one XDG lookup in `paths.rs`; unit-tested) |
+| 20 | — | fixed in H (`write_key` re-asserts `0600`; unit-tested) |
+| 21 | — | fixed in H (one logger; `md` path-includes it) |
+| 22 | — | fixed in H (comments + AGENTS.md tree; drift is now a test failure) |
+| 23 | `update-viewer.py` | PASS — fixed in E |
+| 24 | — | documented in H, not changed (both fixes measured and rejected) |

@@ -1,5 +1,11 @@
 /// Colour palette — shared from the main ptm source.
+///
+/// `md` builds a `Theme` (the markdown renderer takes one) but does not read
+/// any of its fields: `markdown.rs` styles with its own `Style` constants.  The
+/// allow keeps that honest instead of reporting seven "field is never read"
+/// warnings per `md` build; the fields *are* read by `ptm`.
 #[path = "../../ui/theme.rs"]
+#[allow(dead_code)]
 pub mod theme;
 
 /// Markdown → ratatui renderer — shared from the main ptm source.

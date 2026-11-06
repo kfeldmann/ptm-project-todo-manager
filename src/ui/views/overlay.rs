@@ -493,7 +493,7 @@ fn key_help_lines(desc_width: usize) -> Vec<Line<'static>> {
     row!("t/d/u/f", "Switch tabs");
     row!("T",       "Tag editor  (r:rename tag)");
     row!("e / n",   "Edit todo title inline (or the description in $EDITOR in the Description tab)");
-    row!("s",       "Cycle todo status");
+    row!("s",       "Cycle todo status: New → In Progress → Done → Canceled → New");
     row!("S",       "Spell check selected item (todo / update / description)");
     row!("r",       "Set / clear reminder");
     row!("m",       "Move todo to project");
@@ -521,7 +521,7 @@ fn key_help_lines(desc_width: usize) -> Vec<Line<'static>> {
     section!(" TODO LIST");
     row!("j / k",   "Move cursor");
     row!("J / K",   "Reorder todo");
-    row!("s",       "Cycle status");
+    row!("s",       "Cycle status: New → In Progress → Done → Canceled → New");
     row!("S",       "Spell check selected todo");
     row!("e",       "Edit todo inline");
     row!("r",       "Set / clear reminder");

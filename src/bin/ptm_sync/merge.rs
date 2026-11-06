@@ -316,8 +316,8 @@ fn rotate_premerge_snapshots(backup_dir: &Path, keep: usize) -> Result<()> {
         .map(|e| e.path())
         .filter(|p| {
             p.file_name()
-                .map_or(false, |n| n.to_string_lossy().starts_with("ptm-premerge-"))
-                && p.extension().map_or(false, |x| x == "db")
+                .is_some_and(|n| n.to_string_lossy().starts_with("ptm-premerge-"))
+                && p.extension().is_some_and(|x| x == "db")
         })
         .collect();
     snapshots.sort();
@@ -441,7 +441,7 @@ fn merge_dbs(local_db: &Path, src_db: &Path) -> Result<MergeStats> {
         .context("Failed to begin merge transaction")?;
     if let Err(e) = merge_content(&conn, &mut stats) {
         let _ = conn.execute_batch("ROLLBACK;");
-        return Err(anyhow::Error::from(e).context("Merge failed; transaction rolled back"));
+        return Err(e.context("Merge failed; transaction rolled back"));
     }
     conn.execute_batch("COMMIT;").context("Commit failed")?;
 

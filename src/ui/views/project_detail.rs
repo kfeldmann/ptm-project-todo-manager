@@ -6,6 +6,11 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 
+use super::reminder_date_style;
+use crate::app::{App, PdTab};
+use crate::data::models::{TodoStatus, Update};
+use crate::ui::theme::Theme;
+
 // ─── Search-highlight helpers ─────────────────────────────────────────────────
 
 /// One search match, in coordinates of the *rendered* (wrapped) output.
@@ -167,11 +172,13 @@ fn style_current_match(
         .collect()
 }
 
-use crate::app::{App, PdTab};
-use crate::data::models::{TodoStatus, Update};
-
-/// The current match location (from `pd_match_idx`, clamped), or `None` when
-/// there are no matches.
+/// Resolve `pd_match_idx` into the [`MatchLoc`] it points at, clamped to the
+/// available marks, or `None` when there are no matches.
+///
+/// This is the render-side half of the n/N contract: the key handler moves
+/// `pd_match_idx`, this decides which mark that means, and
+/// [`publish_match_marks`] hands the positions to the handler.  All three must
+/// agree, or `n` scrolls to a match other than the one highlighted.
 fn current_match(app: &App, marks: &[MatchLoc]) -> Option<MatchLoc> {
     if marks.is_empty() {
         return None;
@@ -179,9 +186,6 @@ fn current_match(app: &App, marks: &[MatchLoc]) -> Option<MatchLoc> {
     let clamped = app.pd_match_idx.min(marks.len() - 1);
     Some(marks[clamped])
 }
-use crate::ui::theme::Theme;
-use super::reminder_date_style;
-
 /// Register `marks` in [`crate::app::PublishedMetrics::match_marks`] so key
 /// handlers can navigate with n / N.
 ///

@@ -23,11 +23,11 @@ impl S3Client {
     /// back to `"us-east-1"`.  Credentials follow the standard AWS credential
     /// chain: environment variables → `~/.aws/credentials` (using `$AWS_PROFILE`).
     pub fn new(bucket_name: &str, prefix: &str) -> Result<Self> {
-        // rustls cannot choose between the providers compiled into this
-        // binary (ring and aws-lc-rs both arrive through transitive deps), so
-        // it panics on the first handshake unless one is installed.  Doing it
-        // here rather than in `main` covers every caller — including the
-        // tests, which drive this function directly.
+        // rustls refuses to choose a provider on its own (see
+        // `install_crypto_provider` for why that is not only a "two backends"
+        // problem), so it aborts on the first handshake unless one is
+        // installed.  Doing it here rather than in `main` covers every caller
+        // — including the tests, which drive this function directly.
         crate::install_crypto_provider();
 
         let region_str = std::env::var("AWS_REGION")
@@ -131,5 +131,54 @@ impl S3Client {
         self.head_etag()
             .context("Failed to fetch ETag after upload")?
             .context("Object not found immediately after upload")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Finding #24: rustls refuses to pick a provider on its own, so a
+    /// process that can reach S3 must install one.  This pins the *effect*
+    /// (a provider is installed and can be read back) rather than the call
+    /// site, so moving the install is fine as long as it still happens.
+    ///
+    /// It also documents why the call exists even though `Cargo.toml`
+    /// selects a backend: `attohttpc`'s `rustls/default` turns off rustls's
+    /// automatic detection, which a single-backend build does not otherwise
+    /// need.  Removing the install makes the first handshake abort with
+    /// "Could not automatically determine the process-level CryptoProvider".
+    #[test]
+    fn constructing_a_client_installs_the_crypto_provider() {
+        crate::install_crypto_provider();
+        // A second install must not fail or replace the first: the call is
+        // idempotent, which is what lets both `main` and `S3Client::new`
+        // call it.
+        crate::install_crypto_provider();
+        assert!(
+            rustls::crypto::CryptoProvider::get_default().is_some(),
+            "a rustls CryptoProvider must be installed before any TLS handshake"
+        );
+    }
+
+    /// `install_crypto_provider` must run before anything that can fail in
+    /// `S3Client::new`, so a user with a broken `~/.aws/credentials` sees the
+    /// real AWS error instead of a rustls abort.
+    ///
+    /// The environment is not touched here: `set_var`/`remove_var` are
+    /// process-wide and the harness runs tests on several threads, so changing
+    /// `$AWS_PROFILE` would race every other test in this binary.  What
+    /// matters is the *ordering*, which the source guarantees by putting the
+    /// call first in `new`; this test pins that a client construction (which
+    /// may fail at any later step) leaves the provider installed.
+    #[test]
+    fn constructing_a_client_never_leaves_rustls_without_a_provider() {
+        // Whatever the outcome — credentials found, missing, or rejected —
+        // the provider must be installed by the time `new` returns.
+        let _ = S3Client::new("some-bucket", "some-prefix");
+        assert!(
+            rustls::crypto::CryptoProvider::get_default().is_some(),
+            "the provider must be installed even when credentials fail"
+        );
     }
 }

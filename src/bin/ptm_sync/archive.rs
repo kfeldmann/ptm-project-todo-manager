@@ -113,7 +113,7 @@ pub fn rotate_local_backups(dir: &Path, keep: usize) -> Result<()> {
         .with_context(|| format!("Cannot read local-backups dir: {}", dir.display()))?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |ext| ext == "zip"))
+        .filter(|p| p.extension().is_some_and(|ext| ext == "zip"))
         .collect();
 
     entries.sort(); // lexicographic order = chronological for our filenames
@@ -295,7 +295,7 @@ mod tests {
         let zip_count = fs::read_dir(&backup_dir)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |x| x == "zip"))
+            .filter(|e| e.path().extension().is_some_and(|x| x == "zip"))
             .count();
         assert_eq!(zip_count, 4);
     }

@@ -28,6 +28,31 @@ uuid = { version = "1.26.0", features = ["v4"] }
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 anyhow = "1.0"
 clap = { version = "4.6", features = ["derive"] }
+# TLS stack for ptm-sync.
+#
+# `sync-rustls-tls` reaches `rustls` through attohttpc, and its `tls-rustls`
+# feature enables `rustls/default`, whose backend is `aws-lc-rs`. That makes
+# `aws-lc-sys` (a C library needing cmake, nasm and perl) compile alongside our
+# pure-Rust `ring` in every cross-build, and leaves rustls with two providers
+# compiled in — which is why `ptm_sync::install_crypto_provider` must install
+# one explicitly rather than relying on auto-detection (finding #24).
+#
+# This is a known, measured cost, not an oversight; the two fixes available
+# today are both worse:
+#
+#   * Drop `ring`, keep `aws_lc_rs`.  Single backend, ~7 MB smaller binary,
+#     verified working against real S3 — but it puts a cmake/nasm/perl build
+#     of aws-lc-sys into the Docker cross-build images (build/Dockerfile*),
+#     which currently install only a C toolchain.
+#   * Upgrade to rust-s3 0.38 + `aws-creds/rustls-tls-ring`, which selects
+#     `ring` through a new `__rustls-ring` feature.  `cargo tree -i
+#     aws-lc-sys` then reports nothing, but attohttpc 0.30.1 only recognises
+#     `__rustls`, so TLS ends up *disabled* — `head_object` fails with "TLS
+#     is disabled, activate one of the tls- features" rather than a handshake
+#     error, which would be a silent downgrade in production.
+#
+# Revisit when attohttpc (>= 0.32) understands `__rustls-ring` through the
+# rust-s3 dependency chain, or when the build images gain cmake/nasm/perl.
 rust-s3 = { version = "0.37", default-features = false, features = ["sync-rustls-tls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std"] }
 zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }

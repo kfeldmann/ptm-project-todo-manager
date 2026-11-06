@@ -268,7 +268,7 @@ impl Ctx {
             let pfx   = self.bq_prefix();
             let style = self.blockquote_style;
             // Avoid double bar-only lines.
-            let already = self.output.last().map_or(false, |l| {
+            let already = self.output.last().is_some_and(|l| {
                 l.spans.len() == 1 && l.spans[0].content.as_ref() == pfx.as_str()
             });
             if !already {
@@ -293,7 +293,7 @@ impl Ctx {
         let tokens     = std::mem::take(&mut self.tokens);
         let first_pfx  = std::mem::take(&mut self.first_pfx);
         let cont_pfx   = std::mem::take(&mut self.cont_pfx);
-        let line_style = std::mem::replace(&mut self.line_style, Style::default());
+        let line_style = std::mem::take(&mut self.line_style);
 
         self.output.extend(reflow(&tokens, self.width, &first_pfx, &cont_pfx, line_style));
     }
@@ -1555,7 +1555,7 @@ mod tests {
 
     /// Collect every `line_text` into one big string joined by `\n`.
     fn all_text(lines: &[Line<'static>]) -> String {
-        lines.iter().map(|l| line_text(l)).collect::<Vec<_>>().join("\n")
+        lines.iter().map(line_text).collect::<Vec<_>>().join("\n")
     }
 
     // ── word_wrap_cell ─────────────────────────────────────────────────────────
@@ -2093,7 +2093,7 @@ mod tests {
         // Verify neither "1" followed by "0" on the very next content row
         // (a crude check that '10' wasn't split).
         let content: Vec<String> = lines.iter()
-            .map(|l| line_text(l))
+            .map(line_text)
             .filter(|t| !t.trim().is_empty())
             .collect();
         for pair in content.windows(2) {
@@ -2289,7 +2289,7 @@ mod tests {
         let md = "| A |\n| -- |\n| one<br>two |";
         let lines = render_markdown(md, 80, &theme());
         let cell_rows: Vec<String> = lines.iter()
-            .map(|l| line_text(l))
+            .map(line_text)
             .filter(|t| t.contains('│'))
             .collect();
         assert!(cell_rows.iter().any(|t| t.contains("one")), "{:?}", cell_rows);
@@ -2332,7 +2332,7 @@ mod tests {
         let md = "| A |\n| -- |\n| - outer<br>  - inner |";
         let lines = render_markdown(md, 60, &theme());
         let row = |needle: &str| -> String {
-            lines.iter().map(|l| line_text(l))
+            lines.iter().map(line_text)
                 .find(|t| t.contains(needle))
                 .unwrap_or_else(|| panic!("no row with {:?}", needle))
         };
@@ -2413,7 +2413,7 @@ mod tests {
         let md = "| A | B |\n| -- | -- |\n| one<br>two<br>three | x |";
         let lines = render_markdown(md, 80, &theme());
         let content_rows = lines.iter()
-            .map(|l| line_text(l))
+            .map(line_text)
             .filter(|t| t.contains('│') && (t.contains("one") || t.contains("two") || t.contains("three") || t.contains(" x ")))
             .count();
         assert_eq!(content_rows, 3, "row should be 3 lines tall");

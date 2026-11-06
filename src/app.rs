@@ -315,14 +315,7 @@ pub struct App {
 }
 
 fn data_path() -> PathBuf {
-    let base = std::env::var("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))
-                .join(".local")
-                .join("share")
-        });
-    base.join("ptm").join("ptm.db")
+    crate::paths::app_data_file("ptm", "ptm.db")
 }
 
 impl App {

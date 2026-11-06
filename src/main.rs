@@ -2,6 +2,7 @@ mod app;
 mod data;
 mod input;
 mod log;
+mod paths;
 mod spell;
 mod tz;
 mod ui;
@@ -138,4 +139,109 @@ fn suspend_and_edit(
     term.clear()?;
 
     Ok(Some(result.trim_end_matches('\n').to_string()))
+}
+
+#[cfg(test)]
+mod docs_tests {
+    //! Guards the `AGENTS.md` repository tree against drift (finding #22).
+    //!
+    //! The documented tree had grown a file that does not exist
+    //! (`ui/views/reference_library.rs`) and lost one that does (`tz.rs`), and
+    //! described `input/mod.rs` as a placeholder when it is fully implemented.
+    //! A layout section that lies is worse than none: it is the map a future
+    //! session navigates by.  This test parses the tree out of `AGENTS.md` and
+    //! compares it with what is on disk, so the next drift fails the build
+    //! instead of misdirecting someone.
+
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    /// Parse the fenced tree block under `## Repository Layout`.
+    ///
+    /// Returns the set of paths it names (relative to the repo root) that look
+    /// like files — i.e. that carry an extension or are `main.rs`-style leaves.
+    /// Directories are skipped: they are implied by their children, and the
+    /// tree draws them with a trailing `/`.
+    fn documented_files() -> BTreeSet<PathBuf> {
+        let agents = include_str!("../AGENTS.md");
+        let start = agents
+            .find("## Repository Layout")
+            .expect("AGENTS.md must have a 'Repository Layout' section");
+        let section = &agents[start..];
+        let open = section.find("```").expect("the layout section must have a code block") + 3;
+        let close = section[open..]
+            .find("```")
+            .expect("the layout code block must be closed");
+        let block = &section[open..open + close];
+
+        let mut stack: Vec<String> = Vec::new();
+        let mut files = BTreeSet::new();
+        for line in block.lines() {
+            // A tree row looks like `│   ├── name.rs    — description`; the
+            // indentation before the connector gives the depth.
+            let Some(conn_pos) = line.find("── ") else { continue };
+            let prefix = &line[..conn_pos];
+            if !prefix.chars().all(|c| c == '│' || c == ' ' || c == '├' || c == '└') {
+                continue;
+            }
+            // Four columns per level; the connector itself is the last level's
+            // marker, so the depth is the indentation divided by four.
+            let depth = prefix.len() / 4;
+            let rest = &line[conn_pos + "── ".len()..];
+            let name = rest.split_whitespace().next().unwrap_or("");
+            if name.is_empty() {
+                continue;
+            }
+            stack.truncate(depth);
+            if name.ends_with('/') {
+                stack.push(name.trim_end_matches('/').to_string());
+            } else {
+                let mut path = PathBuf::from("src");
+                for part in &stack {
+                    path.push(part);
+                }
+                path.push(name);
+                files.insert(path);
+            }
+        }
+        files
+    }
+
+    /// Every `.rs` file under `root`, as paths relative to the repo root (so
+    /// they compare directly with [`documented_files`]).
+    fn actual_files(root: &Path, dir: &Path, out: &mut BTreeSet<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                actual_files(root, &path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                if let Ok(rel) = path.strip_prefix(root) {
+                    out.insert(rel.to_path_buf());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn agents_md_tree_matches_the_source_tree() {
+        let documented = documented_files();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut actual = BTreeSet::new();
+        actual_files(root, &root.join("src"), &mut actual);
+
+        let missing: Vec<_> = documented.difference(&actual).collect();
+        let undocumented: Vec<_> = actual.difference(&documented).collect();
+
+        assert!(
+            missing.is_empty(),
+            "AGENTS.md documents files that do not exist:\n{:#?}",
+            missing
+        );
+        assert!(
+            undocumented.is_empty(),
+            "AGENTS.md does not document these files:\n{:#?}",
+            undocumented
+        );
+    }
 }
