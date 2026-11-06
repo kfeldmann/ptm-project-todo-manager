@@ -43,6 +43,7 @@ PROFILE = os.environ.get("PTM_PROFILE", "debug")
 results = ptmdb.Results("panics")
 
 OVERLAY = ptmdb.REPO / "src/ui/views/overlay.rs"
+TEXT_SRC = ptmdb.REPO / "src/ui/text.rs"
 VIEWS_MOD = ptmdb.REPO / "src/ui/views/mod.rs"
 
 
@@ -111,19 +112,59 @@ impl<'a> Span<'a> {
 '''
 
 
+# The extracted code refers to the shared helpers as `crate::ui::text::…`, so
+# the probe crate has to provide that path.  `src/ui/text.rs` is path-included
+# unchanged — the same file the binaries compile.
+CRATE_PRELUDE = '''
+pub mod ui {
+    pub mod text {
+        #[path = "TEXT_SRC_PLACEHOLDER"]
+        mod text_impl;
+        pub use text_impl::*;
+    }
+}
+'''
+
+
 def compile_and_run(root, name, body, call):
-    """Compile `STUBS + body + main` and run it; return (ok, stdout, stderr)."""
-    src = root / f"{name}.rs"
-    src.write_text(f"{STUBS}\n{body}\nfn main() {{\n{call}\n}}\n")
-    exe = root / name
+    """Build `STUBS + body + main` in a scratch cargo crate and run it.
+
+    A scratch crate rather than a bare `rustc` call: the extracted code calls
+    into `crate::ui::text`, which needs `unicode-width`, and letting cargo
+    resolve that keeps the probe on the same compiler and dependency build as
+    the binaries.  `CARGO_TARGET_DIR` points at the workspace's own `target/`
+    so nothing is rebuilt.
+
+    Returns (ok, stdout, stderr).
+    """
+    crate = root / f"probe_{name}"
+    (crate / "src").mkdir(parents=True, exist_ok=True)
+    prelude = CRATE_PRELUDE.replace("TEXT_SRC_PLACEHOLDER", str(TEXT_SRC))
+    (crate / "src/main.rs").write_text(
+        f"{prelude}\n{STUBS}\n{body}\nfn main() {{\n{call}\n}}\n"
+    )
+    (crate / "Cargo.toml").write_text(
+        f'''[package]
+name = "probe_{name}"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+unicode-width = "0.2"
+
+[[bin]]
+name = "probe_{name}"
+path = "src/main.rs"
+'''
+    )
+    env = dict(os.environ, CARGO_TARGET_DIR=str(ptmdb.REPO / "target"))
     cp = subprocess.run(
-        ["rustc", "--edition", "2021", "-O", "-o", str(exe), str(src)],
-        capture_output=True, text=True,
+        ["cargo", "run", "--quiet", "--manifest-path", str(crate / "Cargo.toml")],
+        capture_output=True, text=True, env=env, timeout=600,
     )
     if cp.returncode != 0:
-        return False, "", cp.stderr[-1500:]
-    out = subprocess.run([str(exe)], capture_output=True, text=True)
-    return True, out.stdout, out.stderr
+        return False, cp.stdout, cp.stderr[-1500:]
+    return True, cp.stdout, cp.stderr
 
 
 # ── #4: key-help wrapping at narrow widths ───────────────────────────────────

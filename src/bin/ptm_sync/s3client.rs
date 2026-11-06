@@ -23,6 +23,13 @@ impl S3Client {
     /// back to `"us-east-1"`.  Credentials follow the standard AWS credential
     /// chain: environment variables → `~/.aws/credentials` (using `$AWS_PROFILE`).
     pub fn new(bucket_name: &str, prefix: &str) -> Result<Self> {
+        // rustls cannot choose between the providers compiled into this
+        // binary (ring and aws-lc-rs both arrive through transitive deps), so
+        // it panics on the first handshake unless one is installed.  Doing it
+        // here rather than in `main` covers every caller — including the
+        // tests, which drive this function directly.
+        crate::install_crypto_provider();
+
         let region_str = std::env::var("AWS_REGION")
             .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
             .unwrap_or_else(|_| "us-east-1".to_string());

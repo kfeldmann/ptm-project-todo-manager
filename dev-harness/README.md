@@ -82,6 +82,7 @@ the `/etc/hosts` entry, which is host state — `s3-roundtrip.py` will print
 | `update-viewer.py` | 6, 23 | drives the real TUI in a pty and asserts that universal keys (`d`, `E`) work inside the update viewer |
 | `keyhelp-widths.py` | 4 | exhaustive width sweep over the real `key_help_lines()` strings |
 | `search-highlight.py` | 17 | `split_span` index drift under case-folding |
+| `width-display.py` | 16 | wrapping/padding/hint height measured in chars instead of columns |
 | `query-count.py` | 10, 11 | statement counts for `list_projects` / `list_todos_global` (N+1), and `rename_tag` swallowing a failed collision probe |
 | `s3-roundtrip.py` | 2, 3, 1c (partial) | true `--end`/`--start` round trip (needs the hosts entry below) |
 
@@ -108,6 +109,26 @@ different runs (once the pull was discarded, once it survived). A flaky
 assertion is worse than none. The deterministic reproduction is in
 `wal-safety.py`, which stages the exact state — stale `-wal` plus busy
 checkpoint plus rename — rather than racing for it.
+
+## What `width-display.py` and `search-highlight.py` assert, and why
+
+Both findings live in pure functions, so the tempting harness is a Python
+reimplementation of the algorithm. That is useless in both directions: the
+copy keeps failing after the source is fixed (so it cannot confirm a fix) and
+keeps passing if the fix is later reverted (so it cannot guard one).
+
+Both harnesses therefore compile the **real** `src/ui/text.rs` (path-included
+into a scratch cargo crate, so `unicode-width` resolves against the same build
+as the binaries) and assert on its output. `search-highlight.py` additionally
+keeps a companion check that the *legacy* algorithm still mis-highlights the
+same fixtures, and greps both call sites for the lowercased-offset pattern, so
+a re-introduced copy of the old matcher is caught even if the shared helper
+survives.
+
+`panics.py`'s #4 check works the same way (it extracts `wrap_key_row` textually
+from `overlay.rs`), which is why it too builds through a scratch crate: the
+extracted code calls `crate::ui::text`, and a bare `rustc` invocation has no
+`crate::` root to resolve it against.
 
 ## What `wal-safety.py` asserts, and why it is shaped that way
 

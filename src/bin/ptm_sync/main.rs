@@ -334,11 +334,22 @@ pub fn prompt_continue_without_pull(paths: &Paths, reason: &str) -> Result<()> {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-fn main() {
-    // rustls 0.23 requires an explicit CryptoProvider when more than one is
-    // compiled in (ring + aws-lc-rs can both appear via transitive deps).
-    // Install ring unconditionally; ignore the error if one is already set.
+/// Install the process-wide rustls `CryptoProvider`.
+///
+/// rustls 0.23 refuses to pick one automatically when more than one is
+/// compiled in, and both `ring` and `aws-lc-rs` reach this binary through
+/// transitive dependencies, so every process that can reach the S3 client has
+/// to install one explicitly.  Doing it in `main()` alone is not enough: the
+/// `--end` tests drive `run_end` (and therefore the TLS handshake) without
+/// going through `main`, which made one of them panic on this environment.
+/// Idempotent — a provider that is already installed wins and the error is
+/// ignored.
+pub fn install_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+fn main() {
+    install_crypto_provider();
 
     let args = Args::parse();
 

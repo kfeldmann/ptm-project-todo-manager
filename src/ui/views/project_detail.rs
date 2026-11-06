@@ -57,46 +57,25 @@ fn split_span(
     if text.is_empty() || lower_query.is_empty() {
         return vec![Span::styled(text, base)];
     }
-    let text_chars: Vec<char> = text.chars().collect();
-    let lower_text: Vec<char> = text.to_lowercase().chars().collect();
-    let qlen = lower_query.len();
-    let tlen = text_chars.len();
 
     let fallback = &mut 0usize;
     let occ_counter: &mut usize = next_occ.unwrap_or(fallback);
 
+    // The matching lives in `ui::text::split_matches`, which maps a
+    // case-folded match back onto whole characters of the original text.
+    // Using lowercased offsets directly against the original (as this used to)
+    // mis-highlights whenever folding changes the length — `'İ'` lowercases to
+    // two chars, so searching `İ` in `İstanbul` highlighted `İs` (finding #17).
     let mut out: Vec<Span<'static>> = Vec::new();
-    let mut i = 0usize;
-    let mut seg = 0usize;
-    while i + qlen <= tlen {
-        if lower_text[i..i + qlen] == *lower_query {
-            if i > seg {
-                out.push(Span::styled(
-                    text_chars[seg..i].iter().collect::<String>(),
-                    base,
-                ));
-            }
+    for (seg, is_match) in crate::ui::text::split_matches(&text, lower_query) {
+        if is_match {
             let is_current = current == Some(MatchLoc { line: this_line, occ: *occ_counter });
             let style = if is_current { current_style } else { other_style };
-            out.push(Span::styled(
-                text_chars[i..i + qlen].iter().collect::<String>(),
-                style,
-            ));
+            out.push(Span::styled(seg, style));
             *occ_counter += 1;
-            seg = i + qlen;
-            i = seg;
         } else {
-            i += 1;
+            out.push(Span::styled(seg, base));
         }
-    }
-    if seg < tlen {
-        out.push(Span::styled(
-            text_chars[seg..].iter().collect::<String>(),
-            base,
-        ));
-    }
-    if out.is_empty() {
-        out.push(Span::styled(text_chars.iter().collect::<String>(), base));
     }
     out
 }
@@ -493,27 +472,27 @@ fn update_content_lines(
         .map(|i| {
             let label_part = label_lines.get(i).map(|s| s.as_str()).unwrap_or("");
             let body_part  = body_lines.get(i).map(|s| s.as_str()).unwrap_or("");
-            let padded     = format!("{:<width$}", label_part, width = DATE_COL_WIDTH);
+            // Pad by display columns, not characters: a label containing wide
+            // text would otherwise push the body column out of alignment
+            // (finding #16).
+            let padded     = super::pad_to_width(label_part, DATE_COL_WIDTH);
             let date_style = Style::default().fg(Color::DarkGray);
 
-            // Last visible row when truncated → end with an ellipsis.
+            // Last visible row when truncated → end with an ellipsis, which is
+            // the signal that more body text exists below.  Both the fit test
+            // and the truncation are by column, so a wide character is never
+            // split and the ellipsis always stays inside the budget.
             let body_owned: String;
             let effective_body: &str = if truncated && i + 1 == visible_rows {
-                body_owned = if body_part.is_empty() {
-                    "…".to_string()
+                if body_part.is_empty() {
+                    body_owned = "…".to_string();
+                } else if crate::ui::text::display_width(body_part) + 1 > body_width {
+                    // No room for the text plus the ellipsis: truncate to
+                    // `body_width` columns, which reserves one for the `…`.
+                    body_owned = crate::ui::text::ellipsize(body_part, body_width);
                 } else {
-                    let chars: Vec<char> = body_part.chars().collect();
-                    if chars.len() >= body_width {
-                        format!(
-                            "{}…",
-                            chars[..body_width.saturating_sub(1)]
-                                .iter()
-                                .collect::<String>()
-                        )
-                    } else {
-                        format!("{}…", body_part)
-                    }
-                };
+                    body_owned = format!("{}…", body_part);
+                }
                 &body_owned
             } else {
                 body_part
@@ -828,7 +807,11 @@ fn render_todos_tab(frame: &mut Frame, area: Rect, app: &App, theme: &Theme, low
             // Word-wrap the title to fit the available width, reserving space
             // for the "  X " prefix (4 cols) and the reminder suffix.
             const PREFIX_COLS: usize = 4;
-            let reminder_cols = if reminder.is_empty() { 0 } else { reminder.chars().count() + 2 };
+            let reminder_cols = if reminder.is_empty() {
+                0
+            } else {
+                crate::ui::text::display_width(&reminder) + 2
+            };
             let wrap_width = (content_area.width as usize)
                 .saturating_sub(PREFIX_COLS + reminder_cols)
                 .max(1);
@@ -1086,5 +1069,150 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── finding #17: case-fold drift in the search highlighter ──────────────
+
+    /// The highlighted segments produced by the real `split_span`, in order.
+    fn highlighted(spans: &[Span<'static>]) -> Vec<String> {
+        let other = search_hl_other_style().bg;
+        spans
+            .iter()
+            .filter(|s| s.style.bg == other)
+            .map(|s| s.content.to_string())
+            .collect()
+    }
+
+    fn split_plain(text: &'static str, query: &str) -> Vec<Span<'static>> {
+        let q: Vec<char> = query.to_lowercase().chars().collect();
+        split_span(
+            Span::styled(text, Style::default()),
+            &q,
+            usize::MAX,
+            None,
+            search_hl_style(),
+            search_hl_other_style(),
+            None,
+        )
+    }
+
+    #[test]
+    fn the_highlighter_does_not_drift_when_case_folding_changes_length() {
+        // 'İ' lowercases to two chars; the old code used the lowercased
+        // offsets against the original and highlighted `İs`.
+        assert_eq!(highlighted(&split_plain("İstanbul", "İ")), vec!["İ"]);
+        assert_eq!(highlighted(&split_plain("İstanbul", "i")), vec!["İ"]);
+        // A match starting after the fold: old code reported `tanb`.
+        assert_eq!(highlighted(&split_plain("İstanbul", "stan")), vec!["stan"]);
+    }
+
+    #[test]
+    fn the_highlighter_keeps_every_character_of_the_span() {
+        for (text, query) in [
+            ("İstanbul", "i"),
+            ("İstanbul", "İ"),
+            ("hello world", "o"),
+            ("no match", "zzz"),
+            ("日本語", "本"),
+        ] {
+            let spans = split_plain(text, query);
+            let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(joined, text, "query {query:?}");
+        }
+    }
+
+    #[test]
+    fn the_highlighter_counts_occurrences_across_a_span() {
+        let spans = split_plain("aaa", "a");
+        assert_eq!(highlighted(&spans), vec!["a", "a", "a"]);
+    }
+
+    // ── finding #16: wide text must be measured in columns ──────────────────
+
+    #[test]
+    fn a_cjk_update_label_pads_to_the_column_budget() {
+        // `update_content_lines` pads the label column so the body lines up.
+        // With `format!("{:<width$}")` a two-character CJK label (4 columns)
+        // was padded to 11 *characters* = 13 columns, pushing the body right.
+        let upd = Update {
+            id: "u".into(),
+            project_id: "p".into(),
+            label: "日本".into(),
+            body: "body".into(),
+            sort_order: 0.0,
+            created_at: "2025-01-01T00:00:00Z".into(),
+            updated_at: "2025-01-01T00:00:00Z".into(),
+        };
+        let lines = update_content_lines(&upd, 20, 4, &[]);
+        let first = lines.first().expect("at least one line");
+        let label_span = first
+            .spans
+            .iter()
+            .find(|s| s.content.contains('日'))
+            .expect("label span");
+        assert_eq!(
+            crate::ui::text::display_width(&label_span.content),
+            DATE_COL_WIDTH,
+            "the label column must be {DATE_COL_WIDTH} columns wide, not chars"
+        );
+    }
+
+    #[test]
+    fn a_truncated_update_body_ends_with_an_ellipsis_inside_the_column_budget() {
+        // The ellipsis is the only signal that more text exists below, so it
+        // must survive the truncation — and must not push the line past the
+        // body column.
+        let body = "word ".repeat(40);
+        let upd = Update {
+            id: "u".into(),
+            project_id: "p".into(),
+            label: String::new(),
+            body: body.clone(),
+            sort_order: 0.0,
+            created_at: "2025-01-01T00:00:00Z".into(),
+            updated_at: "2025-01-01T00:00:00Z".into(),
+        };
+        let width = 20usize;
+        let lines = update_content_lines(&upd, width, 2, &[]);
+        let last = lines.last().expect("at least one line");
+        // spans: ["  ", padded label, "  ", body…]
+        let body_text: String = last
+            .spans
+            .iter()
+            .skip(3)
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            body_text.trim_end().ends_with('…'),
+            "a truncated body must end with an ellipsis: {body_text:?}"
+        );
+        assert!(
+            crate::ui::text::display_width(body_text.trim_end()) <= width,
+            "{body_text:?} exceeds the {width}-column body budget"
+        );
+    }
+
+    #[test]
+    fn a_cjk_truncated_body_never_splits_a_character() {
+        // 20 wide characters = 40 columns; at 10 columns the ellipsis must
+        // replace a whole character, not half of one.
+        let upd = Update {
+            id: "u".into(),
+            project_id: "p".into(),
+            label: String::new(),
+            body: "日本語のテキストです。".into(),
+            sort_order: 0.0,
+            created_at: "2025-01-01T00:00:00Z".into(),
+            updated_at: "2025-01-01T00:00:00Z".into(),
+        };
+        let lines = update_content_lines(&upd, 10, 1, &[]);
+        let last = lines.last().expect("one line");
+        // spans: ["  ", padded label, "  ", body…]
+        let body_text: String = last.spans.iter().skip(3).map(|s| s.content.as_ref()).collect();
+        assert!(body_text.ends_with('…'), "{body_text:?}");
+        assert!(
+            crate::ui::text::display_width(&body_text) <= 10,
+            "{body_text:?} exceeds the 10-column budget"
+        );
     }
 }

@@ -704,6 +704,7 @@ pub fn run_end(args: &Args, paths: &Paths) -> Result<()> {
 mod tests {
     use super::*;
     use crate::db::snapshot_bytes;
+
     use rusqlite::Connection;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;

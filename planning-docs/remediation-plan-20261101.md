@@ -14,19 +14,23 @@
 | **D** | DONE | Crash fixes | **4, 5, 13** | `views/overlay.rs`, `ptm_sync/main.rs`, `bin/enc/main.rs`, `paths.rs`, `views/{mod,project_list,todo_list,project_detail}.rs` |
 | **E** | DONE | Key handling & render purity | **6, 14, 15, 23** | `app.rs`, `views/project_detail.rs`, `views/overlay.rs`, `dev-harness/update-viewer.py` |
 | **F** | DONE | Data-layer correctness & perf | **10, 11** | `data/repo.rs`, `app.rs` (caller) |
-| **G** | | Unicode/display-width consistency | **16, 17** | `views/mod.rs`, `views/*.rs`, `bin/md/main.rs` |
+| **G** | DONE | Unicode/display-width consistency | **16, 17** | `ui/text.rs` (new), `ui/{mod,markdown}.rs`, `input/mod.rs`, `views/*.rs`, `bin/md/{main,ui}.rs` |
 | **H** | | Dedup, permissions, docs sweep | **18, 19, 20, 21, 22, 24** | `app.rs`, `crypto.rs`, `log.rs`, `bin/md/log.rs`, `Cargo.toml`, `AGENTS.md` |
 
 ## Status at the time of writing
 
-- `cargo test --all-targets` → **408 tests, 0 failures** (36 + 82 + 214 + 76).
+- `cargo test --all-targets` → **651 tests, 0 failures** (37 + 145 + 337 + 132
+  after session G; the starting point was 408 = 36 + 82 + 214 + 76).
   (After session D: **478**, all green. After session E: **495**, i.e. 37 + 82 + 244 + 132.
-  After session F: **517**, i.e. 37 + 82 + 266 + 132.)
+  After session F: **517**, i.e. 37 + 82 + 266 + 132. After session G: **651**,
+  i.e. 37 + 145 + 337 + 132, with 2 ignored.)
 - `cargo check --all-targets` clean.
 - All 24 findings are still live at the lines the review cites.
-- **11 of the findings have been reproduced by the harnesses in `dev-harness/`**
-  (#1b, #1c, #2, #3, #4, #5, #7, #8, #9, #12, #13, #17).
-  (After session F: **13**, i.e. + #10 and #11 via `query-count.py`.)
+- **15 of the findings have been reproduced by the harnesses in `dev-harness/`**
+  (#1b, #1c, #2, #3, #4, #5, #7, #8, #9, #12, #13, #16, #17).
+  (After session F: **13**, i.e. + #10 and #11 via `query-count.py`.
+  After session G: **15**, i.e. + #16 and #17 via `width-display.py` and
+  `search-highlight.py`.)
   Two of them differ from the review's write-up — see
   [§Findings that need correcting](#findings-that-need-correcting-first).
 - `git` is **not installed** in this environment. Sessions must therefore be
@@ -446,6 +450,100 @@ in one place because #11's fix makes a distinction the caller has to honour.
 
 ---
 
+### G — Unicode/display-width consistency — **done**
+
+Findings #16 and #17 fixed. Both were "the same string measured or sliced two
+different ways", so the fix is one shared module rather than a patch per view.
+
+- **#16 — width was counted in characters.** `word_wrap`, `char_wrap`,
+  `hint_height` and the inline-edit window all counted `chars()`, while
+  `markdown.rs` already measured with `unicode-width`. A CJK title therefore
+  wrapped at half the intended column count and overflowed the pane; a wide
+  hint string was given too few rows. The measurement now lives once, in
+  **`src/ui/text.rs`**: `display_width` / `char_display_width` /
+  `char_wrap` / `word_wrap` / `wrap_rows` / `split_at_width` / `pad_to_width` /
+  `truncate_to_width` / `hint_height`. Every renderer in both binaries goes
+  through it — `views/mod.rs` re-exports the wrapping helpers as `super::…`,
+  `markdown.rs` imports the two width primitives instead of defining its own
+  copies, and `md` path-includes the same file (`bin/md/ui.rs`). Two view-level
+  char-counted computations that were genuinely wrong are fixed too:
+  `update_content_lines` padded its date/label column with
+  `format!("{:<width$}")` (character padding, so a wide label pushed the body
+  column right) and now uses `pad_to_width`, and the global-todo group rule
+  was sized from `project_title.len()` (bytes) and is now sized from
+  `display_width`.
+- **#17 — the highlighted range drifted under case folding.** `split_span`
+  (in `views/project_detail.rs`, duplicated as `split_span_hits` in
+  `bin/md/main.rs`) lowercased the text, searched the lowercased copy, then
+  sliced the **original** at those offsets. Folding is not length-preserving
+  (`'İ'` → `i` + U+0307), so searching `İ` in `İstanbul` highlighted `İs`, and
+  a match starting after the fold highlighted the wrong region. The matcher is
+  now `ui::text::find_matches` / `split_matches`, which records the original
+  character index for every lowercased character, so a match always maps back
+  onto whole original characters. Both call sites use it; the two copies are
+  gone.
+- **The inline-edit field took a column budget and spent characters.**
+  `InputState::display(width)` overflowed by one column per wide character and
+  could scroll the cursor character off the field. It now measures in columns
+  (`char_display_width`) and reserves the cursor cell at its own width.
+- Tests: 517 → **651**, all green (37 + 145 + 337 + 132, 2 ignored). The new
+  coverage is where the bugs were:
+  - `ui/text.rs` — 57 tests: wide characters as two columns in every wrapper,
+    an over-wide character still making progress (the width analogue of the
+    #4 non-termination bug), padding/truncation never splitting a wide
+    character, and the case-fold mapping (`İ` at the start, `İ` mid-string, a
+    match after the fold, reconstruction of the original from the segments).
+  - `views/project_detail.rs` — the real `split_span` (not a model of it):
+    no drift on `İ`, every character preserved, occurrences counted.
+  - `views/overlay.rs` — the spell-check preview and the suggestion row wrap
+    by columns.
+  - `views/todo_list.rs` — the first tests in that file: a rendered frame
+    (`TestBackend`) whose CJK todo title wraps onto several rows and whose CJK
+    group header keeps its right border.
+  - `input/mod.rs` — `display` never exceeds the column budget at any width or
+    cursor position, and the cursor character stays visible in wide text.
+  - `bin/md/main.rs` — the first tests in that file: the `md` highlighter does
+    not drift, `hint_height_fn` counts columns, the preview wraps by columns.
+  - **Each fix's test was confirmed to fail against the unfixed code** by
+    re-introducing the defect (the drift test, the label-padding test, the
+    preview and suggestion tests, the CJK-title render test, and the
+    `InputState` budget test all fail on the old code).
+- **New harness `dev-harness/width-display.py` (#16), 33/33.** #16 has no
+  crash and, with a narrow enough terminal, no obvious symptom either, so the
+  harness compiles the **real `src/ui/text.rs`** into a scratch crate and
+  asserts that every wrapped row fits its column budget and that no text is
+  lost, across CJK, emoji, mixed and empty input. It also checks that the
+  renderers route through `ui::text` and that no character-counted width
+  arithmetic is left in them.
+- `search-highlight.py` **rewritten from 4/5 to 14/14.** The old version
+  reimplemented the algorithm in Python, which can neither confirm a fix
+  (the copy keeps failing) nor guard one (a reverted fix still passes). It now
+  compiles the real `src/ui/text.rs` and asserts on its output, keeps a
+  companion check that the *legacy* algorithm still mis-highlights the same
+  fixtures (so the cases are not vacuous), and greps both call sites for the
+  lowercased-offset pattern.
+- `panics.py` still **9/9**. Its #4 check extracts `wrap_key_row` textually and
+  compiles it standalone, so it had to build through a scratch cargo crate to
+  resolve `crate::ui::text` — a harness change forced by the fix, and a
+  legitimate one: the extracted code is still the real source.
+- **A pre-existing red test was fixed on the way.** `cargo test --all-targets`
+  was already failing before session G (`ops::tests::
+  a_dry_run_end_neither_sets_nor_clears_the_marker`) because rustls cannot
+  choose a `CryptoProvider` when both `ring` and `aws-lc-rs` are compiled in,
+  and the provider was installed only in `main()`. `install_crypto_provider()`
+  is now called from `S3Client::new`, which covers every caller including the
+  tests. Not a Session G finding, but a session cannot exit "suite green"
+  while the suite is red.
+- `wal-safety.py` **23/23**, `sync-state.py` **20/20**, `merge-robust.py`
+  **6/6**, `s3-roundtrip.py` **12/12**, `panics.py` **9/9**,
+  `update-viewer.py` **4/4**, `query-count.py` **8/8**, `keyhelp-widths.py`
+  diagnostic — unchanged.
+- `cargo clippy --all-targets` reports **no new warnings**; the remaining ones
+  are the pre-existing set in `markdown.rs`, `crypto.rs`, `merge.rs` and
+  `archive.rs` that session H owns.
+
+---
+
 ## Grouping principle
 
 Three rules drive the split:
@@ -503,7 +601,9 @@ overlap with any other session.
 
 **G is a different kind of bug from D**: #16/#17 don't panic, they render
 wrong, and the fix is one shared width-aware helper used everywhere. Doing it
-in D would balloon a 3-line-per-fix session into a repo-wide refactor.
+in D would balloon a 3-line-per-fix session into a repo-wide refactor. It
+turned out to be one new file (`ui/text.rs`) plus call-site changes — the
+helpers existed already, they were just duplicated and character-based.
 
 **H is the sweep** — it touches nearly every file, so it must be last or it
 conflicts with everything. It also absorbs the `cargo clippy --fix` pass the
@@ -605,7 +705,14 @@ rather than repairing it, and it needs justifying in the commit message.
   entirely. Counting is done by SQLite's `SQLITE_TRACE_STMT` callback instead.
   #11 is covered by the same harness via an authorizer that denies the probe's
   column.
-- **G** — `search-highlight.py` fully green; width test with CJK/emoji titles.
+- **G** — *met.* `search-highlight.py` **14/14** (real `ui::text`, not a
+  model of it) and `width-display.py` **33/33**. CJK and emoji titles are
+  covered at three levels: the pure helpers (`ui/text.rs`), the renderers that
+  use them (`overlay.rs`, `todo_list.rs` via a rendered frame), and the
+  inline-edit window (`input/mod.rs`). The two char-counted view computations
+  that were genuinely wrong (`format!("{:<w$}")` label padding, the byte-sized
+  group rule) are fixed as well, because "one shared width-aware helper used
+  everywhere" is the exit criterion, not "the two cited functions".
 - **H** — `cargo clippy --all-targets` at zero warnings; AGENTS.md tree matches
   `src/`.
 
@@ -742,8 +849,8 @@ any finding.
 | 13 | `panics.py` | PASS — fixed in D |
 | 14 | — | documented (unit-tested via the handlers that read it) |
 | 15 | — | PASS — fixed in E (unit test; no external symptom) |
-| 16 | — | not covered |
-| 17 | `search-highlight.py` | FAIL — live |
+| 16 | `width-display.py` | PASS — fixed in G (columns everywhere) |
+| 17 | `search-highlight.py` | PASS — fixed in G (shared matcher) |
 | 2, 3, 1c (partial) | `s3-roundtrip.py` | **12/12 passing** (happy path; #1c race not asserted — see above) |
 | 2 (exit code) | `sync-state.py`, `wal-safety.py` | PASS — fixed in A, marker added in B |
 | 18–24 | — | polish / docs (23 fixed in E) |

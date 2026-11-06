@@ -83,9 +83,12 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
 
     for group in &app.tl_groups {
         // Group header.
+        // The rule fills whatever is left after the title.  Both sides are
+        // display columns: a CJK project title is twice as wide as its byte or
+        // char count suggests, and the rule would otherwise overflow (#16).
         let sep = "─".repeat(
             (inner.width as usize)
-                .saturating_sub(group.project_title.len() + 5)
+                .saturating_sub(crate::ui::text::display_width(&group.project_title) + 5)
         );
         items.push(vec![Line::from(vec![
             Span::styled(
@@ -134,7 +137,11 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
 
             let item = if is_editing {
                 let state = app.tl_editing.as_ref().map(|(_, s)| s).unwrap();
-                let reminder_cols = if reminder.is_empty() { 0 } else { reminder.chars().count() + 2 };
+                let reminder_cols = if reminder.is_empty() {
+                    0
+                } else {
+                    crate::ui::text::display_width(&reminder) + 2
+                };
                 let avail = (inner.width as usize)
                     .saturating_sub(4 + reminder_cols) // 4 = "  X "
                     .max(1);
@@ -151,7 +158,11 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
                 // Word-wrap the title to fit the available width, reserving space
                 // for the "  X " prefix (4 cols) and the reminder suffix.
                 const PREFIX_COLS: usize = 4;
-                let reminder_cols = if reminder.is_empty() { 0 } else { reminder.chars().count() + 2 };
+                let reminder_cols = if reminder.is_empty() {
+                    0
+                } else {
+                    crate::ui::text::display_width(&reminder) + 2
+                };
                 let wrap_width = (inner.width as usize)
                     .saturating_sub(PREFIX_COLS + reminder_cols)
                     .max(1);
@@ -290,5 +301,87 @@ fn status_style(status: &TodoStatus, theme: &Theme) -> Style {
         TodoStatus::InProgress => Style::default().fg(theme.in_progress_fg),
         TodoStatus::Done       => Style::default().fg(theme.done_fg),
         TodoStatus::Canceled   => Style::default().fg(theme.canceled_fg),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::app::App;
+    use crate::data::repo;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn mk_app() -> App {
+        let conn = crate::data::db::open_in_memory().expect("in-memory db");
+        App::with_conn(conn, None).expect("app")
+    }
+
+    /// Render one frame and return the screen as one string per row.
+    fn draw(app: &mut App, w: u16, h: u16) -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(w, h)).expect("test terminal");
+        term.draw(|frame| crate::ui::render(frame, app)).expect("draw");
+        let buffer = term.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// Finding #16: a CJK todo title must wrap by *columns*.  Counting
+    /// characters put twice as many characters on a row as the pane could
+    /// display, so the title overflowed and the reminder was pushed off.
+    #[test]
+    fn a_wide_todo_title_wraps_within_the_pane() {
+        let mut app = mk_app();
+        // A long CJK title: 20 characters = 40 columns.
+        let title = "日本語のタイトルです日本語のタイトルです";
+        repo::create_todo(&app.conn, None, title).unwrap();
+        app.screen = crate::app::Screen::TodoList;
+        app.reload_todo_list().unwrap();
+
+        let rows = draw(&mut app, 30, 12);
+        let screen = rows.join("\n");
+        assert!(screen.contains('日'), "the title must be rendered:\n{screen}");
+        // Every rendered row must fit the pane (ratatui clips, so the real
+        // assertion is that the title is *wrapped* onto several rows rather
+        // than truncated after one).
+        let title_rows = rows.iter().filter(|r| r.contains('日') || r.contains('本') || r.contains('語')).count();
+        assert!(
+            title_rows >= 2,
+            "a 40-column title in a ~28-column pane must wrap onto several rows, got {title_rows}:\n{screen}"
+        );
+    }
+
+    /// A CJK group header must not push its rule past the pane edge.
+    #[test]
+    fn a_wide_group_header_stays_within_the_pane() {
+        let mut app = mk_app();
+        let p = repo::create_project(&app.conn, "日本語のプロジェクト").unwrap();
+        repo::create_todo(&app.conn, Some(&p.id), "task").unwrap();
+        app.screen = crate::app::Screen::TodoList;
+        app.reload_todo_list().unwrap();
+
+        let rows = draw(&mut app, 40, 14);
+        let screen = rows.join("\n");
+        // `TestBackend` leaves a blank cell under each wide character, so the
+        // rendered title reads back with gaps; compare with spaces removed.
+        let compact: String = screen.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            compact.contains("日本語のプロジェクト"),
+            "header rendered:\n{screen}"
+        );
+        // The header row must keep its right border: the rule is sized from
+        // the title's *column* width, so a title measured in bytes or chars
+        // over-fills and pushes the border off the edge.
+        let header = rows
+            .iter()
+            .find(|r| r.contains('日'))
+            .expect("header row");
+        assert!(
+            header.trim_end().ends_with('│'),
+            "the header's right border was pushed off the pane: {header:?}"
+        );
     }
 }

@@ -25,6 +25,7 @@ HARNESSES = [
     ("keyhelp-widths.py", "finding 4 (diagnostic, always passes)"),
     ("update-viewer.py", "findings 6, 23 (pty; the viewer swallowed universal keys)"),
     ("search-highlight.py", "finding 17"),
+    ("width-display.py", "finding 16 (width-aware wrapping, padding, hint height)"),
     ("query-count.py", "findings 10, 11 (statement counts + swallowed SQL errors)"),
     ("s3-roundtrip.py", "end-to-end S3 (skips without /etc/hosts)"),
 ]

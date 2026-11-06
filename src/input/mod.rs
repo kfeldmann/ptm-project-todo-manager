@@ -73,10 +73,13 @@ impl InputState {
 
     /// Decompose the visible window into `(before, cursor_char, after)` spans.
     ///
-    /// `width` is the number of character columns available for display.
-    /// The window slides automatically to keep the cursor visible at all times.
-    /// When the cursor is past the end of the text, `cursor_char` is `' '`
-    /// (a placeholder for a block cursor).
+    /// `width` is a **column** budget (the terminal cell count of the field),
+    /// not a character count: a CJK or emoji character occupies two columns, so
+    /// a character-counted window overflows the field by one column per wide
+    /// character (finding #16).  The window slides to keep the cursor visible;
+    /// the cursor's own cell is reserved at its display width.  When the cursor
+    /// is past the end of the text, `cursor_char` is `' '` (a placeholder for a
+    /// block cursor).
     pub fn display(&self, width: usize) -> (String, char, String) {
         if width == 0 {
             return (String::new(), ' ', String::new());
@@ -84,28 +87,40 @@ impl InputState {
 
         let chars: Vec<char> = self.value.chars().collect();
         let len = chars.len();
+        let cursor = self.cursor.min(len);
 
-        // Slide the window so the cursor stays within [scroll, scroll + width).
-        let scroll = (self.cursor + 1).saturating_sub(width);
+        // The cursor cell shows the character under it (or a space at the
+        // end) and needs that many columns.
+        let cursor_char = if cursor < len { chars[cursor] } else { ' ' };
+        let cursor_w = crate::ui::text::char_display_width(cursor_char).max(1);
+        let budget = width.saturating_sub(cursor_w);
 
-        let before_count = self.cursor - scroll;          // always in 0..=width-1
-        let after_cap    = width.saturating_sub(before_count + 1);
+        // Take as much text before the cursor as fits...
+        let mut used = 0usize;
+        let mut start = cursor;
+        while start > 0 {
+            let w = crate::ui::text::char_display_width(chars[start - 1]);
+            if used + w > budget {
+                break;
+            }
+            used += w;
+            start -= 1;
+        }
 
-        let before: String = chars[scroll..scroll + before_count].iter().collect();
+        // ... then fill the rest of the row after the cursor.
+        let after_start = (cursor + 1).min(len);
+        let mut end = after_start;
+        while end < len {
+            let w = crate::ui::text::char_display_width(chars[end]);
+            if used + w > budget {
+                break;
+            }
+            used += w;
+            end += 1;
+        }
 
-        let (cursor_char, after_start) = if self.cursor < len {
-            (chars[self.cursor], self.cursor + 1)
-        } else {
-            (' ', len)
-        };
-
-        let after_end = (after_start + after_cap).min(len);
-        let after: String = if after_start < after_end {
-            chars[after_start..after_end].iter().collect()
-        } else {
-            String::new()
-        };
-
+        let before: String = chars[start..cursor].iter().collect();
+        let after: String = chars[after_start..end].iter().collect();
         (before, cursor_char, after)
     }
 
@@ -506,5 +521,69 @@ mod tests {
         let alt_char = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT);
         handle_input_key(&mut s, alt_char);
         assert_eq!(s.value, "");
+    }
+
+    // ── display(): the width budget is columns (finding #16) ────────────────
+
+    /// The rendered cell width of a `display` result.
+    fn display_cols(s: &InputState, width: usize) -> usize {
+        let (before, cur, after) = s.display(width);
+        crate::ui::text::display_width(&before)
+            + crate::ui::text::char_display_width(cur).max(1)
+            + crate::ui::text::display_width(&after)
+    }
+
+    /// A single wide character that is itself wider than the whole budget is
+    /// shown on its own rather than dropped — the one allowed overflow.
+    fn within_budget(s: &InputState, width: usize) -> bool {
+        display_cols(s, width) <= width.max(2)
+    }
+
+    #[test]
+    fn display_never_exceeds_the_column_budget_for_wide_text() {
+        for value in ["日本語のタイトルです", "🚀🚀🚀🚀🚀", "a日b語c", "plain ascii text"] {
+            let mut s = InputState::from_str(value);
+            for width in 1..=12usize {
+                assert!(
+                    within_budget(&s, width),
+                    "{value:?} at width {width} renders {} columns",
+                    display_cols(&s, width)
+                );
+                // With the cursor at every position, too.
+                s.home();
+                for _ in 0..value.chars().count() {
+                    assert!(
+                        within_budget(&s, width),
+                        "{value:?} at width {width} with cursor mid-string renders {} columns",
+                        display_cols(&s, width)
+                    );
+                    s.move_right();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn display_shows_the_character_under_the_cursor() {
+        let mut s = InputState::from_str("日本語");
+        s.home();
+        s.move_right(); // cursor on 本
+        let (_, cur, _) = s.display(10);
+        assert_eq!(cur, '本');
+    }
+
+    #[test]
+    fn display_keeps_the_cursor_visible_in_wide_text() {
+        let mut s = InputState::from_str("日本語のタイトル");
+        s.home();
+        for _ in 0..5 {
+            s.move_right(); // cursor on イ (index 5)
+        }
+        let (before, cur, _) = s.display(6);
+        assert_eq!(cur, 'イ', "the cursor character must be shown");
+        assert!(
+            crate::ui::text::display_width(&before) < 6,
+            "the window must slide to make room: before={before:?}"
+        );
     }
 }

@@ -26,22 +26,8 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-
+use crate::ui::text::{char_display_width, display_width};
 use crate::ui::theme::Theme;
-
-/// Returns the terminal display width of a string, counting wide characters
-/// (such as emoji and CJK) as 2 columns and narrow characters as 1.
-#[inline]
-fn display_width(s: &str) -> usize {
-    UnicodeWidthStr::width(s)
-}
-
-/// Display width of a single `char`.
-#[inline]
-fn char_display_width(c: char) -> usize {
-    UnicodeWidthChar::width(c).unwrap_or(0)
-}
 
 // ─── Public entry point ───────────────────────────────────────────────────────
 

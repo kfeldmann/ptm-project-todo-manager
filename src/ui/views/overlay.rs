@@ -415,8 +415,10 @@ fn wrap_key_row(
     key_sty: Style,
     desc_sty: Style,
 ) -> Vec<Line<'static>> {
-    let chars: Vec<char> = d.chars().collect();
-    if max_desc == 0 || chars.len() <= max_desc {
+    // `max_desc` is a column budget, so the fit test and the breaks must be
+    // measured in display columns: a description containing wide characters
+    // wraps at half the intended count if it is measured in chars (#16).
+    if max_desc == 0 || crate::ui::text::display_width(d) <= max_desc {
         return vec![Line::from(vec![
             Span::styled(format!("  {:12}", k), key_sty),
             Span::styled(d, desc_sty),
@@ -424,52 +426,17 @@ fn wrap_key_row(
     }
 
     let mut out = Vec::new();
-    let mut pos = 0usize;
-    let mut first = true;
-
-    while pos < chars.len() {
-        let prefix = if first {
+    for (i, chunk) in crate::ui::text::wrap_rows(d, max_desc).into_iter().enumerate() {
+        let prefix = if i == 0 {
             format!("  {:12}", k)
         } else {
             format!("  {:12}", "")
         };
-        let remaining = chars.len() - pos;
-
-        if remaining <= max_desc {
-            let chunk: String = chars[pos..].iter().collect();
-            out.push(Line::from(vec![
-                Span::styled(prefix, key_sty),
-                Span::styled(chunk, desc_sty),
-            ]));
-            break;
-        }
-
-        // Look one column past the budget for a space to break on; fall back
-        // to a hard break when the budget holds no space (one long word).
-        let window = &chars[pos..pos + max_desc + 1];
-        let (cut, next) = match window.iter().rposition(|&c| c == ' ') {
-            // Break on the space: it is dropped, not part of either line.
-            Some(i) => (i, pos + i + 1),
-            // Hard break: nothing is skipped, so no character is lost.
-            None => (max_desc, pos + max_desc),
-        };
-
-        if cut == 0 {
-            // The window starts with whitespace — skip it instead of emitting
-            // a line that contains nothing.
-            pos = next.max(pos + 1);
-            continue;
-        }
-
-        let chunk: String = chars[pos..pos + cut].iter().collect();
         out.push(Line::from(vec![
             Span::styled(prefix, key_sty),
             Span::styled(chunk, desc_sty),
         ]));
-        first = false;
-        pos = next;
     }
-
     out
 }
 
@@ -857,29 +824,22 @@ fn build_text_window(
                     need_record = false;
                 }
 
-                let remaining_chars = remaining.chars().count();
-                if remaining_chars <= available {
+                // Widths are terminal columns, not characters: a CJK word
+                // occupies two columns per character (finding #16).
+                let remaining_w = crate::ui::text::display_width(remaining);
+                if remaining_w <= available {
                     // Entire remaining slice fits on the current row.
                     all_lines
                         .last_mut()
                         .unwrap()
                         .spans
                         .push(Span::styled(remaining.to_string(), style));
-                    x += remaining_chars;
+                    x += remaining_w;
                     remaining = "";
                 } else {
-                    // Must wrap. Find the byte offset of the `available`-th char.
-                    let avail_bytes = remaining
-                        .char_indices()
-                        .nth(available)
-                        .map(|(b, _)| b)
-                        .unwrap_or(remaining.len());
-                    // Prefer to break at the last space within that slice.
-                    let break_byte = remaining[..avail_bytes]
-                        .rfind(' ')
-                        .map(|p| p + 1) // keep the space on the current row
-                        .unwrap_or(avail_bytes); // hard break if no space found
-                    let (chunk, rest) = remaining.split_at(break_byte);
+                    // Must wrap.  Break at the last space within the column
+                    // budget, or hard-break there if the slice holds no space.
+                    let (chunk, rest) = crate::ui::text::split_at_width(remaining, available);
                     if !chunk.is_empty() {
                         all_lines
                             .last_mut()
@@ -924,11 +884,15 @@ fn build_suggestion_lines(suggestions: &[String], width: usize) -> Vec<Line<'sta
 
     for (i, s) in suggestions.iter().enumerate().take(9) {
         let entry = format!("{}: {}", i + 1, s);
-        // Each column is at least (entry.len + 2) wide, minimum 14 chars.
-        let col_w = (entry.len() + 2).max(14);
-        let padded = format!("{:<col_w$}", entry);
+        // Each column is at least (entry width + 2) columns, minimum 14.
+        // Measured in display columns: a suggestion containing wide
+        // characters would otherwise overflow the row (finding #16).
+        let col_w = (crate::ui::text::display_width(&entry) + 2).max(14);
+        let padded = crate::ui::text::pad_to_width(&entry, col_w);
 
-        if row.len() + padded.len() > width && row.trim() != "" {
+        if crate::ui::text::display_width(&row) + crate::ui::text::display_width(&padded) > width
+            && !row.trim().is_empty()
+        {
             lines.push(Line::from(Span::styled(row.clone(), Style::default().fg(Color::Cyan))));
             if lines.len() >= 2 {
                 break;
@@ -981,7 +945,9 @@ fn render_warn(frame: &mut Frame, area: Rect, title: &str, body: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{key_help_lines, wrap_key_row, KEY_COL_WIDTH};
+    use super::{
+        build_suggestion_lines, build_text_window, key_help_lines, wrap_key_row, KEY_COL_WIDTH,
+    };
     use ratatui::style::Style;
     use ratatui::text::Line;
 
@@ -1047,7 +1013,10 @@ mod tests {
         for line in &lines {
             let text = desc_of(line);
             let desc = &text[KEY_COL_WIDTH..];
-            assert!(desc.chars().count() <= 11, "{desc:?} exceeds the budget");
+            assert!(
+                crate::ui::text::display_width(desc) <= 11,
+                "{desc:?} exceeds the budget"
+            );
         }
         // No character is lost or duplicated across the wrap.
         let joined: String = lines
@@ -1086,5 +1055,54 @@ mod tests {
         let lines = plain("→→→→→ x", 5);
         let first = desc_of(&lines[0]);
         assert_eq!(&first[KEY_COL_WIDTH..], "→→→→→");
+    }
+
+    // ── finding #16: the spell-check preview measures columns ───────────────
+
+    fn line_text(line: &Line<'static>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn the_text_preview_wraps_wide_text_by_columns() {
+        // One CJK "word" at a 4-column budget: two characters per row.
+        let segments = vec![("日本語日本語".to_string(), false)];
+        let lines = build_text_window(&segments, None, 6, 4);
+        for line in &lines {
+            let text = line_text(line);
+            assert!(
+                crate::ui::text::display_width(&text) <= 4,
+                "{text:?} exceeds the 4-column budget"
+            );
+        }
+        let joined: String = lines.iter().map(line_text).collect();
+        assert_eq!(joined, "日本語日本語", "no text may be lost");
+    }
+
+    #[test]
+    fn the_text_preview_keeps_the_current_word_visible() {
+        let segments: Vec<(String, bool)> = (0..12)
+            .map(|i| (format!("word{i} "), true))
+            .collect();
+        let lines = build_text_window(&segments, Some(11), 3, 10);
+        assert_eq!(lines.len(), 3);
+        let joined: String = lines.iter().map(line_text).collect();
+        assert!(joined.contains("word11"), "the current word must be on screen: {joined:?}");
+    }
+
+    #[test]
+    fn the_suggestion_row_measures_columns() {
+        // Two wide suggestions whose combined width exceeds the row budget
+        // must wrap onto separate lines.
+        let suggestions = vec!["日本語".to_string(), "タイトル".to_string()];
+        let lines = build_suggestion_lines(&suggestions, 20);
+        assert_eq!(lines.len(), 2);
+        for line in &lines {
+            let text = line_text(line);
+            assert!(
+                crate::ui::text::display_width(&text) <= 20,
+                "{text:?} exceeds the 20-column row"
+            );
+        }
     }
 }

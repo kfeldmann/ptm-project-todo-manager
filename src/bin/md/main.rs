@@ -856,15 +856,15 @@ fn build_text_window(
                     current_word_visual_line = all_lines.len() - 1;
                     need_record = false;
                 }
-                let remaining_chars = remaining.chars().count();
-                if remaining_chars <= available {
+                // Widths are terminal columns, not characters: a CJK word
+                // occupies two columns per character (finding #16).
+                let remaining_w = ui::text::display_width(remaining);
+                if remaining_w <= available {
                     all_lines.last_mut().unwrap().spans.push(Span::styled(remaining.to_string(), style));
-                    x += remaining_chars;
+                    x += remaining_w;
                     remaining = "";
                 } else {
-                    let avail_bytes = remaining.char_indices().nth(available).map(|(b, _)| b).unwrap_or(remaining.len());
-                    let break_byte  = remaining[..avail_bytes].rfind(' ').map(|p| p + 1).unwrap_or(avail_bytes);
-                    let (chunk, rest) = remaining.split_at(break_byte);
+                    let (chunk, rest) = ui::text::split_at_width(remaining, available);
                     if !chunk.is_empty() {
                         all_lines.last_mut().unwrap().spans.push(Span::styled(chunk.to_string(), style));
                     }
@@ -898,9 +898,13 @@ fn build_suggestion_lines(suggestions: &[String], width: usize) -> Vec<Line<'sta
     let mut row = String::from("  ");
     for (i, s) in suggestions.iter().enumerate().take(9) {
         let entry  = format!("{}: {}", i + 1, s);
-        let col_w  = (entry.len() + 2).max(14);
-        let padded = format!("{:<col_w$}", entry);
-        if row.len() + padded.len() > width && row.trim() != "" {
+        // Column widths are display columns, not characters or bytes
+        // (finding #16): a wide suggestion would otherwise overflow the row.
+        let col_w  = (ui::text::display_width(&entry) + 2).max(14);
+        let padded = ui::text::pad_to_width(&entry, col_w);
+        if ui::text::display_width(&row) + ui::text::display_width(&padded) > width
+            && !row.trim().is_empty()
+        {
             lines.push(Line::from(Span::styled(row.clone(), Style::default().fg(Color::Cyan))));
             if lines.len() >= 2 { break; }
             row = format!("  {padded}");
@@ -1098,44 +1102,34 @@ fn compute_search_matches(
     (lines, positions)
 }
 
-/// Variant of `split_span` that also reports whether the span contained a match.
+/// Split one span at every case-insensitive occurrence of `lower_query`,
+/// also reporting whether the span contained a match.
+///
+/// The matching itself lives in [`ui::text::split_matches`], which maps a
+/// case-folded match back onto whole characters of the original text.  The
+/// previous version here (and its twin in `views/project_detail.rs`) used the
+/// lowercased offsets directly against the original string, so a query
+/// containing `İ` highlighted one character too many (finding #17).
 fn split_span_hits(span: Span<'static>, lower_query: &[char]) -> (Vec<Span<'static>>, bool) {
     let base = span.style;
     let text = span.content.into_owned();
     if text.is_empty() || lower_query.is_empty() {
         return (vec![Span::styled(text, base)], false);
     }
-    let text_chars:  Vec<char> = text.chars().collect();
-    let lower_chars: Vec<char> = text.to_lowercase().chars().collect();
-    let qlen = lower_query.len();
-    let tlen = text_chars.len();
-
-    let mut out: Vec<Span<'static>> = Vec::new();
-    let mut seg = 0usize;
-    let mut i   = 0usize;
     let mut hit = false;
-
-    while i + qlen <= tlen {
-        if lower_chars[i..i + qlen] == *lower_query {
-            if i > seg {
-                out.push(Span::styled(text_chars[seg..i].iter().collect::<String>(), base));
+    let out = ui::text::split_matches(&text, lower_query)
+        .into_iter()
+        .map(|(seg, is_match)| {
+            if is_match {
+                hit = true;
+                // Placeholder style for the match segment; the current-match
+                // pass (highlight_lines_with_current) fixes this up afterwards.
+                Span::styled(seg, other_match_style())
+            } else {
+                Span::styled(seg, base)
             }
-            // Placeholder style for the match segment; the current-match pass
-            // (highlight_lines_with_current) fixes this up afterwards.
-            out.push(Span::styled(text_chars[i..i + qlen].iter().collect::<String>(), other_match_style()));
-            hit = true;
-            seg = i + qlen;
-            i   = seg;
-        } else {
-            i += 1;
-        }
-    }
-    if seg < tlen {
-        out.push(Span::styled(text_chars[seg..].iter().collect::<String>(), base));
-    }
-    if out.is_empty() {
-        out.push(Span::styled(text_chars.iter().collect::<String>(), base));
-    }
+        })
+        .collect();
     (out, hit)
 }
 
@@ -1200,9 +1194,103 @@ fn search_hl_style() -> Style {
 
 /// Returns the number of terminal rows the hint string occupies when ratatui
 /// word-wraps it at `width` columns.  Capped at 3.
+///
+/// Delegates to the shared, width-aware helper so `md` and `ptm` reserve the
+/// same number of rows for the same hint string (finding #16).
 fn hint_height_fn(text: &str, width: u16) -> u16 {
-    if width == 0 { return 1; }
-    let len = text.chars().count();
-    let w   = width as usize;
-    (len.div_ceil(w).max(1) as u16).min(3)
+    ui::text::hint_height(text, width)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── finding #17: the `md` search highlighter must not drift ─────────────
+
+    fn split(text: &'static str, query: &str) -> (Vec<Span<'static>>, bool) {
+        let q: Vec<char> = query.to_lowercase().chars().collect();
+        split_span_hits(Span::styled(text, Style::default()), &q)
+    }
+
+    fn matched(spans: &[Span<'static>]) -> Vec<String> {
+        let other = other_match_style().bg;
+        spans
+            .iter()
+            .filter(|s| s.style.bg == other)
+            .map(|s| s.content.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn the_md_highlighter_does_not_drift_when_case_folding_changes_length() {
+        // 'İ' lowercases to two chars; using the lowercased offsets against
+        // the original highlighted `İs` instead of `İ`.
+        assert_eq!(matched(&split("İstanbul", "İ").0), vec!["İ"]);
+        assert_eq!(matched(&split("İstanbul", "i").0), vec!["İ"]);
+        assert_eq!(matched(&split("İstanbul", "stan").0), vec!["stan"]);
+    }
+
+    #[test]
+    fn the_md_highlighter_keeps_every_character_and_reports_hits() {
+        for (text, query) in [("İstanbul", "İ"), ("hello", "l"), ("none", "zz"), ("日本語", "本")] {
+            let (spans, hit) = split(text, query);
+            let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(joined, text, "query {query:?}");
+            assert_eq!(hit, !matched(&spans).is_empty(), "query {query:?}");
+        }
+        assert_eq!(matched(&split("aaa", "a").0), vec!["a", "a", "a"]);
+    }
+
+    // ── finding #16: hint height is measured in columns ────────────────────
+
+    #[test]
+    fn hint_height_counts_wide_characters_as_columns() {
+        // 40 CJK characters = 80 columns = two rows at width 50.  Counting
+        // characters would have reserved a single row.
+        assert_eq!(hint_height_fn(&"日".repeat(40), 50), 2);
+        assert_eq!(hint_height_fn("short ascii hint", 80), 1);
+        assert_eq!(hint_height_fn("anything", 0), 1);
+    }
+
+    #[test]
+    fn hint_height_is_capped_at_three_rows() {
+        assert_eq!(hint_height_fn(&"a".repeat(400), 50), 3);
+    }
+
+    // ── finding #16: the spell-check preview wraps by columns ──────────────
+
+    #[test]
+    fn the_text_preview_wraps_wide_text_by_columns() {
+        // A single "word" of CJK, 8 columns of budget: two characters per row.
+        let segments = vec![("日本語日本語".to_string(), false)];
+        let lines = build_text_window(&segments, None, 6, 4);
+        for line in &lines {
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(
+                ui::text::display_width(&text) <= 4,
+                "{text:?} exceeds the 4-column budget"
+            );
+        }
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert_eq!(joined, "日本語日本語", "no text may be lost");
+    }
+
+    #[test]
+    fn the_suggestion_row_measures_columns() {
+        // Two wide suggestions whose combined width exceeds the row budget
+        // must wrap onto separate lines.
+        let suggestions = vec!["日本語".to_string(), "タイトル".to_string()];
+        let lines = build_suggestion_lines(&suggestions, 20);
+        assert_eq!(lines.len(), 2);
+        for line in &lines {
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            assert!(
+                ui::text::display_width(&text) <= 20,
+                "{text:?} exceeds the 20-column row"
+            );
+        }
+    }
 }

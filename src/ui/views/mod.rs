@@ -59,17 +59,12 @@ pub fn date_prefix(s: &str) -> &str {
 }
 
 /// Returns how many terminal rows a single-line hint string needs when
-/// ratatui word-wraps it inside `width` columns.  Uses ceiling division
-/// as a conservative upper bound and caps at 3 so the hint bar can never
-/// crowd out the main content on very narrow terminals.
-pub fn hint_height(text: &str, width: u16) -> u16 {
-    if width == 0 {
-        return 1;
-    }
-    let len = text.chars().count();
-    let w = width as usize;
-    (len.div_ceil(w).max(1) as u16).min(3)
-}
+/// ratatui word-wraps it inside `width` columns.
+///
+/// Re-exported from [`crate::ui::text`], which is the single width-aware
+/// implementation shared by every renderer (finding #16): counting `chars()`
+/// here under-counted wide text and gave the hint bar too few rows.
+pub use crate::ui::text::hint_height;
 
 // ─── List pagination helper (shared by multiple list views) ──────────────────
 
@@ -195,131 +190,15 @@ pub fn list_window_reserved(
     FooterPlan { start, end, kept_footers, core_rows, footer_rows }
 }
 
-// ─── Text wrapping helpers (shared by multiple views) ────────────────────────
+// ─── Text helpers (shared, width-aware) ─────────────────────────────────────
+//
+// `word_wrap`, `char_wrap` and `pad_to_width` live in
+// [`crate::ui::text`] so that `ptm` and `md` wrap text identically and so that
+// every measurement is in display **columns** rather than characters
+// (finding #16).  They are re-exported here because the views refer to them as
+// `super::word_wrap(...)`.
 
-/// Hard-wrap `text` at `width` characters per line.
-pub fn char_wrap(text: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return vec![text.to_string()];
-    }
-    let mut result = Vec::new();
-    for line in text.lines() {
-        let chars: Vec<char> = line.chars().collect();
-        if chars.is_empty() {
-            result.push(String::new());
-        } else {
-            let mut i = 0;
-            while i < chars.len() {
-                let end = (i + width).min(chars.len());
-                result.push(chars[i..end].iter().collect());
-                i = end;
-            }
-        }
-    }
-    if result.is_empty() {
-        result.push(String::new());
-    }
-    result
-}
-
-/// Tokenises a single source line into `(preceding_space_count, word)` pairs,
-/// preserving runs of multiple spaces between words so that callers can
-/// reconstruct them faithfully.
-///
-/// Example: `"foo  bar"` → `(0, "foo")`, `(2, "bar")`.
-fn line_tokens(line: &str) -> impl Iterator<Item = (usize, &str)> {
-    let mut s = line;
-    std::iter::from_fn(move || {
-        if s.is_empty() {
-            return None;
-        }
-        // ASCII space is always a single byte, so byte count == char count here.
-        let n_spaces = s.bytes().take_while(|&b| b == b' ').count();
-        s = &s[n_spaces..];
-        let n_bytes = s.find(' ').unwrap_or(s.len());
-        let word = &s[..n_bytes];
-        s = &s[n_bytes..];
-        Some((n_spaces, word))
-    })
-}
-
-/// Word-wrap `text` at `width` columns; falls back to [`char_wrap`] for overlong words.
-///
-/// Multiple consecutive spaces between words are preserved on the same output
-/// line.  Spaces at a wrap boundary (i.e. the spaces that would have started
-/// the continuation line) are dropped, which is standard word-wrap behaviour.
-pub fn word_wrap(text: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return vec![text.to_string()];
-    }
-    let mut result = Vec::new();
-    for line in text.lines() {
-        if line.is_empty() {
-            result.push(String::new());
-            continue;
-        }
-        let mut current = String::new();
-        let mut cur_len = 0usize;
-
-        for (space_len, word) in line_tokens(line) {
-            let wlen = word.chars().count();
-            if current.is_empty() {
-                // Start of an output line (first line or after a wrap).
-                // Drop preceding spaces — they are either leading indentation
-                // or spaces at the wrap boundary, both normalised away.
-                if wlen > width {
-                    let mut chunks = char_wrap(word, width).into_iter().peekable();
-                    while let Some(chunk) = chunks.next() {
-                        let clen = chunk.chars().count();
-                        if chunks.peek().is_some() || clen == width {
-                            result.push(chunk);
-                        } else {
-                            current = chunk;
-                            cur_len = clen;
-                        }
-                    }
-                } else {
-                    current = word.to_string();
-                    cur_len = wlen;
-                }
-            } else if cur_len + space_len + wlen <= width {
-                // Word fits on the current line; preserve the exact space run.
-                for _ in 0..space_len {
-                    current.push(' ');
-                }
-                current.push_str(word);
-                cur_len += space_len + wlen;
-            } else {
-                // Flush current line; start a new one with just the word
-                // (spaces at the wrap boundary are dropped).
-                result.push(std::mem::take(&mut current));
-                cur_len = 0;
-                if wlen > width {
-                    let mut chunks = char_wrap(word, width).into_iter().peekable();
-                    while let Some(chunk) = chunks.next() {
-                        let clen = chunk.chars().count();
-                        if chunks.peek().is_some() || clen == width {
-                            result.push(chunk);
-                        } else {
-                            current = chunk;
-                            cur_len = clen;
-                        }
-                    }
-                } else {
-                    current = word.to_string();
-                    cur_len = wlen;
-                }
-            }
-        }
-        if !current.is_empty() {
-            result.push(current);
-        }
-    }
-    if result.is_empty() {
-        result.push(String::new());
-    }
-    result
-}
+pub use crate::ui::text::{char_wrap, pad_to_width, word_wrap};
 
 #[cfg(test)]
 mod tests {

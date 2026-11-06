@@ -54,9 +54,14 @@ src/
 ├── ui/
 │   ├── mod.rs       — top-level render() dispatcher
 │   ├── theme.rs     — Theme struct (Color palette); always used as Theme::default()
+│   ├── text.rs      — width-aware text helpers: display_width, char_wrap,
+│   │                  word_wrap, wrap_rows, split_at_width, pad_to_width,
+│   │                  ellipsize, hint_height, find_matches/split_matches;
+│   │                  shared with `md`
+│   │                  (path-included — edit this file, never a copy)
 │   ├── markdown.rs  — Markdown → ratatui renderer; shared with `md` (path-included)
 │   └── views/
-│       ├── mod.rs               — shared helpers (hint_height)
+│       ├── mod.rs               — shared helpers (list pagination; re-exports ui::text)
 │       ├── project_list.rs      — Project List screen renderer
 │       ├── project_detail.rs    — Project Detail screen renderer
 │       ├── todo_list.rs         — Global Todo List screen renderer
@@ -67,7 +72,7 @@ src/
     │   └── main.rs     — clap subcommands: keygen/encrypt/decrypt/export/import
     ├── md/          — md binary (Markdown viewer + spell check)
     │   ├── main.rs     — TUI viewer: scroll, incremental search, $EDITOR, S:spell
-    │   ├── ui.rs       — path-includes src/ui/theme.rs and src/ui/markdown.rs
+    │   ├── ui.rs       — path-includes src/ui/{theme,markdown,text}.rs
     │   └── log.rs      — file logger → $XDG_DATA_HOME/md/md.log
     └── ptm_sync/    — ptm-sync binary (S3 backup sync; see §ptm-sync below)
         ├── main.rs     — CLI args (clap), Paths struct, shared utilities, entry point
@@ -623,6 +628,39 @@ not set in this environment.
   `Color::LightBlue`, etc.) — these map to the 256-color palette.
 - ❌ Do **not** use `Color::Rgb(r, g, b)` — 24-bit sequences are silently
   ignored by this terminal, producing no color change.
+
+### Text width — always measure in columns
+Terminal layout is measured in **display columns**, not characters and never
+bytes. A CJK ideograph or an emoji occupies two columns; a combining mark
+occupies none. `str::chars().count()` is therefore wrong for any width
+decision (finding #16: CJK titles wrapped at half the intended width and
+overflowed the pane), and `str::len()` is wrong twice over.
+
+All wrapping, truncation, padding and row-height arithmetic goes through
+`ui/text.rs` (path-included by `md`, so both binaries agree):
+
+| Helper | Use |
+|--------|-----|
+| `display_width(s)` | columns occupied by `s` |
+| `char_display_width(c)` | columns occupied by one `char` |
+| `char_wrap(text, w)` | hard-wrap at `w` columns |
+| `word_wrap(text, w)` | word-wrap at `w` columns (preserves space runs) |
+| `wrap_rows(s, w)` | wrap one already-split string into rows |
+| `split_at_width(s, w)` | `(prefix, rest)` at a column budget, space-preferred |
+| `pad_to_width(s, w)` | right-pad to exactly `w` columns |
+| `ellipsize(s, w)` | truncate to `w` columns, **always** ending in `…` |
+| `hint_height(text, w)` | rows a hint string needs at `w` columns |
+
+`format!("{:<w$}")` pads by characters and misaligns any column containing wide
+text — use `pad_to_width`. `views/mod.rs` re-exports these as `super::…` for
+the view modules.
+
+Case-insensitive search matching also lives here (`find_matches` /
+`split_matches`): they map a case-folded match back onto whole characters of
+the original text. Using lowercased offsets directly against the original is
+wrong because folding is not length-preserving (`'İ'` lowercases to two chars,
+finding #17). `views/project_detail.rs` and `bin/md/main.rs` both call these —
+do not reintroduce a local copy.
 
 ### Reminder display
 Reminder dates are stored as `YYYY-MM-DD` strings and truncated to 10
