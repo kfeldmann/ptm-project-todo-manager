@@ -715,6 +715,29 @@ budget `desc_width = inner_width - KEY_COL_WIDTH` (14). Two rules:
 `key_help_lines()` row, so adding a description with wide characters is
 covered automatically.
 
+### Markdown tables
+`markdown.rs` renders a table as a box: every line of it — top rule, header,
+row rules, body rows, bottom rule — must be exactly the same display width, or
+the box visibly breaks. Two rules keep it that way, and the width depends on
+the terminal, so a table that looks right at 120 columns can break at 60:
+
+- **A block marker's trailing space belongs to the source, not to the cell
+  text.** `parse_block_marker` consumes it (as it does for `> `, `- `, `1. `)
+  and `build_cell` re-supplies it as part of the rendered prefix. Leaving it
+  in `rest` rendered `| # |` as `│ #  │` beside `│ A │` and widened the column
+  by one. A prefix-only cell (`| # |`) must also drop the separator space
+  entirely — the cell is exactly as wide as its marker.
+- **A prefix may not take the whole column.** `emit_pfx` truncates a prefix
+  (`• `, `1. `, `# `, `│ `, indent) to `width - 1` columns when the cell has
+  text, so the text always has somewhere to land; otherwise a column squeezed
+  below its marker emits an over-wide line, and `render_table`'s
+  `w.saturating_sub(content_w)` turns that into a short `rpad`, so the row
+  renders *longer* than the rules around it.
+
+`rm_table_every_line_has_the_same_width` sweeps widths 12..=110 over a table
+containing every cell kind and asserts the invariant, so both regressions are
+covered.
+
 ### Overlays
 All overlays are rendered centered over the full terminal area by
 `overlay::render_overlay`. Only one `Overlay` variant can be active at a time.

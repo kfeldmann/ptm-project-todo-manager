@@ -426,6 +426,14 @@ impl Ctx {
 
                     // One space of padding on each side, plus any slack needed
                     // to satisfy the column alignment.
+                    //
+                    // `content_w` can exceed `w`: `wrap_cell_line` refuses to
+                    // break inside a prefix, so a marker wider than the column
+                    // (a `# ` prefix in a column squeezed to 1) is emitted
+                    // whole, and a table narrower than the sum of the prefixes
+                    // cannot be laid out inside `w` at all.  Clamp so `pad`
+                    // never underflows — the row then overflows its column
+                    // rather than being drawn shorter than the rule above it.
                     let content_w = cell_spans
                         .map(|s| s.iter().map(|sp| display_width(sp.content.as_ref())).sum::<usize>())
                         .unwrap_or(0);
@@ -1171,6 +1179,14 @@ fn parse_block_marker(text: &str) -> (CellBlock, &str) {
     }
 
     // Heading.
+    //
+    // The marker's trailing space belongs to the *source*, not to the cell
+    // text, so it is consumed here (as it is for every other block marker)
+    // and re-supplied by the `"# "` prefix `build_cell` emits.  Returning it
+    // as part of `rest` gave heading cells one extra leading space that no
+    // other cell had — visible as `│ #  │` beside `│ A │` — and widened the
+    // column's natural width by one, which could push a narrow table into
+    // wrapping one space earlier than necessary.
     let hashes = trimmed.chars().take_while(|c| *c == '#').count();
     if (1..=6).contains(&hashes) {
         let after = &trimmed[hashes..];
@@ -1256,7 +1272,13 @@ fn build_cell(raw: &[RawCellLine], quote_style: Style) -> Cell {
             CellBlock::Heading(level) => {
                 counters.clear();
                 let h_style = heading_style(level);
-                let pfx = vec![CellRun { text: format!("{} ", "#".repeat(level as usize)), style: h_style }];
+                // The trailing space separates the marker from the heading
+                // text, so a marker-only cell (`| # |` — a row-number column)
+                // must not carry it: it would make the cell one column wider
+                // than the marker it displays, widening the whole column.
+                let marker = "#".repeat(level as usize);
+                let pfx_text = if rest.is_empty() { marker } else { format!("{marker} ") };
+                let pfx = vec![CellRun { text: pfx_text, style: h_style }];
                 out.push(CellLine {
                     first_pfx: pfx.clone(),
                     cont_pfx:  pfx,
@@ -1395,6 +1417,39 @@ fn word_wrap_cell(text: &str, width: usize) -> Vec<String> {
     out
 }
 
+/// Append a cell line's prefix runs to `spans`, patching `base` underneath,
+/// and return the column offset at which the prefix ends.
+///
+/// A prefix (`• `, `1. `, `# `, `│ `, or a list indent) is decoration for the
+/// text that follows, so when there *is* text it must never take the whole
+/// column: the text would have nowhere to go and the cell would render one
+/// line wider than its column, breaking the box drawn around it.  A column
+/// narrower than the prefix itself does happen — a table squeezed below the
+/// sum of its markers — so the prefix is truncated to leave one column for
+/// the text.  A prefix-only cell (`| # |`) may use the whole column.
+fn emit_pfx(
+    pfx:    &[CellRun],
+    budget: usize,
+    base:   Style,
+    spans:  &mut Vec<Span<'static>>,
+) -> usize {
+    let mut cur_w = 0usize;
+    for run in pfx {
+        if cur_w >= budget { break; }
+        let mut text = String::new();
+        for ch in run.text.chars() {
+            let cw = char_display_width(ch);
+            if cur_w + cw > budget { break; }
+            text.push(ch);
+            cur_w += cw;
+        }
+        if !text.is_empty() {
+            spans.push(Span::styled(text, base.patch(run.style)));
+        }
+    }
+    cur_w
+}
+
 /// Wrap one cell's runs into lines of at most `width` columns, prefixing the
 /// first line with `first_pfx` and continuations with `cont_pfx`.
 fn wrap_cell_line(
@@ -1410,18 +1465,16 @@ fn wrap_cell_line(
         return out;
     }
 
-    let first_pfx_w = display_width(&runs_text(&line.first_pfx));
-    let cont_pfx_w  = display_width(&runs_text(&line.cont_pfx));
-
-    // Prefix runs, with `base` patched underneath.
-    let emit_pfx = |pfx: &[CellRun]| -> Vec<Span<'static>> {
-        pfx.iter()
-            .map(|r| Span::styled(r.text.clone(), base.patch(r.style)))
-            .collect()
+    // Budget for the prefix: the whole column when the cell is marker-only,
+    // one column less otherwise so the text always has somewhere to land.
+    let pfx_budget = if runs_text(&line.runs).trim().is_empty() {
+        width
+    } else {
+        width.saturating_sub(1)
     };
 
-    let mut spans = emit_pfx(&line.first_pfx);
-    let mut cur_w = first_pfx_w;
+    let mut spans: Vec<Span<'static>> = vec![];
+    let mut cur_w = emit_pfx(&line.first_pfx, pfx_budget, base, &mut spans);
     let mut words_on_line = 0usize;
 
     if line.pre {
@@ -1435,8 +1488,7 @@ fn wrap_cell_line(
                         spans.push(Span::styled(std::mem::take(&mut chunk), base.patch(run.style)));
                     }
                     out.push(std::mem::take(&mut spans));
-                    spans = emit_pfx(&line.cont_pfx);
-                    cur_w = cont_pfx_w;
+                    cur_w = emit_pfx(&line.cont_pfx, pfx_budget, base, &mut spans);
                 }
                 chunk.push(ch);
                 cur_w += cw;
@@ -1456,8 +1508,7 @@ fn wrap_cell_line(
 
         if words_on_line > 0 && cur_w + space + ww > width {
             out.push(std::mem::take(&mut spans));
-            spans = emit_pfx(&line.cont_pfx);
-            cur_w = cont_pfx_w;
+            cur_w = emit_pfx(&line.cont_pfx, pfx_budget, base, &mut spans);
             words_on_line = 0;
         } else if space > 0 {
             spans.push(Span::styled(" ", Style::default()));
@@ -1470,8 +1521,7 @@ fn wrap_cell_line(
                 let cw = char_display_width(ch);
                 if cur_w + cw > width && cur_w > 0 {
                     out.push(std::mem::take(&mut spans));
-                    spans = emit_pfx(&line.cont_pfx);
-                    cur_w = cont_pfx_w;
+                    cur_w = emit_pfx(&line.cont_pfx, pfx_budget, base, &mut spans);
                 }
                 spans.push(Span::styled(ch.to_string(), base.patch(style)));
                 cur_w += cw;
@@ -1539,7 +1589,7 @@ fn char_wrap_line(s: &str, width: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{char_wrap_line, reflow, render_markdown, word_wrap_cell, Token};
+    use super::{char_wrap_line, display_width, reflow, render_markdown, word_wrap_cell, Token};
     use ratatui::style::{Color, Modifier, Style};
     use ratatui::text::Line;
     use crate::ui::theme::Theme;
@@ -2352,6 +2402,78 @@ mod tests {
         assert!(text.contains("## Title"), "{:?}", text);
         let s = span_with(&lines, "Title");
         assert!(s.style.add_modifier.contains(Modifier::BOLD), "heading should be bold");
+    }
+
+    /// The heading marker's trailing space must not leak into the cell body:
+    /// `build_cell` already emits `"# "` as the prefix, so keeping the source
+    /// space rendered `# Title` as `#  Title` (one column wider than every
+    /// other cell in the column).
+    #[test]
+    fn rm_table_cell_heading_has_one_space_after_hashes() {
+        let md = "| A |\n| -- |\n| # Title |";
+        let lines = render_markdown(md, 80, &theme());
+        let text = all_text(&lines);
+        assert!(text.contains("│ # Title │"), "{:?}", text);
+        assert!(!text.contains("#  Title"), "double space after #: {:?}", text);
+    }
+
+    /// A marker-only heading cell (`| # |`) is the common "row number"
+    /// column header.  The column must be exactly `#` wide — one column of
+    /// padding on each side — and the header must line up with the body
+    /// cells, which it does not when the marker's trailing space is kept.
+    #[test]
+    fn rm_table_cell_bare_hash_heading_is_marker_wide() {
+        let md = "| # | Status |\n| -- | -- |\n| A | DONE |";
+        let lines = render_markdown(md, 80, &theme());
+        let text = all_text(&lines);
+        assert!(text.contains("┌───┬"), "column should be 1 wide: {:?}", text);
+        assert!(text.contains("│ # │ Status │"), "{:?}", text);
+        assert!(text.contains("│ A │ DONE   │"), "{:?}", text);
+    }
+
+    /// Every line of a rendered table — top rule, header, row rules, body
+    /// rows, bottom rule — must be the same display width.  A cell whose laid
+    /// out content is wider than its column (the heading marker case, or the
+    /// `rpad` underflow in `render_table`) makes one line longer than the
+    /// rules and breaks the box.  Sweeping widths catches both: `w` decides
+    /// both the column widths and where a cell has to wrap.
+    #[test]
+    fn rm_table_every_line_has_the_same_width() {
+        let md = "| # | Status | Session | Findings |\n\
+                  |---|---|---|---|\n\
+                  | **A** | DONE | `ptm-sync` WAL safety | **1, 2** |\n\
+                  | **B** | DONE | Sync state machine & failure semantics | 3, 12, exit-code half of 2 |\n\
+                  | ## C | > quoted | - bullet<br>- another | 7, 8, 9 |";
+        for w in 12..=110 {
+            let lines = render_markdown(md, w, &theme());
+            let widths: Vec<usize> = lines
+                .iter()
+                .map(|l| display_width(&line_text(l)))
+                .collect();
+            let Some(start) = lines
+                .iter()
+                .position(|l| line_text(l).trim_start().starts_with('┌'))
+            else {
+                continue; // width too small to render a table at all
+            };
+            let end = start
+                + lines[start..]
+                    .iter()
+                    .position(|l| line_text(l).trim_start().starts_with('└'))
+                    .expect("unterminated table");
+            for (i, &line_w) in widths[start..=end].iter().enumerate() {
+                assert_eq!(
+                    line_w,
+                    widths[start],
+                    "width {}: table line {} is {} columns, top rule is {}: {:?}",
+                    w,
+                    start + i,
+                    line_w,
+                    widths[start],
+                    all_text(&lines[start..=end]),
+                );
+            }
+        }
     }
 
     #[test]
