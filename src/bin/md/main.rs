@@ -228,8 +228,34 @@ fn run(
 ) -> Result<()> {
     let mut app = App::new(filepath)?;
 
+    // ── Redraw-on-demand ──────────────────────────────────────────────────────
+    //
+    // The viewer has no animation, no clock and no background work: its frame is
+    // a pure function of `App`.  Redrawing on a timer therefore buys nothing —
+    // it just re-runs `render_markdown` over the whole document (and
+    // `render`'s buffer diff, `hide_cursor` and `flush`) 5 times a second while
+    // the user is reading, which measured ~16% CPU on a 4 000-line file.
+    //
+    // Instead, draw only when something can have changed:
+    //
+    //   * the first frame, and after an $EDITOR round-trip (`needs_draw`);
+    //   * after any event, since the handlers are the only thing that mutates
+    //     `App` (a resize included — `term.draw` autoresizes and repaints).
+    //
+    // Idle therefore costs one blocking `poll(Duration::MAX)` per event instead
+    // of 200 ms of markdown rendering.  `poll` on an infinite timeout returns as
+    // soon as a key/resize arrives, so input latency is unchanged (better, if
+    // anything: no waiting for the next tick).
+    //
+    // A `None` (infinite) timeout is safe here because every path that needs a
+    // redraw does so after handling an event; nothing schedules future work.
+    let mut needs_draw = true;
+
     loop {
-        term.draw(|frame| render(frame, &app))?;
+        if needs_draw {
+            term.draw(|frame| render(frame, &app))?;
+            needs_draw = false;
+        }
 
         // Suspend TUI and launch $EDITOR when requested, then reload.
         if app.pending_editor {
@@ -239,19 +265,34 @@ fn run(
             // Clamp scroll to the new document length.
             let max = app.max_scroll.get();
             app.scroll.set(app.scroll.get().min(max));
+            needs_draw = true;
             continue;
-        }
-
-        if event::poll(Duration::from_millis(200))? {
-            match event::read()? {
-                Event::Key(key)    => handle_key(&mut app, key)?,
-                Event::Resize(..)  => { /* ratatui handles resize; next draw re-renders */ }
-                _ => {}
-            }
         }
 
         if app.should_quit {
             break;
+        }
+
+        if event::poll(Duration::MAX)? {
+            // Drain everything already queued before drawing.  A paste arrives
+            // as one burst of bytes, and rendering the document once per
+            // character would freeze the viewer for seconds; between keystrokes
+            // `poll(ZERO)` is false, so ordinary typing still draws per key.
+            loop {
+                match event::read()? {
+                    Event::Key(key)   => handle_key(&mut app, key)?,
+                    Event::Resize(..) => { /* ratatui autoresizes on the next draw */ }
+                    _ => {}
+                }
+                // Leave the rest of the burst for after the editor/exit.
+                if app.should_quit || app.pending_editor {
+                    break;
+                }
+                if !event::poll(Duration::ZERO)? {
+                    break;
+                }
+            }
+            needs_draw = true;
         }
     }
     Ok(())

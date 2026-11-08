@@ -574,6 +574,36 @@ When code sets `app.pending_editor = Some(...)`, the main event loop in
 Do **not** open an editor from inside a `handle_key_*` method; always set
 `pending_editor` and return.
 
+### Idle cost — draw on demand, never on a timer
+
+Both event loops draw **only when something changed**: a `needs_draw` flag is
+set for the first frame, after an `$EDITOR` round-trip, and after any event is
+handled; otherwise the loop blocks in `event::poll(Duration::MAX)`.
+
+`md` used to redraw unconditionally every 200 ms (`poll(200ms)` at the bottom
+of a `draw`-first loop). Its frame is a pure function of `App` — no animation,
+no clock — so that timer only re-ran `render_markdown` over the whole document
+plus the buffer diff, `hide_cursor` and `flush`, five times a second while the
+user read: ~16% CPU and ~100 B/s of terminal output on a 4 000-line file,
+falling to 0% and 0 B/s with the flag. `ptm`'s loop keeps its 200 ms tick only
+because its render output is time-dependent — reminder colours are keyed on
+`today` (`reminder_date_style` calls `SystemTime::now()`), so an idle redraw is
+what re-colours a reminder that goes overdue at midnight. If a renderer is ever
+made clock-independent, drop its tick too; if a clock enters `md`'s render,
+it needs one back.
+
+Two rules keep the flag honest:
+
+* **Anything that mutates `App` outside the key handlers must set `needs_draw`.**
+  That is why the `$EDITOR` branch sets it before its `continue`: without it the
+  reloaded document would not be painted until the next keystroke.
+* **Drain the event queue before drawing.** A paste arrives as a burst of
+  bytes, and one draw per character costs a full markdown render each (60
+  pasted chars measured 1.9 s of CPU). The inner `poll(Duration::ZERO)` loop
+  coalesces a burst into one draw; between keystrokes it is false, so ordinary
+  typing still paints per key. The loop breaks out early on `should_quit` /
+  `pending_editor` so the editor and the exit path never wait behind a queue.
+
 ---
 
 ## Data Layer (`repo.rs`)
