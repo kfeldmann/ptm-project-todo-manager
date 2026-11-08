@@ -2,7 +2,7 @@
 
 set -e
 
-BUILD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BUILD_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJ_DIR="$(cd "${BUILD_DIR}/.." && pwd)"
 
 "${BUILD_DIR}/build-linux-musl-x86_64" ptm
