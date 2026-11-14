@@ -2533,6 +2533,143 @@ mod tests {
         assert_eq!(app.pd_match_idx, 1, "N must step back to the previous match");
     }
 
+    // ── search: a query may contain spaces, and every match on a line must
+    //    be reachable with n/N ───────────────────────────────────────────────
+
+    /// Render the Description tab and return, per rendered row, the text of
+    /// every span painted with `bg`.  Lets a test assert *which* occurrence is
+    /// yellow, not merely how many marks exist.
+    ///
+    /// Rows 0..4 are the border, the tags row and the tab bar; the active tab
+    /// label is painted with `theme.highlight_bg`, which is the same DarkGray
+    /// the "other match" style uses, so the chrome is skipped.
+    fn styled_runs(app: &mut App, bg: ratatui::style::Color) -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        term.draw(|frame| crate::ui::render(frame, app)).expect("draw");
+        let buf = term.backend().buffer().clone();
+        let mut runs = Vec::new();
+        for y in 4..buf.area.height {
+            let mut cur = String::new();
+            for x in 0..buf.area.width {
+                let cell = &buf[(x, y)];
+                if cell.style().bg == Some(bg) {
+                    cur.push_str(cell.symbol());
+                } else {
+                    if !cur.trim().is_empty() { runs.push(cur.trim().to_string()); }
+                    cur.clear();
+                }
+            }
+            if !cur.trim().is_empty() { runs.push(cur.trim().to_string()); }
+        }
+        runs
+    }
+
+    fn description_app(description: &str, query: &str) -> App {
+        let mut app = mk_app();
+        let p = repo::create_project(&app.conn, "Proj").unwrap();
+        repo::update_project_description(&app.conn, &p.id, description).unwrap();
+        app.open_project_detail(&p.id).unwrap();
+        app.pd_tab = PdTab::Description;
+        app.pd_search = query.into();
+        app.pd_match_idx = 0;
+        draw(&mut app, 80, 24);
+        app
+    }
+
+    /// A search query containing a space must match.  The markdown renderer
+    /// emits one span per word, so matching span-by-span (the old approach)
+    /// could never find `/We the people` — the highlight vanished as soon as a
+    /// space was typed.
+    #[test]
+    fn a_search_query_may_contain_spaces() {
+        let mut app = description_app("We the people of the United States.", "We the people");
+        assert_eq!(
+            app.metrics.match_marks.borrow().len(),
+            1,
+            "the phrase must be found"
+        );
+        assert_eq!(
+            styled_runs(&mut app, ratatui::style::Color::Yellow),
+            vec!["We the people"],
+            "the whole phrase must be highlighted"
+        );
+    }
+
+    /// Every match on one rendered line must be reachable, and exactly the
+    /// current one must be yellow.  Before the fix `n` moved the pointer but
+    /// no match on a multi-match line was ever painted.
+    #[test]
+    fn n_cycles_the_yellow_match_between_occurrences_on_one_line() {
+        let mut app = description_app("alpha beta alpha alpha", "alpha");
+        assert_eq!(app.metrics.match_marks.borrow().len(), 3);
+
+        for expected_occurrence in 0..3 {
+            let yellow = styled_runs(&mut app, ratatui::style::Color::Yellow);
+            assert_eq!(yellow, vec!["alpha"], "exactly one match is yellow");
+            let gray = styled_runs(&mut app, ratatui::style::Color::DarkGray);
+            assert_eq!(gray.len(), 2, "the other two matches are gray");
+
+            // Identify *which* occurrence is yellow by its column.
+            let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+            let buf = term.backend().buffer().clone();
+            let mut x0 = None;
+            'outer: for y in 0..buf.area.height {
+                for x in 0..buf.area.width {
+                    if buf[(x, y)].style().bg == Some(ratatui::style::Color::Yellow) {
+                        x0 = Some(x);
+                        break 'outer;
+                    }
+                }
+            }
+            let x0 = x0.expect("a yellow match");
+            let before: String = (0..x0)
+                .map(|x| buf[(x, 4)].symbol().to_string())
+                .collect();
+            assert_eq!(
+                before.matches("alpha").count(),
+                expected_occurrence,
+                "n must step through occurrences left to right"
+            );
+            app.handle_key(key(KeyCode::Char('n'))).unwrap();
+        }
+    }
+
+    /// `N` must step backwards through the same occurrences, wrapping.
+    #[test]
+    fn shift_n_wraps_backwards_through_occurrences_on_one_line() {
+        let mut app = description_app("alpha alpha alpha", "alpha");
+        app.handle_key(key(KeyCode::Char('N'))).unwrap();
+        assert_eq!(app.pd_match_idx, 2, "N wraps to the last match");
+        app.handle_key(key(KeyCode::Char('N'))).unwrap();
+        assert_eq!(app.pd_match_idx, 1);
+    }
+
+    /// A phrase match that spans a styled boundary (`**bold**`) must keep the
+    /// surrounding text's styling and lose no characters.
+    #[test]
+    fn a_phrase_match_survives_markdown_styling() {
+        let mut app = description_app("We the **people** said", "the people");
+        assert_eq!(app.metrics.match_marks.borrow().len(), 1);
+        assert_eq!(
+            styled_runs(&mut app, ratatui::style::Color::Yellow),
+            vec!["the people"]
+        );
+    }
+
+    /// A stale `pd_match_idx` (from a longer previous query) must not leave the
+    /// screen with no current match at all.
+    #[test]
+    fn a_stale_match_index_still_highlights_the_last_match() {
+        let mut app = description_app("alpha alpha", "alpha");
+        app.pd_match_idx = 99;
+        assert_eq!(
+            styled_runs(&mut app, ratatui::style::Color::Yellow),
+            vec!["alpha"],
+            "the index must clamp to the last match"
+        );
+    }
+
     // ── finding #15: the Warn overlay must not eat the key ──────────────────
 
     #[test]

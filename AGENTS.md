@@ -68,6 +68,11 @@ src/
 │   │                  find_matches/split_matches; shared with `md`
 │   │                  (path-included — edit this file, never a copy)
 │   ├── markdown.rs  — Markdown → ratatui renderer; shared with `md` (path-included)
+│   ├── search.rs    — search-match highlighting over *rendered* lines
+│   │                  (`highlight` / `highlight_line` / `MatchLoc`); searches
+│   │                  each line's concatenated span text so a query with a
+│   │                  space matches across the per-word spans markdown.rs
+│   │                  emits; shared with `md` (path-included)
 │   └── views/
 │       ├── mod.rs               — shared helpers (list pagination; re-exports ui::text)
 │       ├── project_list.rs      — Project List screen renderer
@@ -79,7 +84,7 @@ src/
     │   └── main.rs     — clap subcommands: keygen/encrypt/decrypt/export/import
     ├── md/          — md binary (Markdown viewer + spell check)
     │   ├── main.rs     — TUI viewer: scroll, incremental search, $EDITOR, S:spell
-    │   ├── ui.rs       — path-includes src/ui/{theme,markdown,text}.rs
+    │   ├── ui.rs       — path-includes src/ui/{theme,markdown,search,text}.rs
     │   └── log.rs      — thin wrapper over the shared src/log.rs (selects the
     │                     `md` directory → $XDG_DATA_HOME/md/md.log)
     └── ptm_sync/    — ptm-sync binary (S3 backup sync; see §ptm-sync below)
@@ -705,12 +710,40 @@ All wrapping, truncation, padding and row-height arithmetic goes through
 text — use `pad_to_width`. `views/mod.rs` re-exports these as `super::…` for
 the view modules.
 
-Case-insensitive search matching also lives here (`find_matches` /
-`split_matches`): they map a case-folded match back onto whole characters of
-the original text. Using lowercased offsets directly against the original is
-wrong because folding is not length-preserving (`'İ'` lowercases to two chars,
-finding #17). `views/project_detail.rs` and `bin/md/main.rs` both call these —
-do not reintroduce a local copy.
+Case-insensitive matching lives here: `find_matches` returns the char ranges of
+every occurrence, mapping a case-folded match back onto whole characters of the
+original text. Using lowercased offsets directly against the original is wrong
+because folding is not length-preserving (`'İ'` lowercases to two chars,
+finding #17). `split_matches` is the segment-level form of the same thing.
+
+### Search highlighting — `ui/search.rs`
+
+`ui/search.rs` (path-included by `md`) turns those ranges into styled
+`ratatui` spans. Both binaries use it; **do not reintroduce a local copy** —
+`views/project_detail.rs` and `bin/md/main.rs` each had one, and they had
+already drifted.
+
+| Function | Use |
+|----------|-----|
+| `highlight(lines, q, current_idx, cur_style, other_style)` | whole buffer: styles every match, paints the current one, returns `Highlighted { lines, marks }` |
+| `highlight_line(line, q, style)` | one row, all matches in one style (lists that do not navigate) |
+
+Two rules, both of which were live bugs:
+
+* **Match on the whole line, not per span.** `markdown.rs` emits one span per
+  word (and separate spans for markup, list markers and table cells), so a
+  query containing a space never fits inside a single span: `/We the people`
+  highlighted nothing, and the highlight vanished as soon as a space was typed.
+  `search::highlight` concatenates a line's spans, matches, then maps the char
+  ranges back onto the spans, keeping each span's base style.
+* **The current-match pointer is a flat index into `marks`.** Style every match
+  in one pass and index it — an implementation that only advances its
+  occurrence counter while hunting for the current match leaves `n` moving the
+  pointer with no match ever painted yellow on a line that holds several.
+
+A match cannot cross a *rendered line* boundary (a word-wrap point or a block
+break); lines are searched independently, which keeps the `(line, occ)`
+coordinates that `n`/`N` navigation is built on exact.
 
 ### Reminder display
 Reminder dates are stored as `YYYY-MM-DD` strings and truncated to 10
@@ -962,8 +995,8 @@ tail -f ~/.local/share/md/md.log     # md
   `render_updates_tab` in `project_detail.rs`). Don't render a list widget
   straight into the full content area with raw `ListItem`s.
 - **Shared files are `#[path]`-included, never copied** — `crypto.rs`,
-  `spell.rs`, `paths.rs`, `log.rs`, `ui/text.rs`, `ui/markdown.rs` and
-  `ui/theme.rs` are compiled into more than one binary. Editing a "copy" under
+  `spell.rs`, `paths.rs`, `log.rs`, `ui/text.rs`, `ui/search.rs`,
+  `ui/markdown.rs` and `ui/theme.rs` are compiled into more than one binary. Editing a "copy" under
   `src/bin/…` is always wrong: there is no copy, only a `mod` declaration
   pointing back at the shared file. Each `src/bin/<x>/` directory contains
   only what is genuinely specific to that binary (its `main.rs`, plus `md`'s

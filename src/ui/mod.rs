@@ -1,4 +1,5 @@
 pub mod markdown;
+pub mod search;
 pub mod text;
 pub mod theme;
 pub mod views;

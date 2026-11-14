@@ -40,21 +40,28 @@ import ptmdb  # noqa: E402
 results = ptmdb.Results("search-highlight")
 
 TEXT_SRC = ptmdb.REPO / "src/ui/text.rs"
+SEARCH_SRC = ptmdb.REPO / "src/ui/search.rs"
 
 
 def build_and_run(root, body, call):
-    """Compile the real `src/ui/text.rs` (path-included) and run the probe.
+    """Compile the real `src/ui/text.rs` + `src/ui/search.rs` and run the probe.
 
-    A scratch crate rather than a bare `rustc` call: the module needs
-    `unicode-width`, and letting cargo resolve it means the probe builds with
-    the same compiler and the same already-built dependency as the binaries.
-    The crate lives under the workspace's own `target/`, so the dependency is
-    not rebuilt.
+    A scratch crate rather than a bare `rustc` call: the modules need
+    `unicode-width` and `ratatui`, and letting cargo resolve them means the
+    probe builds with the same compiler and the same already-built
+    dependencies as the binaries.  The crate lives under the workspace's own
+    `target/`, so nothing is rebuilt.
     """
     crate = root / "probe_search"
     (crate / "src").mkdir(parents=True, exist_ok=True)
+    # The real modules address each other as `crate::ui::text::…`, so the
+    # probe mirrors that shape instead of flattening them to the crate root.
     (crate / "src/main.rs").write_text(
-        f'#[path = "{TEXT_SRC}"]\nmod text;\nuse text::*;\n\n{body}\nfn main() {{\n{call}\n}}\n'
+        f'mod ui {{\n'
+        f'    #[path = "{TEXT_SRC}"]\n    pub mod text;\n'
+        f'    #[path = "{SEARCH_SRC}"]\n    pub mod search;\n'
+        f'}}\n'
+        f'use ui::text::*;\nuse ui::search::*;\n\n{body}\nfn main() {{\n{call}\n}}\n'
     )
     (crate / "Cargo.toml").write_text(
         '''[package]
@@ -64,6 +71,7 @@ edition = "2021"
 
 [dependencies]
 unicode-width = "0.2"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache"] }
 
 [[bin]]
 name = "probe_search"
@@ -112,9 +120,19 @@ def check_call_sites():
     }
     for label, path in sites.items():
         src = path.read_text()
+        # Both renderers now go through `ui::search`, the single highlighter
+        # that also handles phrase queries spanning several spans (a query with
+        # a space never fit inside one span, so `/We the people` matched
+        # nothing).  `ui::search` itself calls `text::find_matches`.
         results.check(
-            "text::split_matches(" in src,
-            f"{label} uses ui::text::split_matches",
+            "search::highlight(" in src or "ui::search::highlight(" in src,
+            f"{label} uses ui::search::highlight",
+        )
+        # No per-binary copy of the matcher may come back: the two copies had
+        # already drifted (md's miscounted occurrences within a line).
+        results.check(
+            "fn split_span" not in src and "fn compute_search_matches" not in src,
+            f"{label} has no private highlighter copy left",
         )
         # The defect was indexing the *original* text with offsets taken from
         # the lowercased copy.  Lowercasing the query (`search.to_lowercase()`)
@@ -149,6 +167,33 @@ CASES = [
     ("日本語テキスト", "語", ["語"]),
     ("aaa", "a", ["a", "a", "a"]),
     ("no match here", "zzz", []),
+]
+
+
+# (description, rendered-line span texts, query, current index, expected
+# yellow text) — the two defects reported against `/` in the Project Detail
+# Description tab and the update viewer.
+#
+# `render_markdown` emits one span per word, which is what makes a phrase query
+# fail when matching is done span-by-span.
+HIGHLIGHT_CASES = [
+    # A phrase spans several spans.  Before the fix this matched nothing at all
+    # and the highlight vanished as soon as a space was typed.
+    (
+        "phrase across per-word spans",
+        ["We", " ", "the", " ", "people", " of the United States"],
+        "We the people", 0, "We the people",
+    ),
+    # Several matches on one line: the current one must be yellow and it must
+    # move with the pointer.  Before the fix `n` moved the pointer but left
+    # every match gray.
+    ("first of three on one line", ["alpha beta alpha alpha"], "alpha", 0, "alpha"),
+    ("second of three on one line", ["alpha beta alpha alpha"], "alpha", 1, "alpha"),
+    ("third of three on one line", ["alpha beta alpha alpha"], "alpha", 2, "alpha"),
+    # The markdown renderer's markup spans must not break a match.
+    ("phrase across a bold boundary", ["We the ", "people", " said"], "the people", 0, "the people"),
+    # A wide character match must not be split.
+    ("wide character", ["日本語テキスト"], "語", 0, "語"),
 ]
 
 
@@ -217,8 +262,64 @@ fn check(text: &str, query: &str, want: Vec<&str>) {
         if got != want:
             print(f"        legacy {query!r} in {text!r} -> {got} (correct: {want})")
 
+    check_highlight_cases()
     check_call_sites()
     return results.finish()
+
+
+def check_highlight_cases():
+    """Drive the real `ui::search::highlight` on the reported defects."""
+    call_lines = []
+    for label, spans, query, current, want in HIGHLIGHT_CASES:
+        spans_lit = "vec![" + ", ".join(rust_str(x) for x in spans) + "]"
+        call_lines.append(
+            f'    check_hl({rust_str(label)}, {spans_lit}, {rust_str(query)}, '
+            f'{current}, {rust_str(want)});'
+        )
+    body = r'''
+use ratatui::style::{Color, Style};
+use ratatui::text::{Line, Span};
+
+fn check_hl(label: &str, spans: Vec<&str>, query: &str, current: usize, want: &str) {
+    let q: Vec<char> = query.to_lowercase().chars().collect();
+    let line = Line::from(spans.iter().map(|s| Span::raw(s.to_string())).collect::<Vec<_>>());
+    let cur = Style::default().bg(Color::Yellow);
+    let other = Style::default().bg(Color::DarkGray);
+    let hl = highlight(vec![line], &q, Some(current), cur, other);
+    let yellow: String = hl.lines[0].spans.iter()
+        .filter(|s| s.style.bg == Some(Color::Yellow))
+        .map(|s| s.content.as_ref()).collect::<String>();
+    let joined: String = hl.lines[0].spans.iter()
+        .map(|s| s.content.as_ref()).collect::<String>();
+    let original: String = spans.concat();
+    let ok = yellow == want && joined == original;
+    println!("{}|{}|{}|{}", if ok {"PASS"} else {"FAIL"}, label, yellow, want);
+}
+'''
+    call = "\n".join(call_lines)
+    with ptmdb.TempWorkspace("ptm-search-hl-") as root:
+        ok, stdout, stderr = build_and_run(root, body, call)
+        if not ok:
+            results.check(False, "the highlight probe compiled against src/ui/search.rs", stderr)
+            return
+        print("checking current-match highlighting and phrase search\n")
+        seen = 0
+        for line in stdout.strip().splitlines():
+            parts = line.split("|")
+            if len(parts) != 4:
+                continue
+            seen += 1
+            status, label, got, want = parts
+            results.check(
+                status == "PASS",
+                f"{label}: the yellow match is {want!r}",
+                f"got {got!r}",
+            )
+        results.check(
+            seen == len(HIGHLIGHT_CASES),
+            f"all {len(HIGHLIGHT_CASES)} highlight cases reported a verdict",
+            stdout or stderr,
+        )
 
 
 if __name__ == "__main__":

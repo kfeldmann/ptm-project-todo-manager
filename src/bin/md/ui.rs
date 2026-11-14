@@ -12,6 +12,12 @@ pub mod theme;
 #[path = "../../ui/markdown.rs"]
 pub mod markdown;
 
+/// Search-match highlighting over rendered lines — shared from the main ptm
+/// source so `ptm` and `md` highlight (and count) matches identically.
+#[path = "../../ui/search.rs"]
+#[allow(dead_code)] // `highlight_line` is only used by ptm's list views
+pub mod search;
+
 /// Width-aware text helpers (wrapping, padding, truncation, search matching) —
 /// shared from the main ptm source so `ptm` and `md` wrap text identically.
 ///

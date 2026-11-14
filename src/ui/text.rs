@@ -371,6 +371,12 @@ pub fn find_matches(text: &str, lower_query: &[char]) -> Vec<(usize, usize)> {
 /// segments flagged `true` are the matched regions of the *original* text.
 /// With no matches the whole string comes back as a single non-match piece, so
 /// callers never have to special-case an empty result.
+///
+/// The renderers no longer call this directly: `ui::search` needs the char
+/// *ranges* (`find_matches`) so it can map a match onto the several spans a
+/// rendered line is split into.  This remains the segment-level API for tests
+/// and `dev-harness/search-highlight.py`, which pins the case-fold behaviour.
+#[allow(dead_code)]
 pub fn split_matches(text: &str, lower_query: &[char]) -> Vec<(String, bool)> {
     let ranges = find_matches(text, lower_query);
     if ranges.is_empty() {

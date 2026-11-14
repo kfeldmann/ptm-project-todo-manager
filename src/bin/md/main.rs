@@ -58,16 +58,6 @@ use ratatui::{
 
 use ui::theme::Theme;
 
-/// One search match: its wrapped output line plus the ordinal of the matched
-/// occurrence within that line (a line may contain several matches).
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct SearchMark {
-    /// Line index into the rendered (wrapped) output.
-    line:   usize,
-    /// Which occurrence within the line (0-based).
-    occ:    usize,
-}
-
 // ─── Overlay ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -117,10 +107,10 @@ struct App {
     /// the match is visible.  Free scrolling (j/k/g/G) is never fought by
     /// render — only an explicit match change re-centers the view.
     match_dirty:  std::cell::Cell<bool>,
-    /// Published by `render`: flat line indices of all matches after wrapping,
-    /// ordered by position (with an interior `.0` pointing at the wrapped match
-    /// so callers can map a query position back to the right match).
-    match_marks:  std::cell::RefCell<Vec<SearchMark>>,
+    /// Published by `render`: every match, ordered by rendered line and
+    /// occurrence within that line.  `jump_match` (n / N) indexes it with
+    /// `match_idx` and scrolls to the `.line` it finds.
+    match_marks:  std::cell::RefCell<Vec<ui::search::MatchLoc>>,
 
     // Overlays.
     overlay:      Option<Overlay>,
@@ -641,32 +631,37 @@ fn render(frame: &mut Frame, app: &App) {
     let render_width = content_area.width as usize;
     let raw_lines    = ui::markdown::render_markdown(&app.content, render_width, &theme);
 
-    // Apply search highlight.  The "current" match (index `match_idx`)
-    // is yellow; all other matches are dim gray.  Match positions are computed
-    // fresh each frame so the navigation state stays in sync with the text.
+    // Apply search highlight.  The "current" match (index `match_idx`) is
+    // yellow; all other matches are dim gray.  `ui::search::highlight` locates
+    // matches on each rendered *line* (so phrases spanning several of the
+    // markdown renderer's per-word spans are found), clamps the current index
+    // to the real number of matches, and returns both the restyled lines and
+    // the marks for n/N.
     let lower_query: Vec<char> = app.search.to_lowercase().chars().collect();
-    let (md_lines, cur_match_line) = compute_search_matches(raw_lines, &lower_query);
-    {
-        let mut marks = app.match_marks.borrow_mut();
-        marks.clear();
-        *marks = cur_match_line.clone();
-    }
-    // Clamp the current-match index to the number of matches (e.g. the query
-    // just changed and now matches fewer places).
-    let n_marks = cur_match_line.len();
-    if n_marks == 0 {
-        app.match_idx.set(0);
-    } else if app.match_idx.get() >= n_marks {
-        app.match_idx.set(n_marks - 1);
-    }
-    let hl_current = search_hl_style();
-    let md_lines = highlight_lines_with_current(
-        md_lines,
+    let highlighted = ui::search::highlight(
+        raw_lines,
         &lower_query,
-        &cur_match_line,
-        app.match_idx.get(),
-        hl_current,
+        Some(app.match_idx.get()),
+        search_hl_style(),
+        other_match_style(),
     );
+    let marks = highlighted.marks;
+    let md_lines = highlighted.lines;
+
+    // Keep `match_idx` in range so the "match i/n" hint and n/N stay sane.
+    // (`highlight` already clamped the style it applied; this keeps the stored
+    // pointer honest for the next frame.)
+    if marks.is_empty() {
+        app.match_idx.set(0);
+    } else if app.match_idx.get() >= marks.len() {
+        app.match_idx.set(marks.len() - 1);
+    }
+    // Publish the marks for `jump_match` (n / N).
+    {
+        let mut stored = app.match_marks.borrow_mut();
+        stored.clear();
+        stored.extend_from_slice(&marks);
+    }
 
     let total_lines    = md_lines.len();
     let content_height = content_area.height as usize;
@@ -682,10 +677,10 @@ fn render(frame: &mut Frame, app: &App) {
     // has just changed (query edit or n/N).  This leaves free scrolling
     // (j/k/g/G) untouched, even when that moves the match off-screen; a
     // subsequent n/N scrolls the match back into view.
-    if !cur_match_line.is_empty() && app.match_dirty.get() {
+    if !marks.is_empty() && app.match_dirty.get() {
         let cur_scroll = app.scroll.get().min(max_scroll);
-        let ci = app.match_idx.get().min(cur_match_line.len() - 1);
-        let mline = cur_match_line[ci].line;
+        let ci = app.match_idx.get().min(marks.len() - 1);
+        let mline = marks[ci].line;
         if mline < cur_scroll {
             app.scroll.set(mline);
         } else if mline >= cur_scroll + view_height {
@@ -1109,71 +1104,19 @@ fn jump_match(app: &mut App, delta: isize) {
 }
 
 // ─── Search-highlight helpers ─────────────────────────────────────────────────
+//
+// The matching lives in `ui::search`, shared with `ptm`: it searches the
+// concatenated text of each *rendered line*, so a query containing a space
+// (`/We the people`) matches across the per-word spans `markdown.rs` emits.
+// The styles below are `md`'s palette; the old per-span copies here had already
+// drifted from `ptm`'s and miscounted occurrences within a line.
 
-/// Locate all case-insensitive matches of `lower_query` in rendered output,
-/// recording each match's line and occurrence-within-line.  Every match span
-/// is tagged with a neutral marker style (`other_match_style()`); the caller
-/// restyles the current match via `highlight_lines_with_current`.
-fn compute_search_matches(
-    lines: Vec<Line<'static>>,
-    lower_query: &[char],
-) -> (Vec<Line<'static>>, Vec<SearchMark>) {
-    if lower_query.is_empty() {
-        return (lines, Vec::new());
-    }
-    let mut positions: Vec<SearchMark> = Vec::new();
-    let lines: Vec<Line<'static>> = lines
-        .into_iter()
-        .enumerate()
-        .map(|(li, line)| {
-            let mut occ = 0usize;
-            let spans: Vec<Span<'static>> = line
-                .spans
-                .into_iter()
-                .flat_map(|s| {
-                    let (spans, hit) = split_span_hits(s, lower_query);
-                    if hit {
-                        positions.push(SearchMark { line: li, occ });
-                        occ += 1;
-                    }
-                    spans
-                })
-                .collect();
-            Line::from(spans)
-        })
-        .collect();
-    (lines, positions)
-}
-
-/// Split one span at every case-insensitive occurrence of `lower_query`,
-/// also reporting whether the span contained a match.
-///
-/// The matching itself lives in [`ui::text::split_matches`], which maps a
-/// case-folded match back onto whole characters of the original text.  The
-/// previous version here (and its twin in `views/project_detail.rs`) used the
-/// lowercased offsets directly against the original string, so a query
-/// containing `İ` highlighted one character too many (finding #17).
-fn split_span_hits(span: Span<'static>, lower_query: &[char]) -> (Vec<Span<'static>>, bool) {
-    let base = span.style;
-    let text = span.content.into_owned();
-    if text.is_empty() || lower_query.is_empty() {
-        return (vec![Span::styled(text, base)], false);
-    }
-    let mut hit = false;
-    let out = ui::text::split_matches(&text, lower_query)
-        .into_iter()
-        .map(|(seg, is_match)| {
-            if is_match {
-                hit = true;
-                // Placeholder style for the match segment; the current-match
-                // pass (highlight_lines_with_current) fixes this up afterwards.
-                Span::styled(seg, other_match_style())
-            } else {
-                Span::styled(seg, base)
-            }
-        })
-        .collect();
-    (out, hit)
+/// Style for the current search match (bright yellow).
+fn search_hl_style() -> Style {
+    Style::default()
+        .bg(Color::Yellow)
+        .fg(Color::Black)
+        .add_modifier(Modifier::BOLD)
 }
 
 /// Style for non-current search matches (dim gray background).
@@ -1181,56 +1124,6 @@ fn other_match_style() -> Style {
     Style::default()
         .bg(Color::DarkGray)
         .fg(Color::White)
-}
-
-/// Restyle match segments: the match at `current` gets `hl_current` (yellow),
-/// every other match keeps the dim `other_match_style()`.  Match segments are
-/// identified by their marker background colour set in `split_span_hits`.
-fn highlight_lines_with_current(
-    lines: Vec<Line<'static>>,
-    lower_query: &[char],
-    marks: &[SearchMark],
-    current_idx: usize,
-    hl_current: Style,
-) -> Vec<Line<'static>> {
-    if lower_query.is_empty() {
-        return lines;
-    }
-    let current: Option<SearchMark> =
-        if marks.is_empty() { None } else { Some(marks[current_idx.min(marks.len() - 1)]) };
-
-    let mut occ = 0usize;
-    lines
-        .into_iter()
-        .enumerate()
-        .map(|(li, line)| {
-            occ = 0;
-            Line::from(
-                line.spans
-                    .into_iter()
-                    .map(|span| {
-                        if span.style.bg == other_match_style().bg {
-                            let is_cur = current == Some(SearchMark { line: li, occ });
-                            if is_cur {
-                                occ += 1;
-                            }
-                            let style = if is_cur { hl_current } else { other_match_style() };
-                            Span::styled(span.content.into_owned(), style)
-                        } else {
-                            span
-                        }
-                    })
-                    .collect::<Vec<_>>(),
-            )
-        })
-        .collect()
-}
-
-fn search_hl_style() -> Style {
-    Style::default()
-        .bg(Color::Yellow)
-        .fg(Color::Black)
-        .add_modifier(Modifier::BOLD)
 }
 
 // ─── Hint-bar height helper ───────────────────────────────────────────────────
@@ -1248,11 +1141,18 @@ fn hint_height_fn(text: &str, width: u16) -> u16 {
 mod tests {
     use super::*;
 
-    // ── finding #17: the `md` search highlighter must not drift ─────────────
+    // ── search highlighting (shared with ptm: `ui::search`) ────────────────
 
-    fn split(text: &'static str, query: &str) -> (Vec<Span<'static>>, bool) {
+    fn highlight_text(text: &str, query: &str, current: usize) -> Vec<Span<'static>> {
         let q: Vec<char> = query.to_lowercase().chars().collect();
-        split_span_hits(Span::styled(text, Style::default()), &q)
+        let hl = ui::search::highlight(
+            vec![Line::from(Span::raw(text.to_string()))],
+            &q,
+            Some(current),
+            search_hl_style(),
+            other_match_style(),
+        );
+        hl.lines.into_iter().next().unwrap().spans
     }
 
     fn matched(spans: &[Span<'static>]) -> Vec<String> {
@@ -1264,24 +1164,99 @@ mod tests {
             .collect()
     }
 
+    fn current(spans: &[Span<'static>]) -> Vec<String> {
+        let cur = search_hl_style().bg;
+        spans
+            .iter()
+            .filter(|s| s.style.bg == cur)
+            .map(|s| s.content.to_string())
+            .collect()
+    }
+
     #[test]
     fn the_md_highlighter_does_not_drift_when_case_folding_changes_length() {
         // 'İ' lowercases to two chars; using the lowercased offsets against
         // the original highlighted `İs` instead of `İ`.
-        assert_eq!(matched(&split("İstanbul", "İ").0), vec!["İ"]);
-        assert_eq!(matched(&split("İstanbul", "i").0), vec!["İ"]);
-        assert_eq!(matched(&split("İstanbul", "stan").0), vec!["stan"]);
+        assert_eq!(current(&highlight_text("İstanbul", "İ", 0)), vec!["İ"]);
+        assert_eq!(current(&highlight_text("İstanbul", "i", 0)), vec!["İ"]);
+        assert_eq!(current(&highlight_text("İstanbul", "stan", 0)), vec!["stan"]);
     }
 
     #[test]
-    fn the_md_highlighter_keeps_every_character_and_reports_hits() {
+    fn the_md_highlighter_keeps_every_character() {
         for (text, query) in [("İstanbul", "İ"), ("hello", "l"), ("none", "zz"), ("日本語", "本")] {
-            let (spans, hit) = split(text, query);
+            let spans = highlight_text(text, query, 0);
             let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
             assert_eq!(joined, text, "query {query:?}");
-            assert_eq!(hit, !matched(&spans).is_empty(), "query {query:?}");
         }
-        assert_eq!(matched(&split("aaa", "a").0), vec!["a", "a", "a"]);
+        assert_eq!(matched(&highlight_text("aaa", "a", 99)), vec!["a", "a"]);
+        assert_eq!(current(&highlight_text("aaa", "a", 99)), vec!["a"]);
+    }
+
+    #[test]
+    fn moving_the_current_index_moves_the_yellow_match_within_one_line() {
+        // Regression: `n` used to move the pointer but never repaint, so a
+        // line with several matches had no yellow match at all after the first.
+        for idx in 0..3 {
+            let spans = highlight_text("alpha beta alpha alpha", "alpha", idx);
+            assert_eq!(current(&spans), vec!["alpha"], "one yellow match at idx {idx}");
+            assert_eq!(matched(&spans).len(), 2, "two gray matches at idx {idx}");
+            let yellow_pos = spans
+                .iter()
+                .position(|s| s.style.bg == search_hl_style().bg)
+                .expect("a current match");
+            let before: String = spans[..yellow_pos].iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(before.matches("alpha").count(), idx, "wrong occurrence at idx {idx}");
+        }
+    }
+
+    #[test]
+    fn a_phrase_matches_across_the_per_word_spans_of_the_renderer() {
+        // The markdown renderer emits one span per word, so `/We the people`
+        // used to highlight nothing at all.
+        let lines = vec![Line::from(vec![
+            Span::raw("We"), Span::raw(" "), Span::raw("the"), Span::raw(" "),
+            Span::raw("people"), Span::raw(" of the United States"),
+        ])];
+        let q: Vec<char> = "we the people".chars().collect();
+        let hl = ui::search::highlight(lines, &q, Some(0), search_hl_style(), other_match_style());
+        assert_eq!(hl.marks.len(), 1);
+        let yellow: String = hl.lines[0]
+            .spans
+            .iter()
+            .filter(|s| s.style.bg == search_hl_style().bg)
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(yellow, "We the people");
+    }
+
+    /// End-to-end through `render`: a multi-word query highlights, and the
+    /// current match is the yellow one.
+    #[test]
+    fn rendering_a_phrase_query_highlights_the_whole_phrase() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("md-search-{}.md", std::process::id()));
+        std::fs::write(&path, "We the people of the United States.\n").unwrap();
+        let mut app = App::new(path.clone()).expect("app");
+        let _ = std::fs::remove_file(&path);
+
+        app.search = "We the people".into();
+        app.match_idx.set(0);
+
+        let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        term.draw(|f| render(f, &app)).unwrap();
+        let buf = term.backend().buffer().clone();
+
+        let yellow: String = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| buf[(x, y)].style().bg == Some(Color::Yellow))
+            .map(|(x, y)| buf[(x, y)].symbol().to_string())
+            .collect();
+        assert_eq!(yellow, "We the people", "the phrase must be highlighted as one match");
+        assert_eq!(app.match_marks.borrow().len(), 1);
     }
 
     // ── finding #16: hint height is measured in columns ────────────────────

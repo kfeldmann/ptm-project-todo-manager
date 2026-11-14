@@ -12,16 +12,14 @@ use crate::data::models::{TodoStatus, Update};
 use crate::ui::theme::Theme;
 
 // ─── Search-highlight helpers ─────────────────────────────────────────────────
+//
+// The matching itself lives in `ui::search`, shared with `md`: it searches the
+// concatenated text of each *rendered line* so a query containing a space
+// (`/We the people`) can match across the per-word spans `markdown.rs` emits.
+// This module only supplies the palette and adapts the result to
+// `PublishedMetrics`.
 
-/// One search match, in coordinates of the *rendered* (wrapped) output.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct MatchLoc {
-    /// Line index into the rendered line vector.
-    pub line: usize,
-    /// Ordinal of this occurrence within its line (0-based), counted in
-    /// match order across all spans of that line.
-    pub occ:  usize,
-}
+use crate::ui::search::{self, MatchLoc};
 
 /// Style applied to the *current* search match (the one pointed at by
 /// `pd_match_idx`, i.e. the target of n/N navigation).
@@ -39,153 +37,6 @@ fn search_hl_other_style() -> Style {
         .fg(Color::White)
 }
 
-/// Split a single `Span<'static>` into multiple spans, wrapping all
-/// case-insensitive occurrences of `lower_query` (a char slice,
-/// pre-lowercased) with a per-occurrence style.
-///
-/// `this_line` is the rendered line's index; `current` is the
-/// (line, occ) location of the current match, if any.  Matching the current
-/// location gets `current_style`; all other occurrences get `other_style`.
-/// `next_occ` counts the occurrences seen so far in this line (callers pass
-/// `Some(&mut counter)` so occurrences stay in sync across spans).
-fn split_span(
-    span: Span<'static>,
-    lower_query: &[char],
-    this_line: usize,
-    current: Option<MatchLoc>,
-    current_style: Style,
-    other_style: Style,
-    next_occ: Option<&mut usize>,
-) -> Vec<Span<'static>> {
-    let base = span.style;
-    let text = span.content.into_owned();
-    if text.is_empty() || lower_query.is_empty() {
-        return vec![Span::styled(text, base)];
-    }
-
-    let fallback = &mut 0usize;
-    let occ_counter: &mut usize = next_occ.unwrap_or(fallback);
-
-    // The matching lives in `ui::text::split_matches`, which maps a
-    // case-folded match back onto whole characters of the original text.
-    // Using lowercased offsets directly against the original (as this used to)
-    // mis-highlights whenever folding changes the length — `'İ'` lowercases to
-    // two chars, so searching `İ` in `İstanbul` highlighted `İs` (finding #17).
-    let mut out: Vec<Span<'static>> = Vec::new();
-    for (seg, is_match) in crate::ui::text::split_matches(&text, lower_query) {
-        if is_match {
-            let is_current = current == Some(MatchLoc { line: this_line, occ: *occ_counter });
-            let style = if is_current { current_style } else { other_style };
-            out.push(Span::styled(seg, style));
-            *occ_counter += 1;
-        } else {
-            out.push(Span::styled(seg, base));
-        }
-    }
-    out
-}
-
-/// Re-process already-rendered `Vec<Line<'static>>` (e.g. from the markdown
-/// renderer) and highlight all occurrences of `lower_query` within every span.
-/// Returns the restyled lines plus the position of every match so callers can
-/// navigate with n / N.  Every match gets the "other" style here; callers then
-/// call `style_current_match` to paint the current match yellow.
-fn apply_search_highlight(
-    lines: Vec<Line<'static>>,
-    lower_query: &[char],
-) -> (Vec<Line<'static>>, Vec<MatchLoc>) {
-    if lower_query.is_empty() {
-        return (lines, Vec::new());
-    }
-    let mut positions: Vec<MatchLoc> = Vec::new();
-    let lines = lines
-        .into_iter()
-        .enumerate()
-        .map(|(li, line)| {
-            let mut occ = 0usize;
-            let spans: Vec<Span<'static>> = line
-                .spans
-                .into_iter()
-                .flat_map(|span| {
-                    let before = occ;
-                    let spans = split_span(
-                        span,
-                        lower_query,
-                        li,
-                        None,
-                        search_hl_other_style(),
-                        search_hl_other_style(),
-                        Some(&mut occ),
-                    );
-                    for k in before..occ {
-                        positions.push(MatchLoc { line: li, occ: k });
-                                        }
-                    spans
-                })
-                .collect();
-            Line::from(spans)
-        })
-        .collect();
-    (lines, positions)
-}
-
-/// Restyle the current match: paint the match segment at `loc` (identified by
-/// its dim-gray marker background) yellow, leaving all other matches gray.
-/// Call this when the current-match pointer changes, before rendering.
-fn style_current_match(
-    lines: Vec<Line<'static>>,
-    current: Option<MatchLoc>,
-) -> Vec<Line<'static>> {
-    if current.is_none() {
-        return lines;
-    }
-    let cur = current.unwrap();
-    let mut occ = 0usize;
-    lines
-        .into_iter()
-        .enumerate()
-        .map(|(li, line)| {
-            occ = 0;
-            Line::from(
-                line.spans
-                    .into_iter()
-                    .map(|span| {
-                        if span.style.bg == search_hl_other_style().bg {
-                            let is_cur = cur.line == li;
-                            let style = if is_cur && occ == cur.occ {
-                                occ += 1;
-                                search_hl_style()
-                            } else {
-                                if is_cur {
-                                    occ += 1;
-                                }
-                                search_hl_other_style()
-                            };
-                            Span::styled(span.content.into_owned(), style)
-                        } else {
-                            span
-                        }
-                    })
-                    .collect::<Vec<_>>(),
-            )
-        })
-        .collect()
-}
-
-/// Resolve `pd_match_idx` into the [`MatchLoc`] it points at, clamped to the
-/// available marks, or `None` when there are no matches.
-///
-/// This is the render-side half of the n/N contract: the key handler moves
-/// `pd_match_idx`, this decides which mark that means, and
-/// [`publish_match_marks`] hands the positions to the handler.  All three must
-/// agree, or `n` scrolls to a match other than the one highlighted.
-fn current_match(app: &App, marks: &[MatchLoc]) -> Option<MatchLoc> {
-    if marks.is_empty() {
-        return None;
-    }
-    let clamped = app.pd_match_idx.min(marks.len() - 1);
-    Some(marks[clamped])
-}
 /// Register `marks` in [`crate::app::PublishedMetrics::match_marks`] so key
 /// handlers can navigate with n / N.
 ///
@@ -195,6 +46,28 @@ fn current_match(app: &App, marks: &[MatchLoc]) -> Option<MatchLoc> {
 /// [`crate::app::PublishedMetrics`].
 fn publish_match_marks(app: &App, marks: &[MatchLoc]) {
     *app.metrics.match_marks.borrow_mut() = marks.iter().map(|m| (m.line, m.occ)).collect();
+}
+
+/// Highlight every match in a full rendered buffer, paint the current one
+/// yellow, and publish the marks for n/N navigation.
+///
+/// `search::highlight` clamps the current pointer to the real number of
+/// matches, so a stale `pd_match_idx` (left over from a longer previous query)
+/// degrades to "the last match is current" rather than to "nothing is".
+fn highlight_and_publish(
+    app: &App,
+    lines: Vec<Line<'static>>,
+    lower_query: &[char],
+) -> Vec<Line<'static>> {
+    let hl = search::highlight(
+        lines,
+        lower_query,
+        Some(app.pd_match_idx),
+        search_hl_style(),
+        search_hl_other_style(),
+    );
+    publish_match_marks(app, &hl.marks);
+    hl.lines
 }
 
 // Left column: 11-char date/label; leading indent: 2 spaces; gap between cols: 2 spaces.
@@ -382,6 +255,10 @@ fn render_description_tab(frame: &mut Frame, area: Rect, app: &App, theme: &Them
     let content_area = layout[1];
 
     if project.description.trim().is_empty() {
+        // No rendered buffer, so there is nothing for n/N to navigate.  Clear
+        // any marks left over from the previously shown project/tab; otherwise
+        // `n` would scroll to a match that is not on screen.
+        publish_match_marks(app, &[]);
         frame.render_widget(
             Paragraph::new("  (no description — press e to edit)")
                 .style(Style::default().fg(Color::DarkGray)),
@@ -392,8 +269,8 @@ fn render_description_tab(frame: &mut Frame, area: Rect, app: &App, theme: &Them
 
     let render_width = content_area.width as usize;
     let raw_lines = crate::ui::markdown::render_markdown(&project.description, render_width, theme);
-    let (plain_lines, marks) = apply_search_highlight(raw_lines, lower_query);
-    let md_lines = style_current_match(plain_lines, current_match(app, &marks));
+    // Highlight, paint the current match and publish the marks in one step.
+    let md_lines = highlight_and_publish(app, raw_lines, lower_query);
     let total_lines = md_lines.len();
     let content_height = content_area.height as usize;
 
@@ -409,9 +286,6 @@ fn render_description_tab(frame: &mut Frame, area: Rect, app: &App, theme: &Them
     // the overshoot-freeze (needing many k-presses to recover after j at bottom).
     app.metrics.desc_max_scroll.set(max_scroll as u16);
     app.metrics.desc_view_height.set(view_height as u16);
-
-    // Register match positions for n/N navigation.
-    publish_match_marks(app, &marks);
 
     let scroll = (app.pd_desc_scroll as usize).min(max_scroll);
     let has_above = scroll > 0;
@@ -502,19 +376,15 @@ fn update_content_lines(
                 body_part
             };
 
-            let mut spans: Vec<Span<'static>> = vec![Span::raw("  ")];
-            spans.extend(split_span(
+            let line = Line::from(vec![
+                Span::raw("  "),
                 Span::styled(padded, date_style),
-                lower_query, usize::MAX, None,
-                search_hl_style(), hl, None,
-            ));
-            spans.push(Span::raw("  "));
-            spans.extend(split_span(
+                Span::raw("  "),
                 Span::styled(effective_body.to_string(), Style::default()),
-                lower_query, usize::MAX, None,
-                search_hl_style(), hl, None,
-            ));
-            Line::from(spans)
+            ]);
+            // These list rows do not navigate with n/N; every match is painted
+            // with the same style.
+            search::highlight_line(line, lower_query, hl)
         })
         .collect()
 }
@@ -691,11 +561,9 @@ fn render_update_viewer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme,
     let mut all_lines: Vec<Line<'static>> = vec![header, blank];
     all_lines.extend(body_lines);
 
-    // Apply search highlighting across the entire buffer, then publish the
-    // marks and paint the current match yellow.
-    let (moving_map, marks) = apply_search_highlight(all_lines, lower_query);
-    let all_lines = style_current_match(moving_map, current_match(app, &marks));
-    publish_match_marks(app, &marks);
+    // Highlight every match across the whole buffer, paint the current one
+    // yellow, and publish the marks for n/N.
+    let all_lines = highlight_and_publish(app, all_lines, lower_query);
 
     let total_lines = all_lines.len();
     let content_height = content_area.height as usize;
@@ -733,6 +601,21 @@ fn render_update_viewer(frame: &mut Frame, area: Rect, app: &App, theme: &Theme,
         );
     } else {
         frame.render_widget(Paragraph::new(all_lines), content_area);
+    }
+}
+
+/// Highlight the search matches in one Todos-tab row, unless the row is the
+/// selected one (whose text already carries the selection background).
+fn finish_todo_row(
+    line: Line<'static>,
+    is_selected: bool,
+    lower_query: &[char],
+    style: Style,
+) -> Line<'static> {
+    if is_selected {
+        line
+    } else {
+        search::highlight_line(line, lower_query, style)
     }
 }
 
@@ -828,49 +711,32 @@ fn render_todos_tab(frame: &mut Frame, area: Rect, app: &App, theme: &Theme, low
                 .enumerate()
                 .map(|(i, tl)| {
                     let is_last = i == n - 1;
+                    // The selected row is painted with the selection style as
+                    // a whole, so a search highlight on it would be invisible
+                    // (and would fight the selection background).  Only
+                    // unselected rows get their matches highlighted — that is
+                    // the same rule the rest of the list has always used.
+                    let text_style = if is_selected { sel_hl } else { base_text_style };
+                    let gap_style  = if is_selected { sel_hl } else { base_text_style };
                     if i == 0 {
                         let sc_span = Span::styled(
                             format!("  {} ", sc),
                             if is_selected { sc_style.patch(sel_hl) } else { sc_style },
                         );
-                        let text_spans: Vec<Span<'static>> = if is_selected {
-                            vec![Span::styled(tl.clone(), sel_hl)]
-                        } else {
-                            split_span(
-                                Span::styled(tl.clone(), base_text_style),
-                                lower_query, usize::MAX, None,
-                                search_hl_style(), search_hl, None,
-                            )
-                        };
-                        let mut spans = vec![sc_span];
-                        spans.extend(text_spans);
+                        let mut spans = vec![sc_span, Span::styled(tl.clone(), text_style)];
                         if n == 1 && !reminder.is_empty() {
-                            spans.push(Span::styled("  ", if is_selected { sel_hl } else { base_text_style }));
+                            spans.push(Span::styled("  ", gap_style));
                             spans.push(Span::styled(reminder.clone(), eff_reminder_style));
                         }
-                        Line::from(spans)
+                        finish_todo_row(Line::from(spans), is_selected, lower_query, search_hl)
                     } else {
-                        let prefix = if is_selected {
-                            Span::styled("    ", sel_hl)
-                        } else {
-                            Span::styled("    ", base_text_style)
-                        };
-                        let text_spans: Vec<Span<'static>> = if is_selected {
-                            vec![Span::styled(tl.clone(), sel_hl)]
-                        } else {
-                            split_span(
-                                Span::styled(tl.clone(), base_text_style),
-                                lower_query, usize::MAX, None,
-                                search_hl_style(), search_hl, None,
-                            )
-                        };
-                        let mut spans = vec![prefix];
-                        spans.extend(text_spans);
+                        let mut spans = vec![Span::styled("    ", gap_style)];
+                        spans.push(Span::styled(tl.clone(), text_style));
                         if is_last && !reminder.is_empty() {
-                            spans.push(Span::styled("  ", if is_selected { sel_hl } else { base_text_style }));
+                            spans.push(Span::styled("  ", gap_style));
                             spans.push(Span::styled(reminder.clone(), eff_reminder_style));
                         }
-                        Line::from(spans)
+                        finish_todo_row(Line::from(spans), is_selected, lower_query, search_hl)
                     }
                 })
                 .collect();
@@ -998,6 +864,8 @@ fn status_style(status: &TodoStatus, theme: &Theme) -> Style {
     }
 }
 
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1077,37 +945,34 @@ mod tests {
 
     // ── finding #17: case-fold drift in the search highlighter ──────────────
 
-    /// The highlighted segments produced by the real `split_span`, in order.
-    fn highlighted(spans: &[Span<'static>]) -> Vec<String> {
-        let other = search_hl_other_style().bg;
-        spans
+    /// The highlighted segments produced by the shared highlighter, in order.
+    ///
+    /// These used to exercise `split_span`, this module's private copy of the
+    /// matcher.  That copy is gone: `ui::search` is the single implementation,
+    /// and it has its own unit tests, so this checks the *view* still routes
+    /// through it and still styles matches the way the palette says.
+    fn highlighted(line: Line<'static>, query: &str) -> Vec<String> {
+        let q: Vec<char> = query.to_lowercase().chars().collect();
+        let out = search::highlight_line(line, &q, search_hl_other_style());
+        out.spans
             .iter()
-            .filter(|s| s.style.bg == other)
+            .filter(|s| s.style.bg == search_hl_other_style().bg)
             .map(|s| s.content.to_string())
             .collect()
     }
 
-    fn split_plain(text: &'static str, query: &str) -> Vec<Span<'static>> {
-        let q: Vec<char> = query.to_lowercase().chars().collect();
-        split_span(
-            Span::styled(text, Style::default()),
-            &q,
-            usize::MAX,
-            None,
-            search_hl_style(),
-            search_hl_other_style(),
-            None,
-        )
+    fn plain(text: &'static str) -> Line<'static> {
+        Line::from(Span::styled(text, Style::default()))
     }
 
     #[test]
     fn the_highlighter_does_not_drift_when_case_folding_changes_length() {
         // 'İ' lowercases to two chars; the old code used the lowercased
         // offsets against the original and highlighted `İs`.
-        assert_eq!(highlighted(&split_plain("İstanbul", "İ")), vec!["İ"]);
-        assert_eq!(highlighted(&split_plain("İstanbul", "i")), vec!["İ"]);
+        assert_eq!(highlighted(plain("İstanbul"), "İ"), vec!["İ"]);
+        assert_eq!(highlighted(plain("İstanbul"), "i"), vec!["İ"]);
         // A match starting after the fold: old code reported `tanb`.
-        assert_eq!(highlighted(&split_plain("İstanbul", "stan")), vec!["stan"]);
+        assert_eq!(highlighted(plain("İstanbul"), "stan"), vec!["stan"]);
     }
 
     #[test]
@@ -1119,16 +984,41 @@ mod tests {
             ("no match", "zzz"),
             ("日本語", "本"),
         ] {
-            let spans = split_plain(text, query);
-            let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+            let spans = search::highlight_line(plain(text), &query.to_lowercase().chars().collect::<Vec<_>>(), search_hl_other_style());
+            let joined: String = spans.spans.iter().map(|s| s.content.as_ref()).collect();
             assert_eq!(joined, text, "query {query:?}");
         }
     }
 
     #[test]
     fn the_highlighter_counts_occurrences_across_a_span() {
-        let spans = split_plain("aaa", "a");
-        assert_eq!(highlighted(&spans), vec!["a", "a", "a"]);
+        assert_eq!(highlighted(plain("aaa"), "a"), vec!["a", "a", "a"]);
+    }
+
+    // ── the update preview highlights phrases, not just single spans ────────
+
+    /// The Updates list is built row by row; a phrase must match across the
+    /// label/body boundary-free span it is emitted in, and nothing may be lost.
+    #[test]
+    fn an_update_preview_row_highlights_a_phrase() {
+        let upd = Update {
+            id: "u".into(),
+            project_id: "p".into(),
+            label: "We the people".into(),
+            body: "body".into(),
+            sort_order: 0.0,
+            created_at: "2025-01-01T00:00:00Z".into(),
+            updated_at: "2025-01-01T00:00:00Z".into(),
+        };
+        let lines = update_content_lines(&upd, 40, 4, &"we the".to_lowercase().chars().collect::<Vec<_>>());
+        let first = lines.first().expect("at least one line");
+        let hl: Vec<String> = first
+            .spans
+            .iter()
+            .filter(|s| s.style.bg == search_hl_other_style().bg)
+            .map(|s| s.content.to_string())
+            .collect();
+        assert_eq!(hl.concat(), "We the", "the phrase in the label must be highlighted");
     }
 
     // ── finding #16: wide text must be measured in columns ──────────────────

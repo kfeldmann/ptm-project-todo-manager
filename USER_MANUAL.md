@@ -232,7 +232,7 @@ The Project Detail screen is organized into four **tabs**, switched with single-
 | `ESC` | Close the update viewer if one is open, otherwise return to Project List |
 | `E` (Shift+e) | Edit project title inline |
 | `T` (Shift+t) | Open Tag Picker to edit tags on this project |
-| `/` | Search / highlight text across all tabs |
+| `/` | Search / highlight text across all tabs (the query may contain spaces) |
 | `n` / `N` | Next / previous search match (Description tab and update viewer only) |
 | `d` / `u` / `t` / `f` | Switch tab (closes the update viewer if it is open) |
 
@@ -302,6 +302,22 @@ Press `Enter` on a selected update to open it in a scrollable full-screen viewer
 | `d` / `u` / `t` / `f` | Switch tab (closes the viewer) |
 | `ESC` | Close viewer, return to Updates list |
 | `?` | Key help |
+
+### Searching
+
+Press `/` to start a search. The query is typed in the title bar and matches
+are highlighted as you type: the **current** match is yellow, every other
+match is gray. `n` / `N` move to the next / previous match (wrapping around),
+and the view scrolls to keep the current match visible. `Enter` keeps the
+search active, `ESC` clears it.
+
+Queries may contain spaces, so you can search for a phrase to disambiguate a
+common word — `/We the people` matches that phrase and nothing else. Matching
+is case-insensitive, and a match may span inline markup: searching `the people`
+finds it inside `the **people**`.
+
+A match never spans a wrapped line, so a long phrase that the renderer breaks
+across two rows will not be found; search for a shorter part of it.
 
 ---
 

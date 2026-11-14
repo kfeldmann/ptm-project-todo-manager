@@ -81,7 +81,7 @@ the `/etc/hosts` entry, which is host state — `s3-roundtrip.py` will print
 | `panics.py` | 4, 5, 13 | key-help wrap at every `desc_width` 0..=60 (real source), `~` key path, non-ASCII date truncation (real helper) |
 | `update-viewer.py` | 6, 23 | drives the real TUI in a pty and asserts that universal keys (`d`, `E`) work inside the update viewer |
 | `keyhelp-widths.py` | 4 | exhaustive width sweep over the real `key_help_lines()` strings |
-| `search-highlight.py` | 17 | `split_span` index drift under case-folding |
+| `search-highlight.py` | 17 | `split_span` index drift under case-folding; phrase queries (`/We the people`); cycling the current match through several matches on one line |
 | `width-display.py` | 16 | wrapping/padding/hint height measured in chars instead of columns |
 | `query-count.py` | 10, 11 | statement counts for `list_projects` / `list_todos_global` (N+1), and `rename_tag` swallowing a failed collision probe |
 | `s3-roundtrip.py` | 2, 3, 1c (partial) | true `--end`/`--start` round trip (needs the hosts entry below) |
@@ -119,11 +119,14 @@ keeps passing if the fix is later reverted (so it cannot guard one).
 
 Both harnesses therefore compile the **real** `src/ui/text.rs` (path-included
 into a scratch cargo crate, so `unicode-width` resolves against the same build
-as the binaries) and assert on its output. `search-highlight.py` additionally
-keeps a companion check that the *legacy* algorithm still mis-highlights the
-same fixtures, and greps both call sites for the lowercased-offset pattern, so
-a re-introduced copy of the old matcher is caught even if the shared helper
-survives.
+as the binaries) and assert on its output. `search-highlight.py` also compiles
+the real `src/ui/search.rs` (it needs `ratatui`, so the probe crate declares
+it) to exercise highlighting end-to-end: which match comes out yellow, and
+whether a phrase query spanning the renderer's per-word spans matches at all.
+It additionally keeps a companion check that the *legacy* algorithm still
+mis-highlights the same fixtures, and greps both call sites for the
+lowercased-offset pattern and for a re-introduced private highlighter copy, so
+the drifted duplicates cannot come back.
 
 `panics.py`'s #4 check works the same way (it extracts `wrap_key_row` textually
 from `overlay.rs`), which is why it too builds through a scratch crate: the
@@ -160,8 +163,9 @@ and settled 2's exit-code half; session C fixed 7, 8 and 9; session D fixed
 `wal-safety.py` is **23/23**, `sync-state.py` **20/20**, `merge-robust.py`
 **6/6**, `s3-roundtrip.py` **12/12**, `panics.py` **9/9**, `update-viewer.py`
 **4/4**, `query-count.py` **8/8**.
-`search-highlight.py` is unchanged and still fails, because its finding
-belongs to session G.
+`search-highlight.py` is **23/23** (session G): it pins the case-fold fix
+(finding #17) and, since the `/` follow-up, phrase queries and current-match
+cycling as well.
 
 ### Why `update-viewer.py` is a pty harness (session E)
 
