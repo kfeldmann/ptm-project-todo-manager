@@ -951,6 +951,15 @@ tail -f ~/.local/share/md/md.log     # md
 
 ## Common Gotchas
 
+- **A project created under a tag filter inherits that tag** — the inline
+  create handler in `handle_key_project_list` calls `repo::tag_project` with
+  `self.tag_filter` after `repo::create_project`, so the new project does not
+  vanish from the filtered list. With no filter active nothing is tagged. Two
+  consequences for that handler: the cursor must be found by id
+  (`position(|p| p.id == created.id)`), never `len - 1`, because a filter or
+  search means the list does not end with the new project; and `tag_project`
+  is case-insensitive, so it reuses the filter's tag row instead of creating a
+  case-variant duplicate.
 - **`tl_cursor` is a flat todo index** — it counts only todo rows, not group
   header rows. Use `App::tl_current_todo()` / `tl_todo_at(flat_idx)` rather
   than indexing `tl_groups` directly.

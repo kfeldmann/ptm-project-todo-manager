@@ -147,7 +147,9 @@ The cursor follows the project as it moves.
 
 ### Creating a project
 
-Press `n`. A text input appears at the bottom of the list. Type the project title and press `Enter` to save, or `ESC` to cancel. The new project is appended at the end of the list.
+Press `n`. A text input appears at the bottom of the list. Type the project title and press `Enter` to save, or `ESC` to cancel. The new project is appended at the end of the list and the cursor moves to it.
+
+If a **tag filter** is active when you create the project, the filtered tag is added to it automatically, so the new project stays visible instead of disappearing from the filtered list. With no tag filter active, the project is created without tags, exactly as before.
 
 ### Opening a project
 

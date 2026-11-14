@@ -950,9 +950,25 @@ impl App {
                 InputKeyResult::Enter => {
                     let title = state.trimmed().to_string();
                     if !title.is_empty() {
-                        repo::create_project(&self.conn, &title)?;
+                        let created = repo::create_project(&self.conn, &title)?;
+                        // A new project carries no tags, so with a tag filter
+                        // active it would vanish from the list the instant it
+                        // was saved — forcing the user to clear the filter,
+                        // tag it, and re-filter.  Apply the filter's tag to it
+                        // so it lands in the view that is asking for it.
+                        // `tag_project` is case-insensitive, so this reuses the
+                        // existing tag row rather than creating a duplicate.
+                        if let Some(ref tag) = self.tag_filter {
+                            repo::tag_project(&self.conn, &created.id, tag)?;
+                        }
                         self.reload_project_list()?;
-                        self.pl_cursor = self.pl_projects.len().saturating_sub(1);
+                        // Select the new project.  Not `len - 1`: a search or
+                        // tag filter means the list does not end with it.
+                        self.pl_cursor = self
+                            .pl_projects
+                            .iter()
+                            .position(|p| p.id == created.id)
+                            .unwrap_or_else(|| self.pl_projects.len().saturating_sub(1));
                     }
                 }
                 InputKeyResult::Continue => { self.pl_creating = Some(state); }
@@ -2821,6 +2837,92 @@ mod tests {
 
         app.handle_key(key(KeyCode::Char('n'))).unwrap();
         assert!(app.pd_adding_todo.is_some(), "n must add a todo on the Todos tab");
+    }
+
+    // ── new project inherits an active tag filter ───────────────────────────
+
+    /// Type `title` into the inline project-create row and press Enter.
+    fn create_project_via_pl(app: &mut App, title: &str) {
+        app.handle_key(key(KeyCode::Char('n'))).unwrap();
+        assert!(app.pl_creating.is_some(), "n must open the inline create row");
+        for c in title.chars() {
+            app.handle_key(key(KeyCode::Char(c))).unwrap();
+        }
+        app.handle_key(key(KeyCode::Enter)).unwrap();
+    }
+
+    #[test]
+    fn a_project_created_under_a_tag_filter_gets_that_tag_and_stays_listed() {
+        let mut app = mk_app();
+        let p = repo::create_project(&app.conn, "Tagged").unwrap();
+        repo::tag_project(&app.conn, &p.id, "work").unwrap();
+        app.tag_filter = Some("work".into());
+        app.reload_project_list().unwrap();
+        assert_eq!(app.pl_projects.len(), 1);
+
+        create_project_via_pl(&mut app, "Fresh");
+
+        // The whole point: the new project is visible without clearing the
+        // filter, and it carries the tag that is filtering.
+        assert_eq!(
+            app.pl_projects.len(), 2,
+            "the new project must not disappear under the active tag filter"
+        );
+        let fresh = app.pl_projects.iter().find(|p| p.title == "Fresh").expect("new project listed");
+        assert_eq!(fresh.tags.len(), 1, "exactly one tag expected");
+        assert_eq!(fresh.tags[0].name, "work");
+        assert_eq!(app.tag_filter.as_deref(), Some("work"), "the filter itself must be unchanged");
+        // The cursor lands on the new project, not on the end of the list.
+        assert_eq!(app.pl_projects[app.pl_cursor].id, fresh.id);
+    }
+
+    #[test]
+    fn a_project_created_under_a_tag_filter_does_not_duplicate_the_tag_row() {
+        let mut app = mk_app();
+        let p = repo::create_project(&app.conn, "Tagged").unwrap();
+        repo::tag_project(&app.conn, &p.id, "Work").unwrap();
+        // Filter matching is case-insensitive; the applied tag must reuse the
+        // existing row rather than create a "work" sibling.
+        app.tag_filter = Some("Work".into());
+        app.reload_project_list().unwrap();
+
+        create_project_via_pl(&mut app, "Fresh");
+
+        let tags = repo::list_all_tags(&app.conn).unwrap();
+        assert_eq!(tags.len(), 1, "tag rows must not be duplicated: {tags:?}");
+        assert_eq!(tags[0].name, "Work");
+    }
+
+    #[test]
+    fn a_project_created_without_a_tag_filter_gets_no_tags() {
+        let mut app = mk_app();
+        repo::create_project(&app.conn, "Existing").unwrap();
+        app.reload_project_list().unwrap();
+
+        create_project_via_pl(&mut app, "Fresh");
+
+        assert!(repo::list_all_tags(&app.conn).unwrap().is_empty(), "no tag may be invented");
+        let fresh = app.pl_projects.iter().find(|p| p.title == "Fresh").expect("new project listed");
+        assert!(fresh.tags.is_empty());
+        assert_eq!(app.pl_projects[app.pl_cursor].id, fresh.id);
+    }
+
+    #[test]
+    fn a_project_created_under_a_tag_filter_is_selected_even_when_the_list_is_unsorted() {
+        // The old code selected `len - 1`, i.e. the *last* row.  With a filter
+        // that is not the new project, so it silently selected a neighbour.
+        let mut app = mk_app();
+        let a = repo::create_project(&app.conn, "Aaa").unwrap();
+        repo::tag_project(&app.conn, &a.id, "work").unwrap();
+        let b = repo::create_project(&app.conn, "Bbb").unwrap();
+        repo::tag_project(&app.conn, &b.id, "work").unwrap();
+        app.tag_filter = Some("work".into());
+        app.reload_project_list().unwrap();
+
+        create_project_via_pl(&mut app, "Mmm");
+
+        assert_eq!(app.pl_projects.len(), 3);
+        assert_eq!(app.pl_projects[app.pl_cursor].title, "Mmm");
     }
 
     #[test]
