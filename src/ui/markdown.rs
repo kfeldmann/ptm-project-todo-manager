@@ -18,7 +18,10 @@
 //!                    widths; cells may contain inline styles, and `<br>`-
 //!                    separated cell lines may start with `#`, `>`, `-`/`*`/
 //!                    `+`, `1.`, a `---` rule or a ``` fence to get the
-//!                    corresponding block formatting inside the cell)
+//!                    corresponding block formatting inside the cell.
+//!                    A leading `\>` escapes the `>` so the cell renders
+//!                    literal text, and an all-blank header row — the form
+//!                    GFM forces on a header-less table — is not drawn)
 //! • Horizontal rules (─── separator line)
 
 use pulldown_cmark::{Alignment, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
@@ -39,8 +42,11 @@ use crate::ui::theme::Theme;
 pub fn render_markdown(md: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
     let mut ctx = Ctx::new(width, theme);
     let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH;
-    for event in Parser::new_ext(md, opts) {
-        ctx.push(event);
+    // Offsets are needed because pulldown-cmark resolves a backslash escape
+    // before handing us the text: `\> x` and `> x` both arrive as `Text("> x")`,
+    // and only the source around the event tells them apart (see `Ctx::push`).
+    for (event, range) in Parser::new_ext(md, opts).into_offset_iter() {
+        ctx.push(event, md.get(..range.start).unwrap_or(""));
     }
     if ctx.output.is_empty() {
         ctx.output.push(Line::from(""));
@@ -103,6 +109,8 @@ struct CellLine {
 struct RawCellLine {
     runs: Vec<CellRun>,
     pre:  bool,
+    /// The line started with an escaped `\>` — literal text, not a blockquote.
+    escaped_gt: bool,
 }
 
 /// A table cell: a sequence of logical lines.
@@ -169,6 +177,8 @@ struct Ctx {
     cell_pre:             usize,
     /// Whether the current cell line started inside a `<pre>` block.
     cell_line_pre:        bool,
+    /// Whether the current cell line started with an escaped `\>`.
+    cell_line_escaped_gt: bool,
     // HTML inline-style toggles inside table cells (`<b>`, `<i>`, `<code>`, …).
     cell_html_bold:       bool,
     cell_html_italic:     bool,
@@ -220,6 +230,7 @@ impl Ctx {
             cell_line:            vec![],
             cell_pre:             0,
             cell_line_pre:        false,
+            cell_line_escaped_gt: false,
             cell_html_bold:       false,
             cell_html_italic:     false,
             cell_html_strike:     false,
@@ -309,11 +320,20 @@ impl Ctx {
 
     fn render_table(&mut self) {
         // Take ownership so we can push to self.output while iterating.
-        let head_rows  = std::mem::take(&mut self.table_head_rows);
+        let mut head_rows = std::mem::take(&mut self.table_head_rows);
         let body_rows  = std::mem::take(&mut self.table_body_rows);
         let alignments = std::mem::take(&mut self.table_alignments);
 
         let indent = "  ";
+
+        // A header row whose cells are all empty is a syntax artefact: GFM
+        // tables require a header row, so a table with no header is written as
+        // `| | |` followed by the delimiter.  Drawing it would render a blank
+        // row and a rule above the real data, so drop it and let the first body
+        // row open the table.
+        if head_rows.iter().all(|row| row.iter().all(cell_is_empty)) {
+            head_rows.clear();
+        }
 
         let col_count = head_rows.iter().chain(body_rows.iter())
             .map(|r| r.len())
@@ -496,9 +516,11 @@ impl Ctx {
     /// Start a new logical line inside the current cell (a `<br>`).
     fn cell_break(&mut self) {
         let pre = self.cell_line_pre || self.cell_pre > 0;
+        let escaped_gt = self.cell_line_escaped_gt;
         let runs = std::mem::take(&mut self.cell_line);
-        self.cell_lines.push(RawCellLine { runs, pre });
+        self.cell_lines.push(RawCellLine { runs, pre, escaped_gt });
         self.cell_line_pre = self.cell_pre > 0;
+        self.cell_line_escaped_gt = false;
     }
 
     /// Unfold a code span that pulldown-cmark produced from a ``` fence
@@ -567,9 +589,11 @@ impl Ctx {
     fn cell_finish(&mut self) {
         // Flush a trailing partial line.
         let pre = self.cell_line_pre || self.cell_pre > 0;
+        let escaped_gt = self.cell_line_escaped_gt;
         let runs = std::mem::take(&mut self.cell_line);
-        self.cell_lines.push(RawCellLine { runs, pre });
+        self.cell_lines.push(RawCellLine { runs, pre, escaped_gt });
         self.cell_line_pre = false;
+        self.cell_line_escaped_gt = false;
 
         let raw = std::mem::take(&mut self.cell_lines);
         let cell = build_cell(&raw, self.blockquote_style);
@@ -579,13 +603,26 @@ impl Ctx {
     // ── Event handler ─────────────────────────────────────────────────────────
 
     #[allow(clippy::match_same_arms)]
-    fn push(&mut self, event: Event<'_>) {
+    /// `before` is the document source preceding this event, used only to
+    /// detect a backslash that pulldown-cmark has already resolved away.
+    fn push(&mut self, event: Event<'_>, before: &str) {
         // While inside a table cell, inline events are collected into the
         // cell's run list; only structural events (cell/row/table ends) fall
         // through to the main match below.
         if self.in_table_cell {
             match &event {
                 Event::Text(s) => {
+                    // pulldown-cmark resolves backslash escapes, so `\> x` and
+                    // `> x` both arrive as `s == "> x"`.  The character before
+                    // the event still shows which was written.  Escapes only
+                    // matter where a block marker could start, i.e. at the
+                    // beginning of a cell line.
+                    if self.cell_line.is_empty()
+                        && s.starts_with('>')
+                        && ends_with_escape(before)
+                    {
+                        self.cell_line_escaped_gt = true;
+                    }
                     self.cell_push(s);
                     return;
                 }
@@ -813,6 +850,7 @@ impl Ctx {
                 self.cell_line.clear();
                 self.cell_pre = 0;
                 self.cell_line_pre = false;
+                self.cell_line_escaped_gt = false;
                 self.cell_html_bold = false;
                 self.cell_html_italic = false;
                 self.cell_html_strike = false;
@@ -841,6 +879,7 @@ impl Ctx {
                 self.cell_line.clear();
                 self.cell_pre = 0;
                 self.cell_line_pre = false;
+                self.cell_line_escaped_gt = false;
                 self.cell_html_bold = false;
                 self.cell_html_italic = false;
                 self.cell_html_strike = false;
@@ -1054,6 +1093,16 @@ fn restyle(runs: &[CellRun], base: Style) -> Vec<CellRun> {
         .collect()
 }
 
+/// Whether `before` ends in a lone backslash, i.e. an escape character that
+/// pulldown-cmark has already consumed.
+///
+/// A run of `n` backslashes is `n / 2` literal backslashes plus, when `n` is
+/// odd, one escape.  Counting in `char`s (not bytes) keeps this correct for
+/// non-ASCII content.
+fn ends_with_escape(before: &str) -> bool {
+    before.chars().rev().take_while(|c| *c == '\\').count() % 2 == 1
+}
+
 /// Strip `runs` down to their concatenated plain text.
 fn runs_text(runs: &[CellRun]) -> String {
     runs.iter().map(|r| r.text.as_str()).collect()
@@ -1126,6 +1175,19 @@ fn natural_cell_width(cell: &Cell) -> usize {
         })
         .max()
         .unwrap_or(0)
+}
+
+/// Whether a cell renders as nothing at all — no text, no marker, no rule.
+///
+/// Only used to recognise the all-blank header row GFM requires from tables
+/// that have no header (see `render_table`), so a cell containing a marker
+/// (`#`, `>`, `- `) or a rule still counts as content.
+fn cell_is_empty(cell: &Cell) -> bool {
+    cell.iter().all(|line| {
+        !line.rule
+            && runs_text(&line.first_pfx).trim().is_empty()
+            && runs_text(&line.runs).trim().is_empty()
+    })
 }
 
 // ─── Table cell block parsing ───────────────────────────────────────────────
@@ -1256,7 +1318,16 @@ fn build_cell(raw: &[RawCellLine], quote_style: Style) -> Cell {
             continue;
         }
 
-        let (block, rest) = parse_block_marker(&text);
+        // A line that began with `\>` was written as literal text: the `\` is
+        // gone from the event stream, so the leading `>` must not be read as a
+        // blockquote marker (see `Ctx::push`).
+        let (block, rest) = if raw_line.escaped_gt {
+            (CellBlock::Text, text.as_str())
+        } else {
+            parse_block_marker(&text)
+        };
+
+        let body = slice_runs_after(&raw_line.runs, &text, rest);
 
         match block {
             CellBlock::Fence => { in_fence = true; }
@@ -1282,7 +1353,7 @@ fn build_cell(raw: &[RawCellLine], quote_style: Style) -> Cell {
                 out.push(CellLine {
                     first_pfx: pfx.clone(),
                     cont_pfx:  pfx,
-                    runs:      restyle(&slice_runs_after(&raw_line.runs, &text, rest), h_style),
+                    runs:      restyle(&body, h_style),
                     pre:       false,
                     rule:      false,
                 });
@@ -1294,7 +1365,7 @@ fn build_cell(raw: &[RawCellLine], quote_style: Style) -> Cell {
                 out.push(CellLine {
                     first_pfx: pfx.clone(),
                     cont_pfx:  pfx,
-                    runs:      restyle(&slice_runs_after(&raw_line.runs, &text, rest), quote_style),
+                    runs:      restyle(&body, quote_style),
                     pre:       false,
                     rule:      false,
                 });
@@ -1308,7 +1379,7 @@ fn build_cell(raw: &[RawCellLine], quote_style: Style) -> Cell {
                 out.push(CellLine {
                     first_pfx: pfx,
                     cont_pfx:  vec![CellRun { text: format!("{indent}  "), style: Style::default() }],
-                    runs:      slice_runs_after(&raw_line.runs, &text, rest),
+                    runs:      body.clone(),
                     pre:       false,
                     rule:      false,
                 });
@@ -1335,7 +1406,7 @@ fn build_cell(raw: &[RawCellLine], quote_style: Style) -> Cell {
                 out.push(CellLine {
                     first_pfx: vec![CellRun { text: bullet.clone(), style: Style::default() }],
                     cont_pfx:  vec![CellRun { text: " ".repeat(bullet.len()), style: Style::default() }],
-                    runs:      slice_runs_after(&raw_line.runs, &text, rest),
+                    runs:      body.clone(),
                     pre:       false,
                     rule:      false,
                 });
@@ -1589,7 +1660,10 @@ fn char_wrap_line(s: &str, width: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{char_wrap_line, display_width, reflow, render_markdown, word_wrap_cell, Token};
+    use super::{
+        char_wrap_line, display_width, ends_with_escape, reflow, render_markdown,
+        word_wrap_cell, Token,
+    };
     use ratatui::style::{Color, Modifier, Style};
     use ratatui::text::Line;
     use crate::ui::theme::Theme;
@@ -2541,6 +2615,111 @@ mod tests {
         assert_eq!(content_rows, 3, "row should be 3 lines tall");
     }
 
+    // ── Tables without a header ─────────────────────────────────────────────
+
+    #[test]
+    fn rm_table_empty_header_row_is_suppressed() {
+        // GFM requires a header row, so a header-less table is written as
+        // `| | |`.  Drawing it would show a blank row plus a rule above the
+        // real data; only the body should render.
+        let md = "| | |\n|---|---|\n| A | B |";
+        let lines = render_markdown(md, 80, &theme());
+        let text = all_text(&lines);
+        assert!(text.contains("│ A │ B │"), "body missing: {:?}", text);
+        let blank_row = lines.iter().any(|l| {
+            let t = line_text(l);
+            t.contains('│') && t.split('│').all(|seg| seg.trim().is_empty())
+        });
+        assert!(!blank_row, "empty header row was drawn: {:?}", text);
+        // No rule between a header and the body: ┌ then └ only.
+        let rules = lines.iter().filter(|l| line_text(l).contains('├')).count();
+        assert_eq!(rules, 0, "no inter-row rule for a single body row: {:?}", text);
+    }
+
+    #[test]
+    fn rm_table_empty_header_with_wide_cells_keeps_widths() {
+        // Suppressing the header must not leave the columns sized for it.
+        let md = "| | |\n|---|---|\n| A | B |";
+        let lines = render_markdown(md, 80, &theme());
+        let text = all_text(&lines);
+        assert!(text.contains("┌───┬───┐"), "columns not sized to the body: {:?}", text);
+    }
+
+    #[test]
+    fn rm_table_header_with_any_content_is_kept() {
+        // Only an all-blank header is suppressed — a real header, even a
+        // single filled cell, still renders.
+        let md = "| A |  |\n|---|---|\n| r1 | r2 |";
+        let lines = render_markdown(md, 80, &theme());
+        let text = all_text(&lines);
+        assert!(text.contains("│ A  │"), "header dropped: {:?}", text);
+        assert!(text.contains("r1"), "{:?}", text);
+        let rules = lines.iter().filter(|l| line_text(l).contains('├')).count();
+        assert_eq!(rules, 1, "header/body rule missing: {:?}", text);
+    }
+
+    #[test]
+    fn rm_table_header_marker_cell_is_not_blank() {
+        // A cell holding only a block marker (`#`) renders a visible `#`, so
+        // it counts as content even though its text is otherwise empty.
+        let md = "| # |  |\n|---|---|\n| r1 | r2 |";
+        let text = all_text(&render_markdown(md, 80, &theme()));
+        assert!(text.contains("│ #  │"), "marker-only header dropped: {:?}", text);
+    }
+
+    // ── Escaped `>` inside a table cell ─────────────────────────────────────
+
+    #[test]
+    fn rm_table_cell_escaped_gt_is_text_not_quote() {
+        let md = "| A |\n| -- |\n| \\> not a quote |";
+        let lines = render_markdown(md, 80, &theme());
+        let text = all_text(&lines);
+        assert!(text.contains("│ > not a quote │"), "escaped > lost: {:?}", text);
+        assert!(!text.contains("│ │ not a quote"), "rendered as a quote: {:?}", text);
+        assert!(!text.contains('\\'), "backslash must not be shown: {:?}", text);
+    }
+
+    #[test]
+    fn rm_table_cell_unescaped_gt_is_still_a_quote() {
+        // The escape must not disable blockquote cells.
+        let md = "| A |\n| -- |\n| > quoted |";
+        let text = all_text(&render_markdown(md, 80, &theme()));
+        assert!(text.contains("│ quoted"), "expected a quote bar: {:?}", text);
+    }
+
+    #[test]
+    fn rm_table_cell_escaped_gt_keeps_inline_style() {
+        // The escape is resolved before inline styling, so `**\\>**` is bold
+        // text starting with `>`.
+        let md = "| A |\n| -- |\n| **\\>** bold |";
+        let lines = render_markdown(md, 80, &theme());
+        let s = span_with(&lines, ">");
+        assert!(s.style.add_modifier.contains(Modifier::BOLD), "got {:?}", s.style);
+        assert!(!all_text(&lines).contains('\\'), "{:?}", all_text(&lines));
+    }
+
+    #[test]
+    fn ends_with_escape_counts_only_a_lone_backslash() {
+        // A run of n backslashes is n/2 literal backslashes plus, when n is
+        // odd, one escape — only the odd case marks the `>` as escaped.
+        assert!(!ends_with_escape(""));
+        assert!(!ends_with_escape("| "));
+        assert!(ends_with_escape("| \\"));
+        assert!(!ends_with_escape("| \\\\"));
+        assert!(ends_with_escape("| \\\\\\"));
+        assert!(!ends_with_escape("| a\\b"));
+    }
+
+    #[test]
+    fn rm_table_cell_escaped_gt_on_later_line() {
+        // A `<br>` starts a new cell line, and an escape at the start of that
+        // line is honoured too.
+        let md = "| A |\n| -- |\n| first<br>\\> second |";
+        let text = all_text(&render_markdown(md, 80, &theme()));
+        assert!(text.contains("first"), "{:?}", text);
+        assert!(text.contains("> second"), "escaped > lost: {:?}", text);
+    }
+
     // ── Token::Join / punctuation gluing ────────────────────────────────────
 
     #[test]
@@ -2634,3 +2813,6 @@ mod tests {
             "expected space between hello and world, got: {:?}", text);
     }
 }
+
+
+
