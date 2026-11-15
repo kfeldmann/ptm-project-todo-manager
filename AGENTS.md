@@ -6,1009 +6,114 @@ in SQLite via rusqlite.
 
 The project management binary is `ptm`. Separate helper binaries are also included:
 
-- `ptm-sync` - Cloud sync for ptm data
-- `md` - Markdown viewer with spell-checking
-- `enc` - Symmetric file encryption tool
-
----
-
-## Build & Run
+- `ptm-sync` — Cloud sync for ptm data
+- `md` — Markdown viewer with spell-checking
+- `enc` — Symmetric file encryption tool
 
 ```bash
 cargo build            # debug build  → target/debug/{ptm,ptm-sync,md,enc}
 cargo build --release  # release build → target/release/{ptm,ptm-sync,md,enc}
-cargo run              # build + run debug binary
-./build/build-*        # for the user only. Build via Docker
-./build/run            # for the user only. Run the build container interactively
+cargo test             # unit tests
+python3 dev-harness/check-all.py   # end-to-end harnesses
 ```
 
-There are some warnings when building `md` and `enc` because they reuse code
-from `ptm` so some variables are unused. Ignore these.
+Warnings when building `md` and `enc` are expected: they reuse code from `ptm`,
+so some variables are unused. Ignore them. No configuration is needed on first
+launch — the database is created at `~/.local/share/ptm/ptm.db` (or
+`$XDG_DATA_HOME/ptm/ptm.db`).
 
-No configuration is required on first launch. The database is created
-automatically at `~/.local/share/ptm/ptm.db` (or `$XDG_DATA_HOME/ptm/ptm.db`).
+**This file is an index.** It is force-fed into every session, so it carries
+only the rules that apply everywhere. Everything else is one file away — read
+the relevant doc *before* working in that area, not after.
 
 ---
 
-## Repository Layout
+## Three rules that apply everywhere
 
-```
-src/
-├── main.rs          — terminal setup, event loop, $EDITOR suspension
-├── app.rs           — App struct (all state), handle_key_* methods
-├── log.rs           — file-based logger (see Logging section below); shared by
-│                      `ptm` and `md` (path-included — `md` selects its own
-│                      directory with `set_app_name("md")`)
-├── crypto.rs        — AES-256-GCM encrypt/decrypt + key helpers; shared by
-│                      the `ptm-sync` and `enc` binaries (path-included, like
-│                      spell.rs — edit this file, not a copy)
-├── spell.rs         — spell checker; shared by `ptm` and `md` (path-included)
-├── tz.rs            — local UTC offset in minutes, cached for 24h (a `date +%z`
-│                      spawn per cache miss, never per render)
-├── paths.rs         — `expand_tilde` (`~` / `~/` → `$HOME`, error when unset),
-│                      plus the XDG lookup (`data_home`, `app_data_dir`,
-│                      `optional_app_data_dir`, `app_data_file`); shared by all
-│                      four binaries (path-included — edit this file, never a
-│                      copy)
-├── data/
-│   ├── mod.rs       — re-exports db, models, repo
-│   ├── db.rs        — SQLite connection, schema (CREATE TABLE IF NOT EXISTS)
-│   ├── models.rs    — plain data structs: Project, Todo, Update, Tag, TodoStatus
-│   └── repo.rs      — all database reads/writes; no UI dependencies
-├── input/
-│   └── mod.rs       — cursor-aware single-line `InputState` (insert / delete /
-│                      cursor movement, column-budgeted `display`) plus
-│                      `handle_input_key`; fully implemented, not a placeholder
-├── ui/
-│   ├── mod.rs       — top-level render() dispatcher
-│   ├── theme.rs     — Theme struct (Color palette); always used as Theme::default()
-│   ├── text.rs      — width-aware text helpers: display_width,
-│   │                  char_display_width, char_wrap, word_wrap, wrap_rows,
-│   │                  split_at_width, pad_to_width, ellipsize, hint_height,
-│   │                  find_matches/split_matches; shared with `md`
-│   │                  (path-included — edit this file, never a copy)
-│   ├── markdown.rs  — Markdown → ratatui renderer; shared with `md` (path-included)
-│   ├── search.rs    — search-match highlighting over *rendered* lines
-│   │                  (`highlight` / `highlight_line` / `MatchLoc`); searches
-│   │                  each line's concatenated span text so a query with a
-│   │                  space matches across the per-word spans markdown.rs
-│   │                  emits; shared with `md` (path-included)
-│   └── views/
-│       ├── mod.rs               — shared helpers (list pagination; re-exports ui::text)
-│       ├── project_list.rs      — Project List screen renderer
-│       ├── project_detail.rs    — Project Detail screen renderer
-│       ├── todo_list.rs         — Global Todo List screen renderer
-│       └── overlay.rs           — all overlay renderers
-└── bin/
-    ├── enc/         — enc binary (file encryption CLI; see §enc below)
-    │   └── main.rs     — clap subcommands: keygen/encrypt/decrypt/export/import
-    ├── md/          — md binary (Markdown viewer + spell check)
-    │   ├── main.rs     — TUI viewer: scroll, incremental search, $EDITOR, S:spell
-    │   ├── ui.rs       — path-includes src/ui/{theme,markdown,search,text}.rs
-    │   └── log.rs      — thin wrapper over the shared src/log.rs (selects the
-    │                     `md` directory → $XDG_DATA_HOME/md/md.log)
-    └── ptm_sync/    — ptm-sync binary (S3 backup sync; see §ptm-sync below)
-        ├── main.rs     — CLI args (clap), Paths struct, shared utilities, entry point
-        ├── ops.rs      — high-level --start and --end flows
-        ├── archive.rs  — zip pack/unpack, local-backup creation and rotation
-        ├── db.rs       — WAL detection and TRUNCATE checkpoint via rusqlite
-        ├── merge.rs    — diverged-database merge (--merge --from <dir>)
-        └── s3client.rs — thin S3 wrapper (HEAD / GET / PUT via rust-s3)
-```
+1. **Shared files are `#[path]`-included, never copied.** `paths.rs`,
+   `log.rs`, `crypto.rs`, `spell.rs`, `ui/{theme,text,search,markdown}.rs` are
+   compiled into more than one binary. Editing a "copy" under `src/bin/` is
+   always wrong — there is no copy, only a `mod` declaration pointing back.
+   → [docs/shared-files.md](docs/shared-files.md)
+2. **Never `println!` / `eprintln!`.** The TUI owns the terminal in raw mode;
+   use `crate::log::warn(msg)`. → [docs/logging.md](docs/logging.md)
+3. **Measure text in display columns, never chars or bytes.** CJK and emoji
+   occupy two columns, combining marks none. Use `ui/text.rs`.
+   → [docs/ui-conventions.md](docs/ui-conventions.md#text-width--always-measure-in-columns)
 
 ---
 
-## enc
+## Doc map
 
-`enc` is a Rust replacement for `util/encrypt.py`: the same AES-256-GCM file
-format, the same key file format, and the same CLI shape, plus `export` /
-`import` for moving a key around as text. Files and keys are byte-compatible
-with the Python tool in both directions, so either tool can read what the
-other wrote.
+| Doc | Read it when you are… |
+|-----|-----------------------|
+| [docs/build.md](docs/build.md) | building, testing, or running harnesses |
+| [docs/repository-layout.md](docs/repository-layout.md) | orienting yourself in the tree |
+| [docs/shared-files.md](docs/shared-files.md) | adding a helper two binaries need, or editing anything in `src/*.rs` at the crate root |
+| [docs/architecture.md](docs/architecture.md) | touching `app.rs`, key dispatch, rendering, `PublishedMetrics`, `$EDITOR`, or the event loop |
+| [docs/data-layer.md](docs/data-layer.md) | writing SQL, adding a column, or touching `repo.rs` |
+| [docs/ui-conventions.md](docs/ui-conventions.md) | rendering: theme, hint bars, text width, search highlight, tables, overlays |
+| [docs/adding-features.md](docs/adding-features.md) | adding a keybinding, overlay, screen, or inline-edit mode |
+| [docs/logging.md](docs/logging.md) | logging, or choosing between `log::warn` and an overlay |
+| [docs/enc.md](docs/enc.md) | working on the `enc` binary |
+| [docs/ptm-sync.md](docs/ptm-sync.md) | working on `ptm-sync` modes, flags, archive, or merge |
+| [docs/sync-internals.md](docs/sync-internals.md) | changing WAL handling, locking, or the push/pull state machine |
+| [docs/enc-sync.md](docs/enc-sync.md) | changing the encryption format or key handling |
 
-### Commands
+`docs/README.md` lists the same map with a one-line scope for each file.
 
-| Command | Effect |
-|---------|--------|
-| `enc keygen` | Generate a fresh 256-bit key → `~/.encryption_key` (mode 0600) |
-| `enc encrypt <file>` | Encrypt → `<file>.enc` |
-| `enc decrypt <file.enc>` | Decrypt → `<file>` (`.enc` stripped; else `.dec` appended) |
-| `enc export` | Print the key as base64 on stdout |
-| `enc import` | Read a base64 key from stdin, write it to the key file |
-
-### Flags
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--key-file` / `-k` | `~/.encryption_key` | Key file path (`~` is expanded; errors if `$HOME` is unset) |
-| `--output` / `-o` | *(derived from input)* | Output path (encrypt / decrypt only) |
-| `--force` / `-f` | off | Overwrite an existing output/key file without prompting |
-
-### Behavior notes
-
-- **Prompts** happen on stderr so that `enc export > key.b64` stays clean.
-  When stdin is not a terminal (scripts, pipes) an overwrite prompt is
-  answered "no" — pass `--force` to overwrite non-interactively.
-- **`enc export`** prints only the base64 key when stdout is piped. On a
-  terminal it adds a header line and a warning on stderr (the key itself is
-  still the only thing on stdout).
-- **`enc import`** reads a single line interactively, but consumes the whole
-  stream when piped, so keys wrapped with `fold` still work. Base64
-  whitespace is ignored; the decoded key must be exactly 32 bytes.
-- **Key permissions**: `keygen`/`import` create the key file with `0600` at
-  creation time (never briefly world-readable). `encrypt`/`decrypt`/`export`
-  print a warning if the key file has group/other bits set, but do not fail
-  (matching `encrypt.py`); `ptm-sync` is the strict one.
-- **No partial writes on failure**: decryption authenticates before writing,
-  so a wrong key or tampered file leaves no output file behind.
-
-### Shared implementation
-
-The crypto lives in `src/crypto.rs` at the crate root and is path-included by
-both binaries (`#[path = "../../crypto.rs"] mod crypto;`), the same pattern
-`md` uses for `src/spell.rs`. Change the format there — never in a copy.
-`crypto.rs` provides `load_key`, `generate_key`, `write_key`,
-`check_key_permissions`, `encode_key_base64`, `decode_key_base64`,
-`encrypt`, and `decrypt`.
-
-Path handling is shared the same way: `src/paths.rs` is path-included by `enc`,
-`ptm-sync` and `md` (and compiled into `ptm` as a normal module). It provides
-`expand_tilde` and the XDG data-directory lookup (`data_home`, `app_data_dir`,
-`optional_app_data_dir`, `app_data_file`). Do not re-implement either per
-binary:
-
-- The `~` copy that used to live in `ptm_sync/main.rs` sliced at byte 2, which
-  panicked on a bare `"~"` and turned `"~x"` into `$HOME/` (finding #5).
-- The XDG lookup had four copies with three different `$HOME` fallbacks (`.`,
-  an error, and a silent skip), so `ptm`, `ptm-sync` and `md` could disagree
-  about where the data directory is — fatal for `ptm-sync`, which hashes and
-  packs the file `ptm` writes (finding #19).
-
-`app_data_dir` is deliberately lenient (falls back to `./.local/share` when
-neither variable is set) because a TUI with nowhere to put its database is
-worse than one in an odd directory; `expand_tilde` is deliberately strict for
-the same reason in reverse — a private key must not land in `.`.
+`USER_MANUAL.md` is the **end-user** documentation and owns the user-facing key
+tables. `planning-docs/` holds design notes, code reviews, and remediation
+plans — history, not current rules. `dev-harness/` holds one runnable harness
+per review finding.
 
 ---
 
-## ptm-sync
+## Conventions that bite in any area
 
-`ptm-sync` is a companion binary that backs up and restores the ptm data
-directory to/from **S3**. It is intended to be called from a shell wrapper
-that brackets the main `ptm` process:
-
-```bash
-# Typical wrapper pattern
-ptm-sync --start --bucket-name my-bucket --prefix ptm-backups
-trap 'ptm-sync --end --bucket-name my-bucket --prefix ptm-backups' EXIT
-ptm
-```
-
-### Modes
-
-| Flag | Phase | What it does |
-|------|-------|--------------|
-| `--start` | pre-launch | Pull the latest S3 backup (if needed), then store a startup hash |
-| `--end` | post-exit | Hash-check the data; push a new backup to S3 if anything changed |
-| `--merge` | standalone | Merge another ptm data directory (see `--from`) into the local one; no S3 access |
-
-Exactly one mode may be given per invocation.
-
-#### Merge mode (`--merge --from <data-dir>`)
-
-Merges a diverged ptm data directory into the local one.  Implemented in
-`src/bin/ptm_sync/merge.rs`.  Semantics:
-
-- **Row identity is UUID-based**: identical IDs on both sides are the same
-  row; rows present on only one side are inserted into the other.
-- **Last-writer-wins** on shared rows via `updated_at` (ISO 8601 UTC):
-  `projects`, `todos`, `updates`, `references_table`.  Ties keep the local
-  version.
-- **Tags**: tags new by both id and name are inserted; a name collision
-  (different UUIDs, same name) maps the incoming memberships onto the local
-  tag — mirroring the app's case-insensitive rename checks.  Orphaned tags
-  are garbage-collected after membership insertion.
-- **Tag membership tables** (`project_tags`, `reference_tags`) are unioned
-  with `INSERT OR IGNORE`.
-- **`sort_order`**: shared rows keep the local ranking; foreign-only rows
-  are appended after the local rows of their ordering group; every group is
-  then re-spaced to 1.0, 2.0, … with `ROW_NUMBER()` over
-  `(sort_order, created_at)`.  "After the local rows" is a rank *greater than
-  the group's local maximum*, never `local_max + sort_order` — foreign
-  `sort_order` values are another database's own numbering and may be
-  negative, and `updates` are stored newest-first (`create_update` prepends
-  with `MIN(sort_order) - 1.0`, so a group runs `0, -1, -2, …` in display
-  order).  The per-group local maxima are captured into temp tables before
-  any insert, so an offset never depends on how many foreign rows were
-  written first.
-- **Dangling references**: a source row whose reference does not resolve
-  locally does not abort the merge.  `todos.project_id` is nulled (the todo
-  lands in the Inbox) and counted; `updates.project_id` is `NOT NULL`, so such
-  an update is skipped and counted; tag memberships whose owning row is
-  missing are skipped.  The counts are printed and logged.  Note
-  `INSERT OR IGNORE` does **not** suppress FK violations — they are errors,
-  not conflicts — so the resolution happens in the `SELECT`.
-- **Schema drift**: both databases are brought up to date before the merge —
-  including the **local** one (`ensure_schema_compat` runs before
-  `BEGIN IMMEDIATE`), because the merge SQL writes columns a database
-  predating the migrations does not have.  Guarded `ALTER TABLE` migrations
-  mirror `src/data/db.rs`; the source copy is snapshotted with `VACUUM INTO`
-  and migrated in a temp dir.
-- **Safety**: local WAL is checkpointed first (abort if another process has
-  the db open); a `VACUUM INTO` snapshot is written to
-  `local-backups/ptm-premerge-<ts>.db` (5 kept) before any change; the
-  merge runs in a single `BEGIN IMMEDIATE` transaction and rolls back on
-  any error.
-- **`user_words.txt`** is union-merged (dedup + sort), like a pull.
-- **`.needs_push` is written** so the next `--end` pushes the merged state.
-  Deleting `.db_hash` would not work: `--start` re-seeds it from the current
-  database whenever it is missing, so the merged-but-unpushed state would be
-  recorded as the sync baseline and never uploaded.
-- **Known limitation**: deletions are not propagated — a row deleted on one
-  side is resurrected by the other side's surviving copy (tombstones would
-  be needed for true delete propagation).
-
-### CLI Flags
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--bucket-name` | *(required for `--start`/`--end`)* | S3 bucket name |
-| `--prefix` | *(required for `--start`/`--end`)* | S3 key prefix (e.g. `ptm-backups`) |
-| `--from` | *(required for `--merge`)* | Source ptm data directory to merge from (must contain `ptm.db`) |
-| `--encryption-key` | `~/.encryption_key` | Path to the 32-byte raw AES-256 key file |
-| `--dry-run` | off | Perform all logic but make no changes to local files or S3 |
-| `--local-is-master` | off | Treat local data as authoritative: skip pull on `--start`; force overwrite on `--end` |
-| `--remote-is-master` | off | Treat remote data as authoritative: force pull on `--start`; skip push on `--end` |
-| `--block-concurrent` | off | Abort `--start` if another ptm process has the database open (default: allow concurrency) |
-
-`--local-is-master` and `--remote-is-master` are mutually exclusive.
-
-### S3 Object
-
-A single object is used per prefix: `<prefix>/ptm-backup.zip.enc`.
-ETag values from S3 HEAD responses are used to detect whether a pull or push
-is actually needed — unchanged data is never re-uploaded.
-
-### Encryption
-
-Backups are AES-256-GCM encrypted. The on-disk format is:
-
-```
-[ MAGIC (4 B: "ENC1") | nonce (12 B) | ciphertext + GCM tag (16 B) ]
-```
-
-This format is compatible with `util/encrypt.py` and with the `enc` binary
-(see §enc above); all three share `src/crypto.rs`. The key file must be
-exactly 32 bytes of raw key material (not base64, not hex) and must have
-permissions `600` or `400` — ptm-sync refuses to run if group or other bits
-are set.
-
-Generate a key with:
-```bash
-enc keygen                      # writes ~/.encryption_key
-python3 util/encrypt.py keygen  # equivalent (Python tool)
-```
-
-`--encryption-key` and `--from` are resolved by `paths::expand_tilde` — the
-same helper `enc` uses (see §enc). Only a leading `~` or `~/` is expanded;
-`~x` stays a literal relative path, and an unset `$HOME` is an error rather
-than a fallback to the current directory.
-
-### Archive Contents
-
-Each backup is a zip archive (Deflate) containing:
-
-| Entry | Description |
-|-------|-------------|
-| `ptm.db` | The SQLite database |
-| `user_words.txt` | Custom spell-check dictionary (omitted from zip if absent) |
-
-During a pull, `user_words.txt` from the remote backup is **merged** with the
-local copy (union + dedup + sort) rather than overwritten. The database is
-always replaced wholesale — but only after the downloaded copy passes
-`PRAGMA integrity_check`, so a corrupt or truncated backup is reported instead
-of installed.
-
-The `ptm.db` entry is a `VACUUM INTO` snapshot, not the raw file: committed
-transactions can still be sitting in `ptm.db-wal`, and the raw file may not
-contain them. Local backups (`local-backups/`) are built the same way, so they
-are complete even when taken while `ptm` is running.
-
-### Data Directory Files
-
-All files live alongside `ptm.db` in `$XDG_DATA_HOME/ptm/` (default
-`~/.local/share/ptm/`):
-
-| File | Description |
-|------|-------------|
-| `.last_pushed_etag` | ETag of the last object we uploaded |
-| `.last_pulled_etag` | ETag of the last object we downloaded |
-| `.db_hash` | SHA-256 of `ptm.db ∥ user_words.txt` at the last successful push or pull; updated by `--end` on a successful push and by `do_pull` on a successful pull; seeded by `--start` only when absent (first launch) and no push is pending |
-| `.needs_push` | Present when the local state is known to be unpushed, whatever `.db_hash` says. Written by `--merge`, by a refused `--end` (busy WAL, ETag guards, failed upload) and cleared only by a confirmed upload or an install during a pull. Its existence is the signal; the contents are a human-readable reason |
-| `ptm-sync.log` | Append-only sync activity log |
-| `local-backups/` | Rolling local zip snapshots created before each pull (up to 5 kept); also holds `ptm-premerge-*.db` snapshots created before each merge (up to 5 kept) |
-
-### WAL Handling
-
-All of this lives in `src/bin/ptm_sync/db.rs`. Three SQLite behaviours shape it:
-
-- **`PRAGMA wal_checkpoint(TRUNCATE)` reports failure in a result row, not as an
-  error.** It returns `(busy, log, checkpointed)` and raises nothing when it
-  cannot advance, so `execute_batch` reports success for a WAL that is still
-  full. Every checkpoint goes through `run_checkpoint`, which reads that row,
-  and callers must check `CheckpointReport::is_clean()` (`busy == 0` and
-  `log_frames <= 0`).
-- **A `BEGIN EXCLUSIVE; COMMIT;` probe releases the lock at the `COMMIT`.** It
-  does detect a database another process has open, but the answer is stale as
-  soon as it is returned. Work that must not race with a running `ptm` holds an
-  `ExclusiveLock` across the whole operation instead.
-- **Committed data may live only in `ptm.db-wal`.** `std::fs::read("ptm.db")`
-  then returns a copy containing none of it, so anything that needs a complete
-  copy uses `db::snapshot_bytes` (`VACUUM INTO`), never a raw file read.
-
-Behaviour:
-
-- If `ptm.db-wal` is non-empty and no other process has the database open,
-  ptm-sync runs `wal_checkpoint(TRUNCATE)` and verifies the result is clean
-  before syncing.
-- If another ptm process is running, or the checkpoint cannot advance, `--start`
-  skips the pull (allowing concurrent launch) unless `--block-concurrent` is
-  given. A network error during the pull is treated the same way: on a terminal
-  it asks, without one it continues with a warning — `--start` runs immediately
-  before `ptm`, so failing it means `ptm` does not start at all.
-- The "is another process running?" check is gated on `ptm.db-wal` being
-  non-empty, because probing for a lock creates the `-wal`/`-shm` sidecars. A
-  concurrent session that has not written anything is therefore not detected by
-  `--end` (the upload is still coherent — `snapshot_bytes` does not need an
-  exclusive lock — it is just not reported as concurrent).
-- `--end` **exits non-zero** in that case, because the documented wrapper is
-  `trap 'ptm-sync --end' EXIT` and a silent success means the session's work is
-  never backed up. This holds regardless of `--local-is-master`: that flag is
-  about *S3 authority* (push even when the remote has diverged), not about local
-  concurrency, and a user who passed it explicitly asked for a push. The
-  attached client is itself the signal that the other session will push when it
-  exits; the error message says so instead of pretending the backup succeeded.
-- The pulled database is installed while holding an `ExclusiveLock`: checkpoint,
-  verify clean, delete the `-wal`/`-shm` sidecars, then `rename`. Renaming over
-  a database with a live `-wal` lets the stale frames be replayed into the new
-  file, which discards the pull while `--start` reports success.
-- Every connection here sets `busy_timeout` (5 s, matching `src/data/db.rs`);
-  without it a probe against a busy database fails instantly, making "in use"
-  indistinguishable from "broken".
-
-### Sync State Machine
-
-Two files decide whether `--end` uploads, and neither is sufficient alone.
-
-- **`.db_hash`** is the "last synced state" baseline: `--end` compares the
-  current snapshot's hash against it. `--start` seeds it when it is absent,
-  because a genuinely first launch has no baseline — which is exactly why
-  *deleting* it cannot mean "please push". `--start` would recreate it from the
-  current database and record the unpushed state as synced.
-- **`.needs_push`** is the out-of-band "this is unpushed, whatever the hash
-  says" marker. Its existence is the signal. It is written by `--merge`, by
-  every refused `--end` (busy WAL, either ETag guard, a failed upload) and is
-  cleared only by a confirmed upload or by the install during a pull. `--end`
-  pushes when the marker is present even if the hash matches, and `--start`
-  never seeds `.db_hash` while it is present.
-
-Failure semantics follow from the documented wrapper
-(`trap 'ptm-sync --end' EXIT; ptm`), which discards the exit code:
-
-- A push that cannot run is an **error** (non-zero exit) *and* leaves the
-  marker, so the work is retried by the next `--end` rather than lost.
-- `--start` is on the launch path, so it **does not fail the launch** for a
-  recoverable problem. A network error asks on a terminal and continues with a
-  warning without one; only `--block-concurrent` (a deliberate request to abort
-  on a concurrent session) turns a skip into a hard failure. A skipped pull
-  never touches the local database, so continuing is safe.
-- `--dry-run` reports what it would do and writes nothing, including the
-  marker.
-
-The corresponding functions live in `src/bin/ptm_sync/main.rs`
-(`mark_needs_push`, `needs_push`, `clear_needs_push`,
-`prompt_continue_without_pull`) and `src/bin/ptm_sync/ops.rs`
-(`upload_decision`, `mark_refusal`, `push_refused`).
-
-### AWS Credentials
-
-Region is read from `$AWS_REGION` or `$AWS_DEFAULT_REGION`, defaulting to
-`us-east-1`. Credentials follow the standard AWS chain: environment variables
-(`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`) → `~/.aws/credentials` (with
-`$AWS_PROFILE`).
-
-### Sync Log
-
-All ptm-sync activity is appended to `ptm-sync.log` (same data directory).
-Monitor it with:
-
-```bash
-tail -f ~/.local/share/ptm/ptm-sync.log
-```
+- **Keybinding changes touch three places**: the handler in `app.rs`, the hint
+  string in the view, and `key_help_lines()` in `overlay.rs`. The hint bar's
+  height drives the layout, so a stale string is both a lie and a rendering
+  bug. → [docs/adding-features.md](docs/adding-features.md)
+- **`pending_editor` vs immediate action** — any `$EDITOR` invocation sets
+  `pending_editor` and returns; the main loop opens the editor next iteration.
+  Never spawn an editor from inside a `handle_key_*` method.
+- **`pd_tab` (not `pd_focus`)** — the Project Detail tab state is
+  `pd_tab: PdTab`. There is no `pd_focus` field.
+- **Reorder helpers use swap** — `repo::swap_project_order`,
+  `repo::swap_todo_order`, `repo::swap_update_order`. There is no
+  `reorder_project` / `reorder_todo`.
+- **Schema changes** — `CREATE TABLE IF NOT EXISTS`, no migration version
+  table, and SQLite has no `ADD COLUMN IF NOT EXISTS`; guard with
+  `pragma_table_info`. → [docs/data-layer.md](docs/data-layer.md#schema-changes)
+- **List views paginate themselves** via `views::list_window`; never render a
+  `List` with raw `ListItem`s into the full content area.
+  → [docs/data-layer.md](docs/data-layer.md#list-pagination)
 
 ---
 
-## Architecture
+## Keybinding patterns
 
-### State (`app.rs`)
-
-`App` is one flat struct that holds **all** application state. There is no
-separate view-model per screen; fields are prefixed by their owning context:
-
-| Prefix | Context |
-|--------|---------|
-| `pl_` | Project List screen |
-| `pd_` | Project Detail screen |
-| `tl_` | Global Todo List screen |
-
-Navigation state:
-
-```rust
-pub screen:  Screen          // ProjectList | ProjectDetail | TodoList
-pub overlay: Option<Overlay> // only one overlay at a time
-pub pending_editor: Option<PendingEditor> // triggers $EDITOR in main loop
-```
-
-### Key handling flow
-
-```
-App::handle_key(key)
-  ├─ overlay.is_some()  →  handle_key_overlay  →  per-overlay handler
-  ├─ 'i' (quick capture, when not inline-editing)
-  ├─ '?' (key help overlay, when not inline-editing)
-  └─ screen match
-       ├─ ProjectList   →  handle_key_project_list
-       ├─ ProjectDetail →  handle_key_project_detail
-       └─ TodoList      →  handle_key_todo_list
-```
-
-**Project Detail** has tabs and an additional inline-edit guard layer:
-
-```
-handle_key_project_detail
-  ├─ pd_editing_todo.is_some()   →  inline todo-title edit (intercepts all keys)
-  ├─ pd_adding_todo.is_some()    →  inline new-todo entry  (intercepts all keys)
-  ├─ pd_editing_title.is_some()  →  inline title edit      (intercepts all keys)
-  ├─ pd_searching                →  search/highlight mode  (intercepts all keys)
-  ├─ pd_open_update.is_some()    →  update viewer          (intercepts all keys)
-  ├─ Universal keys (ESC, E, T, /, d, u, t, f)
-  └─ pd_tab dispatch
-       ├─ Description  →  handle_key_pd_description
-       ├─ Updates      →  handle_key_pd_updates
-       ├─ Todos        →  handle_key_pd_todos
-       └─ Files        →  (no-op)
-```
-
-The inline-edit, search, and update-viewer guards all take priority over the
-tab dispatch. Universal keys (`E`, `T`, `/`, tab-switches `d`/`u`/`t`/`f`)
-run before tab dispatch and work in every tab.
-
-### Rendering flow
-
-```
-ui::render(frame, app)
-  ├─ views::project_list::render   (or project_detail or todo_list)
-  └─ views::overlay::render_overlay  (if overlay.is_some())
-```
-
-Each view function reads from `app` and writes to `frame`. Application state is
-not mutated during rendering — with **one** deliberate, documented exception.
-
-#### The exception: `PublishedMetrics`
-
-Key handling needs two things only the renderer can know:
-
-* **Geometry** — how many lines the content has, how tall the viewport is, and
-  therefore the largest legal scroll offset. That depends on the terminal
-  width (markdown re-wrapping, hint-bar height) and on the tab layout.
-* **Search-match positions** — where each match landed in the *wrapped*
-  output, which again depends on the width.
-
-Recomputing either in the key handler would duplicate the layout code and let
-the two drift. So the views publish them into `app.metrics`
-(`PublishedMetrics`, in `app.rs`) while they draw, and the key handlers read
-them. It is `Cell`/`RefCell` because views take `&App` and `ui::render` only
-has a shared reference.
-
-The contract (also on the type itself):
-
-* **Renderers own it.** Nothing else writes those fields; a key handler never
-  sets them.
-* **Values are one frame old.** A key event is handled after the frame that
-  preceded it. Handlers must treat every value as a hint — clamp against it,
-  never assume it is non-zero. `nudge_scroll_into_view`'s `.max(1)` and the
-  `.min(max_scroll)` clamps are that rule, not defensive noise.
-* **Losing it is harmless.** A zeroed value must degrade to "no scrolling",
-  never to a panic or a stuck cursor.
-
-Adding a field here is the right move only for a value the renderer genuinely
-computes. Anything derivable from `App` (a list length, a cursor) belongs in
-the key handler.
-
-### Key scopes in Project Detail
-
-```
-handle_key_project_detail
-  ├─ inline-edit guards   (editing todo / adding todo / editing title) — intercept all
-  ├─ pd_searching         — intercepts all (so `n` types into the query)
-  ├─ UNIVERSAL keys       — Esc E T / n N d u t f
-  ├─ update-viewer guard  — handle_key_pd_update_viewer
-  └─ tab dispatch         (Description / Updates / Todos / Files)
-```
-
-The **update viewer is not a separate key scope**. The universal block runs
-before the viewer guard, so `ESC` (close), `E`, `T`, `/`, `n`/`N` and the tab
-switches all work while an update is open; everything the block does not claim
-(`j`/`k`, `^f`/`^b`, `e`, `S`) falls through to the viewer handler. Putting the
-viewer guard *above* the universal block (as it was) makes every universal key
-dead in the viewer, including the `N` arm, whose condition is then unreachable
-(findings #6/#23).
-
-Two rules that follow:
-
-* **Guard modifier keys.** `^F`/`^B` are half-page scroll in the Description
-  tab and the viewer, but `f`/`b` alone also mean "switch to Files" (and are
-  otherwise unbound). The tab-switch arms therefore carry
-  `if !key.modifiers.contains(KeyModifiers::CONTROL)`.
-* **Closing the viewer is not "back".** `ESC` closes the viewer when one is
-  open and otherwise leaves Project Detail. Switching to a tab other than
-  Updates also closes it — see `App::switch_pd_tab` / `close_update_viewer`.
-
-### Overlay dismissal and redispatch
-
-`Overlay::Warn` closes on **any** key press, but the key is not swallowed: once
-the notice is gone, a *safe* key is handed back to `App::handle_key` so a user
-who reflexively presses `e` again at the edit-conflict warning gets the editor
-instead of nothing (finding #15). Redispatch is deliberately narrow —
-`is_redispatchable` is a closed allow-list of plain navigation/editing
-characters plus `Esc`. Keys that open an overlay (`i`, `?`, `n`, `T`, `D`, `/`,
-`r`, `m`, `S`, `Enter`) are excluded: replaying one would raise a new overlay
-while the caller is still unwinding from the old one, and the nesting would
-have no bound.
-
-### External editor (`$EDITOR`)
-
-When code sets `app.pending_editor = Some(...)`, the main event loop in
-`main.rs` detects it **before** polling for key events, then:
-1. Suspends ratatui / restores the normal terminal.
-2. Writes content to a `$TMPDIR/ptm_<uuid>.txt` file.
-3. Spawns `$EDITOR` (falls back to `vi`) and waits for it to exit.
-4. Reads the file back and calls `app.handle_editor_result(target, content)`.
-5. Resumes ratatui.
-
-Do **not** open an editor from inside a `handle_key_*` method; always set
-`pending_editor` and return.
-
-### Idle cost — draw on demand, never on a timer
-
-Both event loops draw **only when something changed**: a `needs_draw` flag is
-set for the first frame, after an `$EDITOR` round-trip, and after any event is
-handled; otherwise the loop blocks in `event::poll(Duration::MAX)`.
-
-`md` used to redraw unconditionally every 200 ms (`poll(200ms)` at the bottom
-of a `draw`-first loop). Its frame is a pure function of `App` — no animation,
-no clock — so that timer only re-ran `render_markdown` over the whole document
-plus the buffer diff, `hide_cursor` and `flush`, five times a second while the
-user read: ~16% CPU and ~100 B/s of terminal output on a 4 000-line file,
-falling to 0% and 0 B/s with the flag. `ptm`'s loop keeps its 200 ms tick only
-because its render output is time-dependent — reminder colours are keyed on
-`today` (`reminder_date_style` calls `SystemTime::now()`), so an idle redraw is
-what re-colours a reminder that goes overdue at midnight. If a renderer is ever
-made clock-independent, drop its tick too; if a clock enters `md`'s render,
-it needs one back.
-
-Two rules keep the flag honest:
-
-* **Anything that mutates `App` outside the key handlers must set `needs_draw`.**
-  That is why the `$EDITOR` branch sets it before its `continue`: without it the
-  reloaded document would not be painted until the next keystroke.
-* **Drain the event queue before drawing.** A paste arrives as a burst of
-  bytes, and one draw per character costs a full markdown render each (60
-  pasted chars measured 1.9 s of CPU). The inner `poll(Duration::ZERO)` loop
-  coalesces a burst into one draw; between keystrokes it is false, so ordinary
-  typing still paints per key. The loop breaks out early on `should_quit` /
-  `pending_editor` so the editor and the exit path never wait behind a queue.
-
----
-
-## Data Layer (`repo.rs`)
-
-All database I/O goes through functions in `repo.rs`. No view or `app.rs`
-code runs SQL directly.
-
-Key conventions:
-- IDs are UUID v4 strings (`Uuid::new_v4().to_string()`).
-- Timestamps are UTC ISO 8601: `"%Y-%m-%dT%H:%M:%SZ"`.
-- Sort order uses fractional indexing (`f64`). Reordering calls
-  `repo::swap_project_order`, `repo::swap_todo_order`, or
-  `repo::swap_update_order`, swapping the `sort_order` values of two
-  adjacent rows.
-- `todos.project_id IS NULL` means the todo is in the **Inbox**.
-- `soonest_reminder` on `Project` is computed with a subquery
-  (`MIN(reminder)` over active todos) — it is not a stored column. The
-  subquery exists once, as `SOONEST_REMINDER_COL`, inlined into the project
-  `SELECT`s; do not add a second definition.
-- Tags are shared globally. `repo::untag_project` garbage-collects orphaned
-  tag rows automatically.
-- **List queries must issue a constant number of statements.** `list_projects`
-  and `list_todos_global` are re-run on every keystroke of a search box
-  (`reload_project_list` / `reload_todo_list`), so a per-row query is a
-  per-keystroke query. The shapes to copy: inline a correlated subquery for a
-  per-row computed column, and load a per-row collection for the whole result
-  set in one `IN (…)` query (`load_tags_for_projects`) rather than one query
-  per row. `dev-harness/query-count.py` counts statements with SQLite's
-  `SQLITE_TRACE_STMT`; the `repo` tests pin the counts at 1 vs 30 rows.
-- **Errors are propagated, not defaulted away.** A fallible lookup whose
-  failure is collapsed into a "not found"/"no conflict" answer silently
-  changes behaviour (`rename_tag` used to do exactly that). Where a caller must
-  distinguish a *user* refusal from a *database* failure, return a typed error
-  (`RenameTagError::NameTaken` vs `RenameTagError::Db`) instead of one string.
-
-Schema changes must use `CREATE TABLE IF NOT EXISTS` (or `ALTER TABLE` with
-care); there is no migration version table yet.
-
-Test-only features live in `[dev-dependencies]` (rusqlite's `trace` and
-`hooks`): dev-dependency features are unified into test builds only, so the
-shipped binaries do not carry them.
-
----
-
-## UI Conventions
-
-### Hint bar
-Every screen/focus mode has a hint string. Its height is computed dynamically
-by `super::hint_height(hints, area.width)` (wraps at terminal width) so the
-main content area shrinks accordingly. Always update the hints string when
-adding or removing keybindings.
-
-```rust
-// pattern used in every view
-let hints = if <editing_mode> { "  Enter:save  ESC:cancel" } else { "  j/k:..." };
-let chunks = Layout::default()
-    .constraints([Constraint::Min(3), Constraint::Length(super::hint_height(hints, area.width))])
-    ...
-```
-
-### Theme
-Colors come from `Theme::default()` (defined in `ui/theme.rs`). Always use
-theme fields rather than hard-coding colors, except for transient states like
-`Color::DarkGray` for placeholder text.
-
-### Color Palette
-The target terminal is **Apple Terminal.app on macOS**, which supports
-**256-color (xterm-256color)** but **not 24-bit true color**. `$COLORTERM` is
-not set in this environment.
-
-- ✅ Use `Color::Indexed(n)` or ratatui named colors (`Color::Red`,
-  `Color::LightBlue`, etc.) — these map to the 256-color palette.
-- ❌ Do **not** use `Color::Rgb(r, g, b)` — 24-bit sequences are silently
-  ignored by this terminal, producing no color change.
-
-### Text width — always measure in columns
-Terminal layout is measured in **display columns**, not characters and never
-bytes. A CJK ideograph or an emoji occupies two columns; a combining mark
-occupies none. `str::chars().count()` is therefore wrong for any width
-decision (finding #16: CJK titles wrapped at half the intended width and
-overflowed the pane), and `str::len()` is wrong twice over.
-
-All wrapping, truncation, padding and row-height arithmetic goes through
-`ui/text.rs` (path-included by `md`, so both binaries agree):
-
-| Helper | Use |
-|--------|-----|
-| `display_width(s)` | columns occupied by `s` |
-| `char_display_width(c)` | columns occupied by one `char` |
-| `char_wrap(text, w)` | hard-wrap at `w` columns |
-| `word_wrap(text, w)` | word-wrap at `w` columns (preserves space runs) |
-| `wrap_rows(s, w)` | wrap one already-split string into rows |
-| `split_at_width(s, w)` | `(prefix, rest)` at a column budget, space-preferred |
-| `pad_to_width(s, w)` | right-pad to exactly `w` columns |
-| `ellipsize(s, w)` | truncate to `w` columns, **always** ending in `…` |
-| `hint_height(text, w)` | rows a hint string needs at `w` columns |
-
-`format!("{:<w$}")` pads by characters and misaligns any column containing wide
-text — use `pad_to_width`. `views/mod.rs` re-exports these as `super::…` for
-the view modules.
-
-Case-insensitive matching lives here: `find_matches` returns the char ranges of
-every occurrence, mapping a case-folded match back onto whole characters of the
-original text. Using lowercased offsets directly against the original is wrong
-because folding is not length-preserving (`'İ'` lowercases to two chars,
-finding #17). `split_matches` is the segment-level form of the same thing.
-
-### Search highlighting — `ui/search.rs`
-
-`ui/search.rs` (path-included by `md`) turns those ranges into styled
-`ratatui` spans. Both binaries use it; **do not reintroduce a local copy** —
-`views/project_detail.rs` and `bin/md/main.rs` each had one, and they had
-already drifted.
-
-| Function | Use |
-|----------|-----|
-| `highlight(lines, q, current_idx, cur_style, other_style)` | whole buffer: styles every match, paints the current one, returns `Highlighted { lines, marks }` |
-| `highlight_line(line, q, style)` | one row, all matches in one style (lists that do not navigate) |
-
-Two rules, both of which were live bugs:
-
-* **Match on the whole line, not per span.** `markdown.rs` emits one span per
-  word (and separate spans for markup, list markers and table cells), so a
-  query containing a space never fits inside a single span: `/We the people`
-  highlighted nothing, and the highlight vanished as soon as a space was typed.
-  `search::highlight` concatenates a line's spans, matches, then maps the char
-  ranges back onto the spans, keeping each span's base style.
-* **The current-match pointer is a flat index into `marks`.** Style every match
-  in one pass and index it — an implementation that only advances its
-  occurrence counter while hunting for the current match leaves `n` moving the
-  pointer with no match ever painted yellow on a line that holds several.
-
-A match cannot cross a *rendered line* boundary (a word-wrap point or a block
-break); lines are searched independently, which keeps the `(line, occ)`
-coordinates that `n`/`N` navigation is built on exact.
-
-### Reminder display
-Reminder dates are stored as `YYYY-MM-DD` strings and truncated to 10
-characters on display. They are rendered with a leading two-space pad:
-
-```rust
-.map(|r| format!("  {}", views::date_prefix(r)))
-```
-
-Always truncate through `views::date_prefix` (in `ui/views/mod.rs`), never
-with a byte slice like `&r[..r.len().min(10)]`: that panics when byte 10
-lands inside a multi-byte character. `reminder` is a free-text `TEXT` column —
-the app's input and `util/import_projects.py` validate `%Y-%m-%d`, but
-`--merge` copies whatever the source database holds, so a display helper must
-not assume ASCII.
-
-Do **not** add emoji or icons before reminder dates (spacing issues on some
-terminals).
-
-### Key Help wrapping
-`wrap_key_row` (in `overlay.rs`) wraps a key-help description into the column
-budget `desc_width = inner_width - KEY_COL_WIDTH` (14). Two rules:
-
-- **`desc_width` is a column count, so count characters, not bytes.** The
-  rows contain `→`; slicing a `&str` at a column offset panics when it lands
-  inside a character.
-- **`desc_width == 0` means "do not wrap"** — render the row unwrapped and let
-  the paragraph clip it. A hard break at column 0 makes no progress and loops
-  forever.
-
-`overlay.rs`'s unit tests sweep `desc_width` 0..=60 over every real
-`key_help_lines()` row, so adding a description with wide characters is
-covered automatically.
-
-### Markdown tables
-`markdown.rs` renders a table as a box: every line of it — top rule, header,
-row rules, body rows, bottom rule — must be exactly the same display width, or
-the box visibly breaks. Two rules keep it that way, and the width depends on
-the terminal, so a table that looks right at 120 columns can break at 60:
-
-- **A block marker's trailing space belongs to the source, not to the cell
-  text.** `parse_block_marker` consumes it (as it does for `> `, `- `, `1. `)
-  and `build_cell` re-supplies it as part of the rendered prefix. Leaving it
-  in `rest` rendered `| # |` as `│ #  │` beside `│ A │` and widened the column
-  by one. A prefix-only cell (`| # |`) must also drop the separator space
-  entirely — the cell is exactly as wide as its marker.
-- **A prefix may not take the whole column.** `emit_pfx` truncates a prefix
-  (`• `, `1. `, `# `, `│ `, indent) to `width - 1` columns when the cell has
-  text, so the text always has somewhere to land; otherwise a column squeezed
-  below its marker emits an over-wide line, and `render_table`'s
-  `w.saturating_sub(content_w)` turns that into a short `rpad`, so the row
-  renders *longer* than the rules around it.
-
-`rm_table_every_line_has_the_same_width` sweeps widths 12..=110 over a table
-containing every cell kind and asserts the invariant, so both regressions are
-covered.
-
-### Overlays
-All overlays are rendered centered over the full terminal area by
-`overlay::render_overlay`. Only one `Overlay` variant can be active at a time.
-The overlay intercepts **all** key events until dismissed.
-
----
-
-## Keybinding Conventions
+The user-facing key tables are in `USER_MANUAL.md`. These are the *patterns*
+new keys should follow, not a list of every binding.
 
 | Pattern | Meaning |
 |---------|---------|
 | `j` / `k` | cursor down / up in any list |
-| `J` / `K` (Shift) | reorder item down / up |
+| `J` / `K` | reorder item down / up |
 | `Enter` | confirm / open |
 | `ESC` | cancel / go back |
-| `D` (Shift) | delete selected item (always with a confirm dialog) |
-| `Q` (Shift) | quit (Project List, Todo List) |
-| `n` | new item in context (project inline in PL, todo inline in PD/TL, update in `$EDITOR` in Updates tab, quick-capture in Todo List) |
-| `n` / `N` | next / previous search match (Project Detail Description tab and update viewer; wraps like vim). With no query, `n` on the Description tab edits the description and `n` on the Updates/Todos tabs creates a new item |
-| `e` | edit selected item (project title inline in PL; todo title inline in PD/TL; description in `$EDITOR` in PD Description tab; selected update in `$EDITOR` in Updates tab) |
-| `E` (Shift) | edit project title inline (Project Detail) |
-| `d` / `u` / `t` / `f` | switch Project Detail tab (Description / Updates / Todos / Files) |
-| `t` | go to Todo List (from Project List); switch to Todos tab (from Project Detail) |
-| `p` | go to Project List (from Todo List) |
-| `r` | set/clear reminder date; rename tag (Tag Picker, when search is empty) |
-| `m` | move todo to another project (opens Project Picker overlay) |
-| `T` (Shift) | tag editor (Project Detail) / tag filter (Project List, Todo List) |
+| `D` | delete selected item (always with a confirm dialog) |
+| `Q` | quit (Project List, Todo List) |
+| `e` / `E` | edit selected item / edit project title |
+| `n` | new item in context — **and** next search match where a query is active |
+| `N` | previous search match |
+| `d` / `u` / `t` / `f` | switch Project Detail tab |
 | `s` | cycle todo status |
-| `S` (Shift) | spell check selected item (todo title, update body, project description) |
-| `i` | quick capture (global, outside overlays) |
-| `?` | open key help overlay (global, outside overlays) |
-| `C` (Shift) | toggle hide done/canceled todos (Project Detail Todos tab, Todo List) |
-| `a` | archive/toggle selected item (todos in PD/TL, projects in PL); accept all occurrences (Spell Check) |
-| `A` (Shift) | show / hide archived items |
+| `a` / `A` | archive selected / show-or-hide archived |
+| `C` | toggle hide done/canceled todos |
+| `i` / `?` | quick capture / key help (global, outside overlays) |
 
----
-
-## How to Add a Keybinding
-
-1. Handle it in the appropriate `handle_key_*` method in `app.rs`.
-2. Update the hints string in the corresponding view file under
-   `src/ui/views/`. Remember: hints update the layout height, so the string
-   must be kept accurate.
-3. Update the `key_help_lines()` function in `src/ui/views/overlay.rs` to
-   reflect the change. This is the content shown by the `?` Key Help modal.
-
-For Project Detail, decide whether the key should work in a specific tab handler
-(`handle_key_pd_description`, `handle_key_pd_updates`, `handle_key_pd_todos`), in
-the **update viewer** (`handle_key_pd_update_viewer`), or as a **universal key**
-(runs before both). Keys like `E` and `T` that act on the project itself are
-universal and live in the universal-keys block in
-`handle_key_project_detail` — which means they also work while an update is
-open. A key that should scroll or edit *the open update* goes in the viewer
-handler instead. See §Key scopes in Project Detail for the ordering and why the
-viewer guard must stay below the universal block.
-
-Two more checks before you finish:
-
-* If the key is a letter that is also a tab switch (`d`/`u`/`t`/`f`) and you
-  bind a Ctrl variant of it for scrolling, guard the tab-switch arm on
-  `!key.modifiers.contains(KeyModifiers::CONTROL)`. The universal block runs
-  first, so an unguarded arm wins and the Ctrl key appears to do nothing.
-* If the key's meaning depends on state (`n` is "next match", "edit
-  description" or "new item" depending on the tab and whether a query is
-  running), put the disambiguation in one place with a comment saying which
-  case wins, and test all of them. Silent dead bindings are the failure mode
-  here: `n` was documented as "edit description" and did nothing, and
-  `^F`/`^B` were advertised in the Key Help while a tab switch ate the key.
-* Add the key to the hint-bar string **only** for the modes that accept it.
-  `n`/`N` in particular mean "next/previous match" on the Description tab and
-  in the update viewer but "new item" on the Todos tab. The hint bar's height
-  drives the layout, so a wrong string is both a lie and a rendering bug; the
-  tests in `project_detail.rs` assert the advertised keys against
-  `key_help_lines()`.
-
-## Warn / Error Modal (`Overlay::Warn`)
-
-A lightweight, reusable notice overlay for conditions that need user attention
-but require no input — missing features, configuration problems, etc.
-
-```rust
-self.overlay = Some(Overlay::Warn {
-    title: " My Warning Title ".into(),   // shown in the border
-    body:  "Line one.\nLine two.".into(), // supports \n-separated lines
-});
-```
-
-- Dismissed by **any key press**. The dismissing key is **not** swallowed when
-  it is safe to replay (see §Overlay dismissal and redispatch), so a reflexive
-  second `e` at an edit-conflict warning still opens the editor.
-- Border is rendered in yellow via `Color::Yellow`.
-- Body text is word-wrapped; keep lines under ~58 characters for best fit.
-- Use this instead of `crate::log::warn` whenever the condition is
-  interactive and the user would benefit from on-screen guidance (e.g.,
-  a missing dictionary, an unsupported operation).
-
----
-
-## How to Add an Overlay
-
-1. Add a variant to the `Overlay` enum in `app.rs`.
-2. Add an arm to the `match overlay { ... }` block in `handle_key_overlay`.
-3. Write a `fn handle_<name>(&mut self, key, ...) -> Result<Option<Overlay>>`
-   method on `App`. Return `Ok(None)` to dismiss, `Ok(Some(overlay))` to keep
-   it open.
-4. Add rendering in `src/ui/views/overlay.rs`: a private `fn render_<name>`
-   and a new arm in `render_overlay`'s `match` block.
-
-## How to Add a Screen
-
-1. Add a variant to the `Screen` enum in `app.rs`.
-2. Write a `fn handle_key_<screen>(&mut self, key) -> Result<()>` method.
-3. Create `src/ui/views/<screen>.rs` with a `pub fn render(frame, area, app)`.
-4. Add `pub mod <screen>;` in `src/ui/views/mod.rs`.
-5. Add the arm to the `match app.screen { ... }` blocks in both
-   `ui::mod::render` and `App::handle_key`.
-
----
-
-## Logging
-
-The TUI runs in raw mode and owns the terminal, so **`eprintln!` and `print!`
-corrupt the display and must never be used**. Use `crate::log::warn(msg)` instead.
-
-```rust
-crate::log::warn("something unexpected happened");
-```
-
-`src/log.rs` is shared by `ptm` and `md`: `ptm` writes
-`$XDG_DATA_HOME/ptm/ptm.log`, `md` writes `$XDG_DATA_HOME/md/md.log` after
-calling `log::set_app_name("md")` (its `bin/md/log.rs` is a two-line wrapper).
-Both create the directory on demand, so the first message of a fresh install is
-not lost. Lines carry a UTC timestamp:
-
-```
-2025-01-15T10:23:45Z WARN  row_to_todo: unknown todo status: "bogus" — defaulting to New
-```
-
-Logging failures are silently swallowed — a log call must never crash the app.
-The log file can be monitored during development with:
-
-```bash
-tail -f ~/.local/share/ptm/ptm.log   # ptm
-tail -f ~/.local/share/md/md.log     # md
-```
-
----
-
-## Common Gotchas
-
-- **A project created under a tag filter inherits that tag** — the inline
-  create handler in `handle_key_project_list` calls `repo::tag_project` with
-  `self.tag_filter` after `repo::create_project`, so the new project does not
-  vanish from the filtered list. With no filter active nothing is tagged. Two
-  consequences for that handler: the cursor must be found by id
-  (`position(|p| p.id == created.id)`), never `len - 1`, because a filter or
-  search means the list does not end with the new project; and `tag_project`
-  is case-insensitive, so it reuses the filter's tag row instead of creating a
-  case-variant duplicate.
-- **`tl_cursor` is a flat todo index** — it counts only todo rows, not group
-  header rows. Use `App::tl_current_todo()` / `tl_todo_at(flat_idx)` rather
-  than indexing `tl_groups` directly.
-- **Inline-edit guards run before tab dispatch** in `handle_key_project_detail`.
-  If you add a new inline-edit mode, add a corresponding check at the top of
-  that method and update `is_inline_editing()`. Note that `is_inline_editing()`
-  also returns `true` while `pd_searching`, `pl_searching`, `tl_searching`,
-  `pl_editing_title`, or `tl_editing.is_some()` is active.
-- **`pending_editor` vs immediate action** — any `$EDITOR` invocation must go
-  through `pending_editor`. Setting it and returning causes the main loop to
-  open the editor on the next iteration.
-- **`pd_tab` (not `pd_focus`)** — the Project Detail tab state is `pd_tab: PdTab`
-  with variants `Description`, `Updates`, `Todos`, `Files`. There is no
-  `pd_focus` field.
-- **Tag garbage collection** — `repo::untag_project` deletes the `tags` row
-  when no join-table reference remains. Don't delete tag rows directly.
-- **Reminder bubble-up** — `Project::soonest_reminder` is computed from
-  active (non-done, non-canceled) todos only. See `load_soonest_reminder` in
-  `repo.rs`.
-- **Update viewer vs. Updates tab** — when `pd_open_update.is_some()`, all
-  keys go to `handle_key_pd_update_viewer`, not `handle_key_pd_updates`. If
-  a key should work in both contexts, add it to both handlers.
-- **Reorder helpers use swap** — reordering calls `repo::swap_project_order`,
-  `repo::swap_todo_order`, or `repo::swap_update_order` (not
-  `reorder_project` / `reorder_todo`). Each function swaps the `sort_order`
-  values of two adjacent rows.
-- **Schema changes** — use `CREATE TABLE IF NOT EXISTS`; running the schema
-  again on an existing database must be a no-op. For column additions, SQLite
-  does **not** support `ADD COLUMN IF NOT EXISTS` (that clause is not part of
-  SQLite's grammar for `ALTER TABLE`). Instead, guard the migration with a
-  `SELECT COUNT(*) FROM pragma_table_info('<table>') WHERE name = '<col>'`
-  check and only run the `ALTER TABLE ... ADD COLUMN` when the count is 0.
-- **List pagination** — ratatui's `List` scrolls by whole items: a multi-row
-  item that overflows the bottom is dropped entirely (leaving a blank gap),
-  and footer rows appended after the items (e.g. the "N archived — A to
-  show" hint) can be pushed past the bottom edge. All list views therefore
-  paginate themselves: build the items as `Vec<Vec<Line>>`, compute the
-  visible window with `views::list_window(&heights, area_height,
-  selected)`, render the `List` into exactly `rows_used` rows, and fill any
-  leftover rows with a "peek" at the next item's first lines (see
-  `project_list.rs`, `todo_list.rs`, and `render_todos_tab` /
-  `render_updates_tab` in `project_detail.rs`). Don't render a list widget
-  straight into the full content area with raw `ListItem`s.
-- **Shared files are `#[path]`-included, never copied** — `crypto.rs`,
-  `spell.rs`, `paths.rs`, `log.rs`, `ui/text.rs`, `ui/search.rs`,
-  `ui/markdown.rs` and `ui/theme.rs` are compiled into more than one binary. Editing a "copy" under
-  `src/bin/…` is always wrong: there is no copy, only a `mod` declaration
-  pointing back at the shared file. Each `src/bin/<x>/` directory contains
-  only what is genuinely specific to that binary (its `main.rs`, plus `md`'s
-  thin `log.rs` wrapper and `ui.rs` module tree). When adding a helper that two
-  binaries need, put it in the shared file and path-include it — a per-binary
-  reimplementation is how findings #5, #19 and #21 happened.
+`n` is the one to be careful with: it is "next match", "edit description" or
+"new item" depending on the tab and whether a query is running. See
+[docs/adding-features.md](docs/adding-features.md#how-to-add-a-keybinding).
