@@ -1,7 +1,9 @@
-#!/bin/sh
+#!/bin/bash
+
+set -e
 
 DS="$(date +%Y%m%d%H%M)"
-PROJ_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PROJ_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
 cd "$PROJ_DIR"
 
