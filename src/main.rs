@@ -143,31 +143,34 @@ fn suspend_and_edit(
 
 #[cfg(test)]
 mod docs_tests {
-    //! Guards the `AGENTS.md` repository tree against drift (finding #22).
+    //! Guards the `docs/repository-layout.md` repository tree against drift
+    //! (finding #22).
     //!
     //! The documented tree had grown a file that does not exist
     //! (`ui/views/reference_library.rs`) and lost one that does (`tz.rs`), and
     //! described `input/mod.rs` as a placeholder when it is fully implemented.
     //! A layout section that lies is worse than none: it is the map a future
-    //! session navigates by.  This test parses the tree out of `AGENTS.md` and
-    //! compares it with what is on disk, so the next drift fails the build
-    //! instead of misdirecting someone.
+    //! session navigates by.  This test parses the tree out of
+    //! `docs/repository-layout.md` (which `AGENTS.md` links to as its index
+    //! entry for orientation) and compares it with what is on disk, so the
+    //! next drift fails the build instead of misdirecting someone.
 
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
 
-    /// Parse the fenced tree block under `## Repository Layout`.
+    /// Parse the fenced tree block under `# Repository Layout` in
+    /// `docs/repository-layout.md` (AGENTS.md is now an index and links there).
     ///
     /// Returns the set of paths it names (relative to the repo root) that look
     /// like files — i.e. that carry an extension or are `main.rs`-style leaves.
     /// Directories are skipped: they are implied by their children, and the
     /// tree draws them with a trailing `/`.
     fn documented_files() -> BTreeSet<PathBuf> {
-        let agents = include_str!("../AGENTS.md");
-        let start = agents
-            .find("## Repository Layout")
-            .expect("AGENTS.md must have a 'Repository Layout' section");
-        let section = &agents[start..];
+        let layout = include_str!("../docs/repository-layout.md");
+        let start = layout
+            .find("# Repository Layout")
+            .expect("docs/repository-layout.md must have a 'Repository Layout' heading");
+        let section = &layout[start..];
         let open = section.find("```").expect("the layout section must have a code block") + 3;
         let close = section[open..]
             .find("```")
@@ -235,12 +238,12 @@ mod docs_tests {
 
         assert!(
             missing.is_empty(),
-            "AGENTS.md documents files that do not exist:\n{:#?}",
+            "docs/repository-layout.md documents files that do not exist:\n{:#?}",
             missing
         );
         assert!(
             undocumented.is_empty(),
-            "AGENTS.md does not document these files:\n{:#?}",
+            "docs/repository-layout.md does not document these files:\n{:#?}",
             undocumented
         );
     }
