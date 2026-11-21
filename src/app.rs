@@ -258,6 +258,10 @@ pub struct App {
     pub pl_creating: Option<InputState>,
     /// `Some(state)` when inline project title editing is active.
     pub pl_editing_title: Option<InputState>,
+    /// Reminder view (`R`) on the Project List: show only projects with an
+    /// active soonest reminder, sorted soonest-first. A view-local filter —
+    /// the stored manual order is untouched and reappears when toggled off.
+    pub pl_reminder_view: bool,
 
     // ── Project Detail state ────────────────────────────────────────────────
     pub pd_project: Option<Project>,
@@ -302,6 +306,11 @@ pub struct App {
     pub tl_editing: Option<(String, InputState)>,
     /// Show archived todos in the Global Todo List (default: false = hidden).
     pub tl_show_archived: bool,
+    /// Reminder view (`R`) on the Global Todo List: show only todos with a
+    /// reminder on an active (non-done, non-canceled) status, sorted
+    /// soonest-first within their groups and groups soonest-first. View-local:
+    /// toggling it off restores the manual order.
+    pub tl_reminder_view: bool,
     /// Count of archived todos visible in the global list scope (non-archived projects + inbox).
     pub tl_archived_count: u32,
     /// Show archived todos in the Project Detail Todos tab (default: false = hidden).
@@ -348,6 +357,7 @@ impl App {
             pl_projects: projects,
             pl_cursor: 0,
             pl_show_archived: false,
+            pl_reminder_view: false,
             pl_archived_count: archived_count,
             pl_search: String::new(),
             pl_searching: false,
@@ -379,6 +389,7 @@ impl App {
             tl_searching: false,
             tl_editing: None,
             tl_show_archived: false,
+            tl_reminder_view: false,
             tl_archived_count: 0,
             pd_show_archived_todos: false,
             pd_archived_todo_count: 0,
@@ -1013,6 +1024,10 @@ impl App {
             }
 
             KeyCode::Char('J') => {
+                // Reorder is disabled in the reminder view: the list is
+                // sorted by reminder date, so any swap would be invisible
+                // (and be undone by the next reload).
+                if self.pl_reminder_view { return Ok(()); }
                 if let Some(id) = self.pl_selected_id() {
                     let next_pos = self.pl_cursor + 1;
                     if let Some(neighbor) = self.pl_projects.get(next_pos) {
@@ -1023,6 +1038,7 @@ impl App {
                 }
             }
             KeyCode::Char('K') => {
+                if self.pl_reminder_view { return Ok(()); }
                 if let Some(id) = self.pl_selected_id() {
                     if self.pl_cursor > 0 {
                         let prev_pos = self.pl_cursor - 1;
@@ -1086,6 +1102,14 @@ impl App {
 
             KeyCode::Char('A') => {
                 self.pl_show_archived = !self.pl_show_archived;
+                self.reload_project_list()?;
+            }
+
+            KeyCode::Char('R') => {
+                // Reminder view: only projects with an active soonest
+                // reminder, soonest first. A view-local toggle — the stored
+                // manual order is untouched and reappears when toggled off.
+                self.pl_reminder_view = !self.pl_reminder_view;
                 self.reload_project_list()?;
             }
 
@@ -1859,6 +1883,10 @@ impl App {
             }
 
             KeyCode::Char('J') => {
+                // Reorder is disabled in the reminder view: the list is
+                // sorted by reminder date, so any swap would be invisible
+                // (and be undone by the next reload).
+                if self.tl_reminder_view { return Ok(()); }
                 if let Some(cur) = self.tl_current_todo() {
                     let id = cur.id.clone();
                     let cur_proj = cur.project_id.clone();
@@ -1875,6 +1903,7 @@ impl App {
                 }
             }
             KeyCode::Char('K') => {
+                if self.tl_reminder_view { return Ok(()); }
                 if let Some(cur) = self.tl_current_todo() {
                     let id = cur.id.clone();
                     let cur_proj = cur.project_id.clone();
@@ -1942,6 +1971,15 @@ impl App {
 
             KeyCode::Char('C') => {
                 self.hide_done = !self.hide_done;
+                self.reload_todo_list()?;
+            }
+
+            KeyCode::Char('R') => {
+                // Reminder view: only todos with a reminder on an active
+                // (non-done, non-canceled) status, soonest first. A view-local
+                // toggle — the stored manual order is untouched and reappears
+                // when toggled off.
+                self.tl_reminder_view = !self.tl_reminder_view;
                 self.reload_todo_list()?;
             }
 
@@ -2088,6 +2126,9 @@ impl App {
         self.pl_projects = repo::list_projects(
             &self.conn, self.pl_show_archived, self.tag_filter.as_deref(), search,
         )?;
+        if self.pl_reminder_view {
+            reminder_view_projects(&mut self.pl_projects);
+        }
         self.pl_archived_count = repo::count_archived(&self.conn)?;
         let len = self.pl_projects.len();
         if len > 0 && self.pl_cursor >= len {
@@ -2136,6 +2177,9 @@ impl App {
         self.tl_groups = repo::list_todos_global(
             &self.conn, self.hide_done, search, self.tag_filter.as_deref(), self.tl_show_archived,
         )?;
+        if self.tl_reminder_view {
+            reminder_view_groups(&mut self.tl_groups);
+        }
         self.tl_archived_count = repo::count_archived_todos_global(&self.conn)?;
         self.tl_done_count = repo::count_done_todos_global(&self.conn)?;
         let total = self.flat_todo_count();
@@ -2381,6 +2425,58 @@ impl App {
 }
 
 // ─── Free helpers ──────────────────────────────────────────────────────────────────────
+
+/// Reminder-view (`R`) projection of the project list: keep only projects
+/// with a soonest *active* reminder, soonest date first.
+///
+/// ISO `YYYY-MM-DD` dates sort lexicographically, so string comparison *is*
+/// chronological comparison. Ties break on the manual `sort_order` and the
+/// sort is stable, so projects due the same day keep their manual order.
+///
+/// This filters and sorts data already loaded by [`repo::list_projects`] —
+/// no SQL, no stored state — which is why it is cheap on every reload and
+/// why toggling `R` off simply stops applying it: the manual order is still
+/// in the database and reappears unchanged.
+fn reminder_view_projects(projects: &mut Vec<Project>) {
+    projects.retain(|p| p.soonest_reminder.is_some());
+    projects.sort_by(|a, b| {
+        let ka = a.soonest_reminder.as_deref().unwrap_or_default();
+        let kb = b.soonest_reminder.as_deref().unwrap_or_default();
+        ka.cmp(kb).then_with(|| a.sort_order.total_cmp(&b.sort_order))
+    });
+}
+
+/// Reminder-view (`R`) projection of the global todo list.
+///
+/// Keeps only todos with a reminder on an *active* status — non-done,
+/// non-canceled, the same predicate `SOONEST_REMINDER_COL` uses, so a project
+/// row and its todos agree on what "has a reminder" means. Todos are sorted
+/// within their group by reminder date; groups are then sorted by their
+/// soonest reminder. Groups are not flattened — the headers still read as
+/// project bands — but the bands are ordered so the flat cursor sequence
+/// (`tl_cursor` skips headers) runs soonest-first. Equal-date groups keep
+/// their manual project order (stable sort).
+///
+/// Like [`reminder_view_projects`], this is a view over data already loaded
+/// by [`repo::list_todos_global`]: no SQL, no stored state, and the manual
+/// order reappears when `R` is toggled off.
+fn reminder_view_groups(groups: &mut Vec<TodoGroup>) {
+    for group in groups.iter_mut() {
+        group.todos.retain(|t| t.reminder.is_some() && t.status.is_active());
+        group.todos.sort_by(|a, b| {
+            a.reminder.cmp(&b.reminder)
+                .then_with(|| a.sort_order.total_cmp(&b.sort_order))
+        });
+    }
+    groups.retain(|g| !g.todos.is_empty());
+    // After the within-group sort, each group's first todo carries the
+    // group's soonest reminder.
+    groups.sort_by(|a, b| {
+        let ka = a.todos.first().and_then(|t| t.reminder.as_deref()).unwrap_or_default();
+        let kb = b.todos.first().and_then(|t| t.reminder.as_deref()).unwrap_or_default();
+        ka.cmp(kb)
+    });
+}
 
 /// Parse the $EDITOR template for update entries.
 ///
@@ -2933,5 +3029,203 @@ mod tests {
             matches!(app.overlay, Some(Overlay::KeyHelp { .. })),
             "? must open the key help overlay, got {:?}", app.overlay
         );
+    }
+
+    // ── Reminder view (`R`) ────────────────────────────────────────────────
+    //
+    // The R view is a filter+sort over data already loaded by the reload
+    // helpers: only rows with an *active* reminder, soonest date first.
+    // Toggling it off must restore the manual order exactly, because the
+    // manual order never left the database.
+
+    #[test]
+    fn reminder_view_filters_the_project_list_and_sorts_soonest_first() {
+        let mut app = mk_app();
+        let late  = repo::create_project(&app.conn, "Late").unwrap();
+        let early = repo::create_project(&app.conn, "Early").unwrap();
+        repo::create_project(&app.conn, "NoReminders").unwrap();
+        let lt = repo::create_todo(&app.conn, Some(&late.id), "lt").unwrap();
+        let et = repo::create_todo(&app.conn, Some(&early.id), "et").unwrap();
+        repo::set_todo_reminder(&app.conn, &lt.id, Some("2026-06-01")).unwrap();
+        repo::set_todo_reminder(&app.conn, &et.id, Some("2026-01-01")).unwrap();
+
+        app.handle_key(key(KeyCode::Char('R'))).unwrap();
+
+        let names: Vec<&str> = app.pl_projects.iter().map(|p| p.title.as_str()).collect();
+        assert_eq!(names, ["Early", "Late"],
+            "R must drop the project without reminders and sort soonest first");
+        assert!(app.pl_reminder_view, "R must toggle the view on");
+
+        app.handle_key(key(KeyCode::Char('R'))).unwrap();
+
+        let names: Vec<&str> = app.pl_projects.iter().map(|p| p.title.as_str()).collect();
+        assert_eq!(names, ["Late", "Early", "NoReminders"],
+            "toggling R off must restore the manual order");
+        assert!(!app.pl_reminder_view, "R must toggle the view off");
+    }
+
+    #[test]
+    fn reminder_view_sorts_projects_with_equal_dates_by_manual_order() {
+        let mut app = mk_app();
+        // Created in this order, so both carry the same soonest reminder.
+        let first  = repo::create_project(&app.conn, "First").unwrap();
+        let second = repo::create_project(&app.conn, "Second").unwrap();
+        let t1 = repo::create_todo(&app.conn, Some(&first.id), "t1").unwrap();
+        let t2 = repo::create_todo(&app.conn, Some(&second.id), "t2").unwrap();
+        repo::set_todo_reminder(&app.conn, &t1.id, Some("2026-03-01")).unwrap();
+        repo::set_todo_reminder(&app.conn, &t2.id, Some("2026-03-01")).unwrap();
+
+        app.handle_key(key(KeyCode::Char('R'))).unwrap();
+
+        let names: Vec<&str> = app.pl_projects.iter().map(|p| p.title.as_str()).collect();
+        assert_eq!(names, ["First", "Second"],
+            "equal dates must keep the manual order (stable sort + sort_order tie-break)");
+    }
+
+    #[test]
+    fn turning_the_reminder_view_on_clamps_the_cursor() {
+        let mut app = mk_app();
+        let with    = repo::create_project(&app.conn, "WithReminder").unwrap();
+        let without = repo::create_project(&app.conn, "Without").unwrap();
+        let t = repo::create_todo(&app.conn, Some(&with.id), "t").unwrap();
+        repo::set_todo_reminder(&app.conn, &t.id, Some("2026-01-01")).unwrap();
+        app.reload_project_list().unwrap();
+        app.pl_cursor = 1; // on "Without", which the R view will drop
+
+        app.handle_key(key(KeyCode::Char('R'))).unwrap();
+
+        assert_eq!(app.pl_projects.len(), 1);
+        assert_eq!(app.pl_cursor, 0, "the cursor must clamp into the filtered list");
+        let _ = without.id; // its absence from the view is the point
+    }
+
+    #[test]
+    fn a_project_created_without_a_reminder_is_not_listed_while_the_reminder_view_is_on() {
+        // Accepted behaviour: like a search that does not match, the new
+        // project is invisible until R is toggled off. Startling, but
+        // logical — and it reappears the moment the view is toggled off.
+        let mut app = mk_app();
+        repo::create_project(&app.conn, "Holder").unwrap(); // keeps the view non-empty
+        app.handle_key(key(KeyCode::Char('R'))).unwrap();
+
+        create_project_via_pl(&mut app, "Fresh");
+
+        assert!(
+            repo::list_projects(&app.conn, false, None, None).unwrap()
+                .iter().any(|p| p.title == "Fresh"),
+            "the project itself must have been created"
+        );
+        assert!(
+            !app.pl_projects.iter().any(|p| p.title == "Fresh"),
+            "the R view hides projects without reminders — the view is the list"
+        );
+    }
+
+    #[test]
+    fn j_and_k_are_no_ops_while_the_project_reminder_view_is_on() {
+        let mut app = mk_app();
+        let early = repo::create_project(&app.conn, "Early").unwrap();
+        let late  = repo::create_project(&app.conn, "Late").unwrap();
+        let te = repo::create_todo(&app.conn, Some(&early.id), "te").unwrap();
+        let tl = repo::create_todo(&app.conn, Some(&late.id), "tl").unwrap();
+        repo::set_todo_reminder(&app.conn, &te.id, Some("2026-01-01")).unwrap();
+        repo::set_todo_reminder(&app.conn, &tl.id, Some("2026-06-01")).unwrap();
+
+        app.handle_key(key(KeyCode::Char('R'))).unwrap();
+        app.handle_key(key(KeyCode::Char('J'))).unwrap();
+        app.handle_key(key(KeyCode::Char('K'))).unwrap();
+        app.handle_key(key(KeyCode::Char('R'))).unwrap();
+
+        let names: Vec<&str> = app.pl_projects.iter().map(|p| p.title.as_str()).collect();
+        assert_eq!(names, ["Early", "Late"],
+            "no swap may have been applied: the R view sorts by reminder, not by J/K");
+        let _ = (te, tl);
+    }
+
+    #[test]
+    fn reminder_view_groups_the_todo_list_soonest_first_within_groups() {
+        let mut app = mk_app();
+        let a = repo::create_project(&app.conn, "A").unwrap();
+        let b = repo::create_project(&app.conn, "B").unwrap();
+        let a_late  = repo::create_todo(&app.conn, Some(&a.id), "a-late").unwrap();
+        let a_early = repo::create_todo(&app.conn, Some(&a.id), "a-early").unwrap();
+        let a_none  = repo::create_todo(&app.conn, Some(&a.id), "a-none").unwrap();
+        let a_done  = repo::create_todo(&app.conn, Some(&a.id), "a-done").unwrap();
+        let b_first = repo::create_todo(&app.conn, Some(&b.id), "b-first").unwrap();
+        repo::set_todo_reminder(&app.conn, &a_late.id,  Some("2026-05-01")).unwrap();
+        repo::set_todo_reminder(&app.conn, &a_early.id, Some("2026-02-01")).unwrap();
+        repo::set_todo_reminder(&app.conn, &a_done.id,  Some("2026-01-01")).unwrap(); // done: excluded
+        repo::set_todo_reminder(&app.conn, &b_first.id, Some("2026-01-15")).unwrap();
+        // Two cycles: New → In Progress → Done.
+        repo::cycle_todo_status(&app.conn, &a_done.id).unwrap();
+        repo::cycle_todo_status(&app.conn, &a_done.id).unwrap();
+
+        app.go_to_todo_list().unwrap();
+        app.handle_key(key(KeyCode::Char('R'))).unwrap();
+
+        let layout: Vec<(&str, Vec<&str>)> = app.tl_groups.iter().map(|g| (
+            g.project_title.as_str(),
+            g.todos.iter().map(|t| t.title.as_str()).collect(),
+        )).collect();
+        // B's group is soonest (01-15), so it leads even though A was created
+        // first; within A the todos sort by reminder; the reminder-less and
+        // done todos are gone.
+        assert_eq!(layout, vec![
+            ("B", vec!["b-first"]),
+            ("A", vec!["a-early", "a-late"]),
+        ]);
+        let _ = a_none;
+    }
+
+    #[test]
+    fn toggling_the_todo_reminder_view_off_restores_the_manual_order() {
+        let mut app = mk_app();
+        let a = repo::create_project(&app.conn, "A").unwrap();
+        let b = repo::create_project(&app.conn, "B").unwrap();
+        let a1 = repo::create_todo(&app.conn, Some(&a.id), "a1").unwrap();
+        let a2 = repo::create_todo(&app.conn, Some(&a.id), "a2").unwrap();
+        let b1 = repo::create_todo(&app.conn, Some(&b.id), "b1").unwrap();
+        repo::set_todo_reminder(&app.conn, &a1.id, Some("2026-05-01")).unwrap();
+        repo::set_todo_reminder(&app.conn, &a2.id, Some("2026-02-01")).unwrap();
+        repo::set_todo_reminder(&app.conn, &b1.id, Some("2026-01-01")).unwrap();
+
+        app.go_to_todo_list().unwrap();
+        app.handle_key(key(KeyCode::Char('R'))).unwrap();
+        let layout: Vec<(&str, Vec<&str>)> = app.tl_groups.iter().map(|g| (
+            g.project_title.as_str(),
+            g.todos.iter().map(|t| t.title.as_str()).collect(),
+        )).collect();
+        assert_eq!(layout, vec![("B", vec!["b1"]), ("A", vec!["a2", "a1"])]);
+
+        app.handle_key(key(KeyCode::Char('R'))).unwrap();
+        let layout: Vec<(&str, Vec<&str>)> = app.tl_groups.iter().map(|g| (
+            g.project_title.as_str(),
+            g.todos.iter().map(|t| t.title.as_str()).collect(),
+        )).collect();
+        assert_eq!(layout, vec![
+            ("A", vec!["a1", "a2"]), // creation order, sorted_order untouched
+            ("B", vec!["b1"]),
+        ]);
+        assert!(!app.tl_reminder_view);
+    }
+
+    #[test]
+    fn j_and_k_are_no_ops_while_the_todo_reminder_view_is_on() {
+        let mut app = mk_app();
+        let a = repo::create_project(&app.conn, "A").unwrap();
+        let a1 = repo::create_todo(&app.conn, Some(&a.id), "a1").unwrap();
+        let a2 = repo::create_todo(&app.conn, Some(&a.id), "a2").unwrap();
+        repo::set_todo_reminder(&app.conn, &a1.id, Some("2026-01-01")).unwrap();
+        repo::set_todo_reminder(&app.conn, &a2.id, Some("2026-06-01")).unwrap();
+
+        app.go_to_todo_list().unwrap();
+        app.handle_key(key(KeyCode::Char('R'))).unwrap();
+        app.handle_key(key(KeyCode::Char('J'))).unwrap();
+        app.handle_key(key(KeyCode::Char('K'))).unwrap();
+        app.handle_key(key(KeyCode::Char('R'))).unwrap();
+
+        let order: Vec<&str> = app.tl_groups[0].todos.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(order, ["a1", "a2"],
+            "no swap may have been applied: the R view sorts by reminder, not by J/K");
     }
 }

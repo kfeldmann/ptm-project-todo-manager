@@ -479,6 +479,7 @@ fn key_help_lines(desc_width: usize) -> Vec<Line<'static>> {
     row!("/",       "Search");
     row!("a",       "Toggle archive (confirm)");
     row!("A",       "Show / hide archived");
+    row!("R",       "Reminder view: active reminders only, soonest first (J/K disabled)");
     row!("D",       "Delete project");
     row!("T",       "Tag filter");
     row!("t",       "→ Todo List");
@@ -531,6 +532,7 @@ fn key_help_lines(desc_width: usize) -> Vec<Line<'static>> {
     row!("a",       "Toggle archive (confirm)");
     row!("A",       "Show / hide archived");
     row!("C",       "Toggle hide done / canceled");
+    row!("R",       "Reminder view: active reminders only, soonest first (J/K disabled)");
     row!("T",       "Tag filter");
     row!("D",       "Delete todo");
     row!("Enter",   "Open owning project");

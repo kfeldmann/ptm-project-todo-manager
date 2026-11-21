@@ -31,9 +31,14 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         ])
         .split(area);
 
-    // Block title shows search query or active tag filter.
+    // Block title shows search query, active tag filter, and the reminder view.
+    let reminder_label = if app.pl_reminder_view {
+        " [R reminders]".to_string()
+    } else {
+        String::new()
+    };
     let title = if app.pl_searching {
-        format!(" Projects  /{} ", app.pl_search)
+        format!(" Projects  /{}{} ", app.pl_search, reminder_label)
     } else {
         let search_label = if app.pl_search.is_empty() {
             String::new()
@@ -45,10 +50,10 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         } else {
             String::new()
         };
-        if search_label.is_empty() && tag_label.is_empty() {
+        if search_label.is_empty() && tag_label.is_empty() && reminder_label.is_empty() {
             " Projects ".to_string()
         } else {
-            format!(" Projects{}{} ", search_label, tag_label)
+            format!(" Projects{}{}{} ", search_label, tag_label, reminder_label)
         }
     };
 
@@ -162,13 +167,30 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         ])]);
     }
 
+    // Reminder-view footer. Renders whenever the view is on — when the
+    // filtered list is empty this is the only feedback the pane gives, and
+    // otherwise it echoes the count and the way out.
+    if app.pl_reminder_view {
+        let n = app.pl_projects.len();
+        let msg = if n == 0 {
+            "  [no active reminders — R to show all]".to_string()
+        } else {
+            let noun = if n == 1 { "reminder" } else { "reminders" };
+            format!("  [{} active {} — R to show all]", n, noun)
+        };
+        items.push(vec![Line::from(vec![
+            Span::styled(msg, Style::default().fg(Color::DarkGray)),
+        ])]);
+    }
+
     // Pagination: slice the items to the window that fits, reserving a row
     // for the footer so it is never pushed off the bottom, and leaving no
     // space under a dropped multi-row item.  Leftover rows are used to peek
     // at the next item's first line.
     let area_height = inner.height as usize;
     let item_heights: Vec<usize> = items.iter().map(|lines| lines.len()).collect();
-    let footer_count = if app.pl_show_archived || app.pl_archived_count == 0 { 0 } else { 1 };
+    let footer_count = if app.pl_show_archived || app.pl_archived_count == 0 { 0 } else { 1 }
+        + if app.pl_reminder_view { 1 } else { 0 };
     let core_count = items.len() - footer_count;
     // The footer is not selectable: anchor the window on the core selection.
     let selected_rel = selection.map(|s| s.min(core_count.saturating_sub(1)));
@@ -226,4 +248,70 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
             .wrap(Wrap { trim: false }),
         chunks[1],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::app::App;
+    use crate::data::repo;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn mk_app() -> App {
+        let conn = crate::data::db::open_in_memory().expect("in-memory db");
+        App::with_conn(conn, None).expect("app")
+    }
+
+    /// Render one frame and return the screen as one string per row.
+    fn draw(app: &mut App, w: u16, h: u16) -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(w, h)).expect("test terminal");
+        term.draw(|frame| crate::ui::render(frame, app)).expect("draw");
+        let buffer = term.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// The `R` view announces itself in the title bar and the footer: the
+    /// title carries the `[R reminders]` indicator, and the footer echoes the
+    /// count plus the way out.
+    #[test]
+    fn the_reminder_view_announces_itself_in_the_title_and_footer() {
+        let mut app = mk_app();
+        let a = repo::create_project(&app.conn, "A").unwrap();
+        let t = repo::create_todo(&app.conn, Some(&a.id), "t").unwrap();
+        repo::set_todo_reminder(&app.conn, &t.id, Some("2026-01-01")).unwrap();
+        app.reload_project_list().unwrap();
+
+        let plain = draw(&mut app, 60, 12).join("\n");
+        assert!(!plain.contains("[R reminders]"), "no indicator while the view is off:\n{plain}");
+        assert!(!plain.contains("R to show all"), "no reminder footer while the view is off:\n{plain}");
+
+        app.pl_reminder_view = true;
+        app.reload_project_list().unwrap();
+        let viewed = draw(&mut app, 60, 12).join("\n");
+        assert!(viewed.contains("[R reminders]"), "the title must show the indicator:\n{viewed}");
+        assert!(
+            viewed.contains("[1 active reminder — R to show all]"),
+            "the footer must echo the count:\n{viewed}"
+        );
+    }
+
+    /// With the view on and nothing matching, the pane is otherwise blank —
+    /// the footer is the only explanation the user gets.
+    #[test]
+    fn an_empty_reminder_view_explains_itself() {
+        let mut app = mk_app();
+        repo::create_project(&app.conn, "NoReminders").unwrap();
+        app.pl_reminder_view = true;
+        app.reload_project_list().unwrap();
+        let viewed = draw(&mut app, 60, 12).join("\n");
+        assert!(
+            viewed.contains("[no active reminders — R to show all]"),
+            "an empty R view must say why:\n{viewed}"
+        );
+    }
 }

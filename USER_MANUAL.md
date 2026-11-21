@@ -145,6 +145,8 @@ This is the default screen when you start ptm.
 
 The cursor follows the project as it moves.
 
+While the **reminder view** (`R`, below) is active, `J`/`K` are disabled — the list is sorted by reminder date, so reordering by hand would have no visible effect.
+
 ### Creating a project
 
 Press `n`. A text input appears at the bottom of the list. Type the project title and press `Enter` to save, or `ESC` to cancel. The new project is appended at the end of the list and the cursor moves to it.
@@ -170,6 +172,16 @@ While searching, the title bar shows `/your-query`.
 Press `T` (Shift+t) to open the **Tag Picker** in filter mode. Select a tag and press `Enter` to show only projects carrying that tag. The active filter is shown in the title bar as `[tagname]`.
 
 Selecting the already-active tag a second time clears the filter.
+
+### Reminder view
+
+Press `R` (Shift+r) to show only projects with an active reminder date — the earliest reminder across their non-done, non-canceled todos — sorted with the soonest date at the top.
+
+The title bar shows `[R reminders]` while the view is active, and a footer line echoes how many projects match (`R to show all` is the way out).
+
+- The sort is **temporary**: the manual order is never changed, and reappears unchanged when the view is toggled off.
+- `J`/`K` reordering is disabled while the view is active.
+- A project created while the view is active is not visible in it unless it acquires a reminder (or the view is toggled off) — the same "vanishing" behavior as a search that does not match.
 
 ### Archiving
 
@@ -405,6 +417,8 @@ The cursor moves through individual todo items only (skipping group headers).
 
 Todos cannot be dragged across project group boundaries — use `m` (move) for that.
 
+While the **reminder view** (`R`, below) is active, `J`/`K` are disabled.
+
 ### Status cycling
 
 Press `s` to cycle the selected todo's status (same cycle as in Project Detail).
@@ -448,8 +462,20 @@ Press `Enter` on a todo to navigate to the **Project Detail** screen for its own
 | `ESC` (in search) | Clear search and exit search mode |
 | `C` (Shift+c) | Toggle hide/show completed (`✓`) and canceled (`x`) todos |
 | `T` (Shift+t) | Open Tag Picker to filter by project tag |
+| `R` (Shift+r) | Toggle the **reminder view** — only todos with active reminders, soonest first |
 
 Selecting the already-active tag in the picker clears the filter.
+
+### Reminder view
+
+Press `R` (Shift+r) to show only todos with a reminder date on an active status (not done, not canceled), sorted with the soonest date at the top. Todos are still grouped by project; the groups themselves are ordered by their soonest reminder, so the list runs soonest-first from top to bottom.
+
+The title bar shows `[R reminders]` while the view is active, and a footer line echoes how many todos match (`R to show all` is the way out).
+
+- The sort is **temporary**: the manual order is never changed, and reappears unchanged when the view is toggled off.
+- `J`/`K` reordering is disabled while the view is active.
+- A reminder on a done todo drops out of this view even when `C` has not hidden completed todos.
+- A todo created while the view is active is not visible in it unless it acquires a reminder (or the view is toggled off).
 
 ### Deleting a todo
 
@@ -690,10 +716,11 @@ Press `C` (Shift+c) in the Global Todo List or the Todos tab to hide/show todos 
 
 A reminder is an ISO date (`YYYY-MM-DD`) associated with a todo. To set or change a reminder, press `r` on the selected todo from either Project Detail (Todos tab) or the Global Todo List.
 
-Reminder dates are surfaced in two places:
+Reminder dates are surfaced in three places:
 
 1. **Inline on the todo** — displayed as `  YYYY-MM-DD` to the right of the todo title, color-coded.
 2. **On the Project List** — the earliest active-todo reminder date bubbles up to appear next to the project title.
+3. **The reminder view** — press `R` (Shift+r) on the Project List or the Global Todo List to filter that view to items with active reminders, sorted soonest-first. The sort is view-local; toggling `R` again restores the manual order.
 
 Only reminders on active (non-done, non-canceled) todos are surfaced.
 
