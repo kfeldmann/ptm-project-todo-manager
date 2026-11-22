@@ -761,6 +761,235 @@ pub fn list_todos_global(
     Ok(groups)
 }
 
+// ─── Global search ───────────────────────────────────────────────────────────
+
+/// Normalized `mtime` expression for [`global_search`]: `updated_at`, falling
+/// back to `created_at` when it is the legacy empty string (the `updates`
+/// table's `updated_at` is `NOT NULL DEFAULT ''`).
+///
+/// This is the only definition of the expression in the data layer — keep it
+/// that way for the same reason as [`SOONEST_REMINDER_COL`]: it is inlined
+/// into every search statement rather than duplicated four times.
+///
+/// It deliberately carries **no aggregate wrapper**. `ORDER BY
+/// MAX(COALESCE(…))` would make SQLite treat the whole table as one group
+/// and collapse the result to a single row; `COALESCE` is per-row already.
+// TEMP(dead_code): wired into the Overlay::GlobalSearch in session 2 of
+// planning-docs/global-search-plan.md — remove the allow then.
+#[allow(dead_code)]
+const MTIME_COL: &str = "COALESCE(NULLIF(updated_at, ''), created_at)";
+
+/// Cap on the number of hits [`global_search`] returns, applied per source and
+/// again after the merge (see the function's doc comment for why both).
+// TEMP(dead_code): wired into the Overlay::GlobalSearch in session 2 of
+// planning-docs/global-search-plan.md — remove the allow then.
+#[allow(dead_code)]
+const GLOBAL_SEARCH_CAP: usize = 100;
+
+/// One match of [`global_search`].
+///
+/// `mtime` is the normalized sort key — `updated_at` falling back to
+/// `created_at` when the legacy value is the empty string. It is an ISO 8601
+/// timestamp, so lexicographic comparison is chronological comparison.
+///
+/// There is no "what to display" variant: projects and todos carry their whole
+/// title, updates and descriptions carry the first non-empty raw line of the
+/// body (heading kept). Update **labels** are neither searched nor displayed.
+#[derive(Debug, Clone, PartialEq)]
+// TEMP(dead_code): wired into the Overlay::GlobalSearch in session 2 of
+// planning-docs/global-search-plan.md — remove the allow then.
+#[allow(dead_code)]
+pub enum SearchHit {
+    Project {
+        project_id: String,
+        title:       String,
+        mtime:       String,
+        archived:    bool,
+    },
+    Todo {
+        /// `None` means the todo is in the Inbox.
+        project_id: Option<String>,
+        todo_id:    String,
+        title:      String,
+        mtime:      String,
+        archived:   bool,
+        status:     String,
+    },
+    Update {
+        project_id: String,
+        update_id:  String,
+        first_line: String,
+        mtime:      String,
+    },
+    Desc {
+        project_id: String,
+        first_line: String,
+        mtime:      String,
+    },
+}
+
+impl SearchHit {
+    /// The hit's normalized sort key.
+// TEMP(dead_code): wired into the Overlay::GlobalSearch in session 2 of
+// planning-docs/global-search-plan.md — remove the allow then.
+    #[allow(dead_code)]
+    pub fn mtime(&self) -> &str {
+        match self {
+            Self::Project { mtime, .. }
+            | Self::Todo    { mtime, .. }
+            | Self::Update  { mtime, .. }
+            | Self::Desc    { mtime, .. } => mtime,
+        }
+    }
+}
+
+/// Skip leading empty lines, then take up to the first `\n`.
+///
+/// Returns `None` when the body has no non-empty line. Empty bodies never
+/// match (the query is non-empty), so callers can only see `None` for a
+/// degenerate whitespace-only match; they skip such rows defensively.
+// TEMP(dead_code): wired into the Overlay::GlobalSearch in session 2 of
+// planning-docs/global-search-plan.md — remove the allow then.
+#[allow(dead_code)]
+fn first_nonempty_line(body: &str) -> Option<String> {
+    body.lines()
+        .skip_while(|line| line.trim().is_empty())
+        .next()
+        .map(str::to_string)
+}
+
+/// Full-text search across projects, todos (Inbox included), update bodies and
+/// project descriptions.
+///
+/// The match is a single whole-query substring, case-insensitive, applied in
+/// **Rust** — SQL `LIKE` does not case-fold non-ASCII input (see
+/// `list_projects`). No FTS5 in this milestone; `references_table` is
+/// deprecated and excluded.
+///
+/// Exactly **four statements** run per call, regardless of row count: one
+/// `SELECT` per source, each pre-sorted `mtime DESC` with the results capped
+/// per source in Rust. Because the top-`GLOBAL_SEARCH_CAP` overall under the
+/// one common sort key is always contained in the top-`GLOBAL_SEARCH_CAP` of
+/// *each* source under that key, merging the four lists, re-sorting by
+/// `mtime DESC` and trimming to the cap is exact. The overlay re-runs this on
+/// every keystroke, so the constant statement count is pinned by tests.
+// TEMP(dead_code): wired into the Overlay::GlobalSearch in session 2 of
+// planning-docs/global-search-plan.md — remove the allow then.
+#[allow(dead_code)]
+pub fn global_search(conn: &Connection, query: &str) -> Result<Vec<SearchHit>> {
+    let mut hits: Vec<SearchHit> = Vec::new();
+
+    // Empty box, zero results — and no statements.
+    let needle = query.to_lowercase();
+    if needle.is_empty() {
+        return Ok(hits);
+    }
+
+    // Projects (by title). Result order is mtime DESC, so capping after the
+    // Rust filter keeps the newest matches.
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, title, archived, {MTIME_COL} FROM projects
+         ORDER BY {MTIME_COL} DESC"
+    ))?;
+    let mut matched: Vec<SearchHit> = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? != 0, row.get::<_, String>(3)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|(_, title, _, _)| title.to_lowercase().contains(&needle))
+        .map(|(id, title, archived, mtime)| SearchHit::Project {
+            project_id: id, title, mtime, archived,
+        })
+        .collect();
+    matched.truncate(GLOBAL_SEARCH_CAP);
+    hits.extend(matched);
+
+    // Todos (by title, Inbox included via `project_id IS NULL`).
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, project_id, title, status, archived, {MTIME_COL} FROM todos
+         ORDER BY {MTIME_COL} DESC"
+    ))?;
+    let mut matched: Vec<SearchHit> = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)? != 0,
+                row.get::<_, String>(5)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|(_, _, title, _, _, _)| title.to_lowercase().contains(&needle))
+        .map(|(id, project_id, title, status, archived, mtime)| SearchHit::Todo {
+            todo_id: id, project_id, title, mtime, archived, status,
+        })
+        .collect();
+    matched.truncate(GLOBAL_SEARCH_CAP);
+    hits.extend(matched);
+
+    // Updates — by body only; the label is neither searched nor displayed.
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, project_id, body, {MTIME_COL} FROM updates
+         ORDER BY {MTIME_COL} DESC"
+    ))?;
+    let mut matched: Vec<SearchHit> = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?, row.get::<_, String>(3)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|(_, _, body, _)| body.to_lowercase().contains(&needle))
+        .map(|(id, project_id, body, mtime)| {
+            let first_line = first_nonempty_line(&body);
+            (id, project_id, body, mtime, first_line)
+        })
+        .filter_map(|(id, project_id, _, mtime, first_line)| {
+            first_line.map(|first_line| SearchHit::Update {
+                update_id: id, project_id, first_line, mtime,
+            })
+        })
+        .collect();
+    matched.truncate(GLOBAL_SEARCH_CAP);
+    hits.extend(matched);
+
+    // Descriptions — the project `description` column, body as for updates.
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, description, {MTIME_COL} FROM projects
+         ORDER BY {MTIME_COL} DESC"
+    ))?;
+    let mut matched: Vec<SearchHit> = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|(_, body, _)| body.to_lowercase().contains(&needle))
+        .map(|(id, body, mtime)| {
+            let first_line = first_nonempty_line(&body);
+            (id, body, mtime, first_line)
+        })
+        .filter_map(|(id, _, mtime, first_line)| {
+            first_line.map(|first_line| SearchHit::Desc {
+                project_id: id, first_line, mtime,
+            })
+        })
+        .collect();
+    matched.truncate(GLOBAL_SEARCH_CAP);
+    hits.extend(matched);
+
+    // Merge: four mtime-DESC lists become one mtime-DESC list. A stable sort
+    // keeps the pre-sorted order within ties; the trim to the cap is exact
+    // because each source list was already capped (see the doc comment).
+    hits.sort_by(|a, b| b.mtime().cmp(a.mtime()));
+    hits.truncate(GLOBAL_SEARCH_CAP);
+    Ok(hits)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1779,5 +2008,214 @@ mod tests {
         let titles: Vec<&str> = groups.iter().map(|g| g.project_title.as_str()).collect();
         assert!(!titles.contains(&"Empty Project"));
         assert!(titles.contains(&"With Tasks"));
+    }
+
+    // ── Global search ─────────────────────────────────────────────────────────
+
+    /// Force a controlled `updated_at` on a row so ordering tests are exact
+    /// (repo setters stamp `now_str()`, which is second-precision and often
+    /// identical for rows created in the same test).
+    fn set_mtime(conn: &Connection, table: &str, id: &str, mtime: &str) {
+        assert!(matches!(table, "projects" | "todos" | "updates"));
+        conn.execute(
+            &format!("UPDATE {table} SET updated_at = ?1 WHERE id = ?2"),
+            params![mtime, id],
+        ).unwrap();
+    }
+
+    #[test]
+    fn global_search_matches_every_source() {
+        let conn = mk_conn();
+        let p     = create_project(&conn, "Project refactor").unwrap();
+        create_todo(&conn, Some(&p.id), "Todo about refactor").unwrap();
+        create_todo(&conn, None, "Inbox refactor").unwrap();
+        create_update(&conn, &p.id, "label", "body mentioning refactor").unwrap();
+        update_project_description(&conn, &p.id, "description with refactor").unwrap();
+
+        let hits = global_search(&conn, "refactor").unwrap();
+        assert_eq!(hits.len(), 5, "one hit per source, todos counted twice");
+
+        let mut saw_project = false;
+        let mut saw_projected_todo = false;
+        let mut saw_inbox_todo = false;
+        let mut saw_update = false;
+        let mut saw_desc = false;
+        for hit in &hits {
+            match hit {
+                SearchHit::Project { project_id, title, archived, .. } => {
+                    saw_project = true;
+                    assert_eq!(title, "Project refactor");
+                    assert!(!archived);
+                    assert_eq!(project_id, &p.id);
+                }
+                SearchHit::Todo { project_id, todo_id, title, status, .. } => {
+                    assert_eq!(status, "new");
+                    assert_eq!(title, if project_id.is_some() {
+                        "Todo about refactor"
+                    } else {
+                        "Inbox refactor"
+                    });
+                    if project_id.is_some() {
+                        saw_projected_todo = true;
+                        assert_eq!(project_id.as_deref(), Some(p.id.as_str()));
+                    } else {
+                        saw_inbox_todo = true;
+                        assert_eq!(todo_id.len(), 36); // a real todo id, not a group placeholder
+                    }
+                }
+                SearchHit::Update { project_id, first_line, .. } => {
+                    saw_update = true;
+                    assert_eq!(project_id, &p.id);
+                    assert_eq!(first_line, "body mentioning refactor");
+                }
+                SearchHit::Desc { project_id, first_line, .. } => {
+                    saw_desc = true;
+                    assert_eq!(project_id, &p.id);
+                    assert_eq!(first_line, "description with refactor");
+                }
+            }
+        }
+        assert!(saw_project && saw_projected_todo && saw_inbox_todo && saw_update && saw_desc);
+    }
+
+    #[test]
+    fn global_search_update_label_is_not_searched_nor_displayed() {
+        let conn = mk_conn();
+        let p = create_project(&conn, "Plain").unwrap();
+
+        // The label alone must not make the update a hit.
+        create_update(&conn, &p.id, "refactor label", "nothing to see here").unwrap();
+        assert!(global_search(&conn, "refactor").unwrap().is_empty());
+
+        // A body hit displays the body's first line, never the label.
+        create_update(&conn, &p.id, "2024-01-01", "refactor the widget\nmore").unwrap();
+        let hits = global_search(&conn, "refactor").unwrap();
+        assert_eq!(hits.len(), 1);
+        match &hits[0] {
+            SearchHit::Update { first_line, .. } =>
+                assert_eq!(first_line, "refactor the widget"),
+            other => panic!("expected an Update hit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn global_search_first_line_skips_blank_leading_lines_and_keeps_headings() {
+        let conn = mk_conn();
+        let p = create_project(&conn, "Notes").unwrap();
+        create_update(&conn, &p.id, "d", "\n\n\n# Heading about refactor\nsecond line").unwrap();
+
+        let hits = global_search(&conn, "refactor").unwrap();
+        assert_eq!(hits.len(), 1);
+        match &hits[0] {
+            SearchHit::Update { first_line, .. } =>
+                assert_eq!(first_line, "# Heading about refactor"),
+            other => panic!("expected an Update hit, got {other:?}"),
+        }
+
+        // Extraction edge cases, tested on the helper directly: empty and
+        // whitespace-only bodies have no displayable line and are skipped.
+        assert_eq!(first_nonempty_line(""), None);
+        assert_eq!(first_nonempty_line("\n\n  \n"), None);
+        assert_eq!(first_nonempty_line("\n  x"), Some("  x".to_string()));
+    }
+
+    #[test]
+    fn global_search_orders_by_normalized_mtime_desc() {
+        let conn = mk_conn();
+        let p1 = create_project(&conn, "Zebra project one").unwrap();
+        let p2 = create_project(&conn, "Zebra project two").unwrap();
+        let t  = create_todo(&conn, None, "Zebra todo").unwrap();
+        set_mtime(&conn, "projects", &p1.id, "2024-01-01T00:00:00Z");
+        set_mtime(&conn, "projects", &p2.id, "2024-03-01T00:00:00Z");
+        set_mtime(&conn, "todos",    &t.id,  "2024-02-01T00:00:00Z");
+
+        // Legacy row: `updates.updated_at` is `NOT NULL DEFAULT ''`; it must
+        // fall back to `created_at` rather than sort after everything.
+        conn.execute(
+            "INSERT INTO updates (id, project_id, label, body, sort_order, created_at, updated_at)
+             VALUES ('legacy', ?1, '', 'zebra legacy row', 0.0, '2024-05-01T00:00:00Z', '')",
+            params![&p1.id],
+        ).unwrap();
+
+        let hits = global_search(&conn, "zebra").unwrap();
+        let keys: Vec<&str> = hits.iter().map(|h| h.mtime()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "2024-05-01T00:00:00Z", // legacy update, via created_at fallback
+                "2024-03-01T00:00:00Z",
+                "2024-02-01T00:00:00Z",
+                "2024-01-01T00:00:00Z",
+            ],
+            "newest first across sources, by normalized mtime",
+        );
+        assert!(matches!(hits[0], SearchHit::Update { .. }));
+    }
+
+    #[test]
+    fn global_search_cap_100_overall() {
+        let conn = mk_conn();
+        for i in 0..60 {
+            create_project(&conn, &format!("cap test {i}")).unwrap();
+        }
+        for i in 0..60 {
+            create_todo(&conn, None, &format!("cap test {i}")).unwrap();
+        }
+
+        let hits = global_search(&conn, "cap test").unwrap();
+        assert_eq!(hits.len(), 100, "capped across sources, not per source");
+        assert!(hits.windows(2).all(|w| w[0].mtime() >= w[1].mtime()),
+                "result order is mtime DESC");
+    }
+
+    #[test]
+    fn global_search_statement_count_is_independent_of_row_count() {
+        let conn = mk_conn();
+        let p = create_project(&conn, "one project").unwrap();
+        create_todo(&conn, Some(&p.id), "one todo").unwrap();
+
+        let (_, with_one) =
+            count_statements(&conn, || global_search(&conn, "one").unwrap());
+
+        for i in 0..30 {
+            let p = create_project(&conn, &format!("p{i}")).unwrap();
+            create_todo(&conn, Some(&p.id), "todo").unwrap();
+            create_update(&conn, &p.id, "label", "body").unwrap();
+            update_project_description(&conn, &p.id, "description").unwrap();
+        }
+
+        let (hits, with_many) =
+            count_statements(&conn, || global_search(&conn, "one").unwrap());
+
+        assert_eq!(
+            with_one, with_many,
+            "global_search must not issue per-row statements: \
+             {with_one} statements for 2 matching rows vs {with_many} for many",
+        );
+        assert_eq!(
+            with_many, 4,
+            "exactly four statements: projects, todos, updates, descriptions",
+        );
+        // And the search still works over the grown database.
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn global_search_case_folds_non_ascii() {
+        let conn = mk_conn();
+        create_project(&conn, "Überarbeiten").unwrap();
+
+        assert_eq!(global_search(&conn, "über").unwrap().len(), 1);
+        assert_eq!(global_search(&conn, "ÜBER").unwrap().len(), 1);
+        assert!(global_search(&conn, "uber").unwrap().is_empty(),
+                "no ASCII folding — only case folding is agreed");
+    }
+
+    #[test]
+    fn global_search_empty_query_yields_nothing() {
+        let conn = mk_conn();
+        create_project(&conn, "Something").unwrap();
+        assert!(global_search(&conn, "").unwrap().is_empty());
+        assert!(global_search(&conn, " ").unwrap().is_empty());
     }
 }
