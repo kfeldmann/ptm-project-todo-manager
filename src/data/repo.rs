@@ -774,16 +774,10 @@ pub fn list_todos_global(
 /// It deliberately carries **no aggregate wrapper**. `ORDER BY
 /// MAX(COALESCE(…))` would make SQLite treat the whole table as one group
 /// and collapse the result to a single row; `COALESCE` is per-row already.
-// TEMP(dead_code): wired into the Overlay::GlobalSearch in session 2 of
-// planning-docs/global-search-plan.md — remove the allow then.
-#[allow(dead_code)]
 const MTIME_COL: &str = "COALESCE(NULLIF(updated_at, ''), created_at)";
 
 /// Cap on the number of hits [`global_search`] returns, applied per source and
 /// again after the merge (see the function's doc comment for why both).
-// TEMP(dead_code): wired into the Overlay::GlobalSearch in session 2 of
-// planning-docs/global-search-plan.md — remove the allow then.
-#[allow(dead_code)]
 const GLOBAL_SEARCH_CAP: usize = 100;
 
 /// One match of [`global_search`].
@@ -796,9 +790,6 @@ const GLOBAL_SEARCH_CAP: usize = 100;
 /// title, updates and descriptions carry the first non-empty raw line of the
 /// body (heading kept). Update **labels** are neither searched nor displayed.
 #[derive(Debug, Clone, PartialEq)]
-// TEMP(dead_code): wired into the Overlay::GlobalSearch in session 2 of
-// planning-docs/global-search-plan.md — remove the allow then.
-#[allow(dead_code)]
 pub enum SearchHit {
     Project {
         project_id: String,
@@ -830,9 +821,6 @@ pub enum SearchHit {
 
 impl SearchHit {
     /// The hit's normalized sort key.
-// TEMP(dead_code): wired into the Overlay::GlobalSearch in session 2 of
-// planning-docs/global-search-plan.md — remove the allow then.
-    #[allow(dead_code)]
     pub fn mtime(&self) -> &str {
         match self {
             Self::Project { mtime, .. }
@@ -848,9 +836,6 @@ impl SearchHit {
 /// Returns `None` when the body has no non-empty line. Empty bodies never
 /// match (the query is non-empty), so callers can only see `None` for a
 /// degenerate whitespace-only match; they skip such rows defensively.
-// TEMP(dead_code): wired into the Overlay::GlobalSearch in session 2 of
-// planning-docs/global-search-plan.md — remove the allow then.
-#[allow(dead_code)]
 fn first_nonempty_line(body: &str) -> Option<String> {
     body.lines()
         .skip_while(|line| line.trim().is_empty())
@@ -873,9 +858,6 @@ fn first_nonempty_line(body: &str) -> Option<String> {
 /// *each* source under that key, merging the four lists, re-sorting by
 /// `mtime DESC` and trimming to the cap is exact. The overlay re-runs this on
 /// every keystroke, so the constant statement count is pinned by tests.
-// TEMP(dead_code): wired into the Overlay::GlobalSearch in session 2 of
-// planning-docs/global-search-plan.md — remove the allow then.
-#[allow(dead_code)]
 pub fn global_search(conn: &Connection, query: &str) -> Result<Vec<SearchHit>> {
     let mut hits: Vec<SearchHit> = Vec::new();
 

@@ -1,6 +1,6 @@
 # Global Full-Text Search — Plan
 
-Status: approved design, not yet implemented
+Status: approved design, session 1 and 2 implemented, session 3 is next
 Milestone owner: ptm
 Feature hotkey: `F` (Shift+f), available on all three screens
 
@@ -176,7 +176,7 @@ Per `docs/adding-features.md`:
 
 ## 7. Work breakdown — three sessions
 
-### Session 1 — data layer (≈ half day)
+### ✔ Session 1 — data layer (≈ half day)
 
 - `SearchHit` enum + `repo::global_search` (four statements, Rust matching,
   normalized `mtime`, per-source LIMIT).
@@ -187,7 +187,7 @@ Per `docs/adding-features.md`:
   (e.g. `Ä` matches `ä`).
 - Acceptance: `cargo test` green; query-count pinned at 4 statements.
 
-### Session 2 — overlay and deep-linking (≈ half day)
+### ✔ Session 2 — overlay and deep-linking (≈ half day)
 
 - `Overlay::GlobalSearch`, `handle_global_search`, renderer, `F` wiring in
   the three places, hint bar, `key_help_lines()`.
@@ -198,7 +198,7 @@ Per `docs/adding-features.md`:
 - Acceptance: manual smoke test of every row of the deep-link and gray-out
   tables; fresh state on every `F`; `Esc` from every state.
 
-### Session 3 — docs and harness (≈ quarter day)
+### ☐ Session 3 — docs and harness (≈ quarter day)
 
 - `USER_MANUAL.md` section; note the single-substring semantics.
 - `docs/data-layer.md`: one paragraph on `global_search` (four statements,

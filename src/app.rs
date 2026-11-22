@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use std::time::SystemTime;
 
-use crate::data::{db, models::*, repo::{self, TodoGroup}};
+use crate::data::{db, models::*, repo::{self, SearchHit, TodoGroup}};
 use crate::input::{InputState, InputKeyResult, handle_input_key};
 
 // ─── Navigation ──────────────────────────────────────────────────────────────
@@ -103,6 +103,17 @@ pub enum Overlay {
         title: String,
         body: String,
     },
+    /// Global full-text search (opened with `F`).
+    ///
+    /// Fresh state is created on every `F` press — nothing is carried over
+    /// from a previous session.  `cursor` is an index into `hits`, or
+    /// [`GLOBAL_SEARCH_QUERY_FOCUS`] when the focus rests on the query box
+    /// itself (`Enter` there moves the focus to the first result).
+    GlobalSearch {
+        query: String,
+        hits: Vec<crate::data::repo::SearchHit>,
+        cursor: usize,
+    },
     /// Spell-check session for a single text field.
     SpellCheck {
         /// Text split into (text, is_word) segments; word segments are
@@ -121,6 +132,13 @@ pub enum Overlay {
         done: bool,
     },
 }
+
+// ─── Global search ───────────────────────────────────────────────────────────
+
+/// Cursor value of [`Overlay::GlobalSearch`] meaning "the focus rests on the
+/// query box, not on any result".  `Enter` there moves the focus to the first
+/// result; `j`/`k`/↑/↓ move into and through the result list.
+pub const GLOBAL_SEARCH_QUERY_FOCUS: usize = usize::MAX;
 
 #[derive(Debug, Clone)]
 pub enum DeleteTarget {
@@ -433,6 +451,18 @@ impl App {
             return Ok(());
         }
 
+        // Global: F → global full-text search overlay.  Fresh state on every
+        // press — nothing is carried over from a previous session (see
+        // planning-docs/global-search-plan.md §1).
+        if key.code == KeyCode::Char('F') && !self.is_inline_editing() {
+            self.overlay = Some(Overlay::GlobalSearch {
+                query: String::new(),
+                hits: Vec::new(),
+                cursor: GLOBAL_SEARCH_QUERY_FOCUS,
+            });
+            return Ok(());
+        }
+
         match self.screen {
             Screen::ProjectList      => self.handle_key_project_list(key),
             Screen::ProjectDetail    => self.handle_key_project_detail(key),
@@ -488,6 +518,9 @@ impl App {
                 if is_redispatchable(key) {
                     return self.handle_key(key);
                 }
+            }
+            Overlay::GlobalSearch { query, hits, cursor } => {
+                self.overlay = self.handle_global_search(key, query, hits, cursor)?;
             }
         }
         Ok(())
@@ -2372,6 +2405,235 @@ impl App {
         }
     }
 
+    // ─── Global Search overlay ────────────────────────────────────────────
+
+    /// Re-run [`repo::global_search`] for `query` and clamp `cursor` to what
+    /// the new result set allows.  Exactly four constant statements run per
+    /// keystroke — see `global_search`'s doc comment for why.
+    fn refresh_global_search(
+        &mut self,
+        query: &str,
+        cursor: usize,
+    ) -> Result<(Vec<SearchHit>, usize)> {
+        let hits = repo::global_search(&self.conn, query)?;
+        let cursor = if hits.is_empty() {
+            // No matches: focus falls back to the query box.
+            GLOBAL_SEARCH_QUERY_FOCUS
+        } else if cursor == GLOBAL_SEARCH_QUERY_FOCUS {
+            cursor
+        } else {
+            cursor.min(hits.len() - 1)
+        };
+        Ok((hits, cursor))
+    }
+
+    /// Handler for [`Overlay::GlobalSearch`].
+    ///
+    /// Chars append to the query and re-run the search; `j`/`k`/↑/↓ move the
+    /// cursor between the query box and the result list; `Esc` closes.
+    /// `Enter` on the query box focuses the first result (no-op when there
+    /// are none); `Enter` on a result closes the overlay and deep-links to
+    /// the item — or opens a [`Overlay::Warn`] when the destination view is
+    /// currently hiding it, with the message computed at press time from the
+    /// *live* toggles.
+    fn handle_global_search(
+        &mut self,
+        key: KeyEvent,
+        mut query: String,
+        mut hits: Vec<SearchHit>,
+        mut cursor: usize,
+    ) -> Result<Option<Overlay>> {
+        match key.code {
+            KeyCode::Esc => return Ok(None),
+            KeyCode::Char('j') | KeyCode::Down => {
+                if cursor == GLOBAL_SEARCH_QUERY_FOCUS {
+                    if !hits.is_empty() { cursor = 0; }
+                } else if !hits.is_empty() {
+                    cursor = cursor.saturating_add(1).min(hits.len() - 1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if cursor == GLOBAL_SEARCH_QUERY_FOCUS {
+                    // The query box is the top of the list; nothing above it.
+                } else if cursor == 0 {
+                    cursor = GLOBAL_SEARCH_QUERY_FOCUS;
+                } else {
+                    cursor -= 1;
+                }
+            }
+            KeyCode::Char(c) => {
+                query.push(c);
+                let (new_hits, new_cursor) = self.refresh_global_search(&query, cursor)?;
+                hits = new_hits;
+                cursor = new_cursor;
+            }
+            KeyCode::Backspace => {
+                // `String::pop` removes one *char*, so multibyte input is safe.
+                query.pop();
+                let (new_hits, new_cursor) = self.refresh_global_search(&query, cursor)?;
+                hits = new_hits;
+                cursor = new_cursor;
+            }
+            KeyCode::Enter => {
+                if cursor < hits.len() {
+                    let hit = hits[cursor].clone();
+                    if let Some((title, body)) = self.search_hit_hidden_notice(&hit) {
+                        // Grayed-out hit: close the search and warn, naming the
+                        // destination screen and the toggle that must be
+                        // flipped.  The warning is purely informational — the
+                        // Warn redispatch allow-list does not contain overlay
+                        // openers, so the user presses `F` or the toggle
+                        // themselves.
+                        return Ok(Some(Overlay::Warn { title, body }));
+                    }
+                    self.deep_link_to_search_hit(&hit)?;
+                    return Ok(None);
+                }
+                // Enter on the query box: focus the first result.  A no-op
+                // when there are no matches.
+                if cursor == GLOBAL_SEARCH_QUERY_FOCUS && !hits.is_empty() {
+                    cursor = 0;
+                }
+            }
+            _ => {}
+        }
+        Ok(Some(Overlay::GlobalSearch { query, hits, cursor }))
+    }
+
+    /// Whether the destination view of `hit` is currently hiding it.
+    ///
+    /// Evaluated live from the current toggles — **never** stored in the
+    /// `SearchHit` — because the user can flip any toggle between running the
+    /// query and pressing `Enter`.
+    ///
+    /// An archived project *is* openable in Project Detail (which has no
+    /// archived filter), but per the agreed rule it is still grayed out and
+    /// warned about: one consistent rule beats two special cases.
+    pub fn search_hit_is_hidden(&self, hit: &SearchHit) -> bool {
+        match hit {
+            SearchHit::Project { archived, .. } => *archived && !self.pl_show_archived,
+            SearchHit::Todo { project_id, archived, status, .. } => {
+                // The destination screen decides which archived toggle counts.
+                let archived_hidden = if project_id.is_some() {
+                    !self.pd_show_archived_todos // PD Todos tab destination
+                } else {
+                    !self.tl_show_archived       // Global Todo List destination
+                };
+                (*archived && archived_hidden)
+                    || (self.hide_done
+                        && (status == TodoStatus::Done.as_str()
+                            || status == TodoStatus::Canceled.as_str()))
+            }
+            // Updates and descriptions have no hiding toggles.
+            SearchHit::Update { .. } | SearchHit::Desc { .. } => false,
+        }
+    }
+
+    /// The [`Overlay::Warn`] content for a hit the destination view would
+    /// currently hide: `None` for an openable hit, otherwise a message that
+    /// names the screen and the toggle the user must flip.  Computed at
+    /// press time from the *current* toggles, never cached.
+    fn search_hit_hidden_notice(&self, hit: &SearchHit) -> Option<(String, String)> {
+        if !self.search_hit_is_hidden(hit) {
+            return None;
+        }
+        match hit {
+            SearchHit::Project { .. } => Some((
+                " Archived result ".into(),
+                "Archived projects are hidden.\n\
+                 Press A on the Project List to show them.".into(),
+            )),
+            SearchHit::Todo { project_id, archived: true, .. } => {
+                let screen = if project_id.is_some() {
+                    "Project Detail Todos tab"
+                } else {
+                    "Todo List"
+                };
+                Some((
+                    " Archived result ".into(),
+                    format!("This todo is archived.\n\
+                             Press A on the {screen} to show it."),
+                ))
+            }
+            // Not archived, but hidden by the done/canceled toggle.
+            SearchHit::Todo { .. } => Some((
+                " Hidden result ".into(),
+                "Done and canceled todos are hidden.\n\
+                 Press C to show them.".into(),
+            )),
+            // Updates and descriptions are never hidden.
+            _ => None,
+        }
+    }
+
+    /// Jump from a search hit straight to the view that owns the item, with
+    /// the cursor on it.
+    ///
+    /// ## The deep-link ordering trap
+    ///
+    /// `switch_pd_tab` **closes the update viewer**, and
+    /// `open_project_detail` resets `pd_tab` to Todos and `pd_open_update` to
+    /// `None`.  Every Project Detail destination therefore follows the same
+    /// order as the existing Todo List → Project Detail `Enter` jump:
+    /// `open_project_detail` **first**, then the tab / cursor state assigned
+    /// **directly** — never via `switch_pd_tab`, which would close a viewer
+    /// opened a moment earlier.
+    fn deep_link_to_search_hit(&mut self, hit: &SearchHit) -> Result<()> {
+        match hit {
+            SearchHit::Project { project_id, .. } => {
+                // No tab forced — opens on the Todos tab.
+                self.open_project_detail(project_id)?;
+            }
+            SearchHit::Todo { project_id, todo_id, .. } => match project_id {
+                Some(pid) => {
+                    self.open_project_detail(pid)?;
+                    if let Some(pos) = self.pd_todos.iter().position(|t| &t.id == todo_id) {
+                        self.pd_todo_cursor = pos;
+                    }
+                }
+                None => {
+                    // Inbox todo → the Global Todo List with the cursor on it.
+                    // A stale `tl_search` or the reminder view could filter
+                    // the todo out of the flat list, so both are cleared
+                    // before the reload (the archived / done toggles are not:
+                    // a hit they hide is intercepted by the Warn path).
+                    self.tl_search.clear();
+                    self.tl_searching = false;
+                    self.tl_reminder_view = false;
+                    self.go_to_todo_list()?;
+                    let mut flat = 0usize;
+                    for group in &self.tl_groups {
+                        for todo in &group.todos {
+                            if &todo.id == todo_id {
+                                self.tl_cursor = flat;
+                            }
+                            flat += 1;
+                        }
+                    }
+                }
+            },
+            SearchHit::Update { project_id, update_id, .. } => {
+                self.open_project_detail(project_id)?;
+                // Direct assignment — `switch_pd_tab` would close the viewer.
+                self.pd_tab = PdTab::Updates;
+                if let Some(pos) = self.pd_updates.iter().position(|u| &u.id == update_id) {
+                    self.pd_update_cursor = pos;
+                }
+                self.pd_update_view_scroll = 0;
+                // The viewer is opened *after* the tab assignment.
+                self.pd_open_update = Some(update_id.clone());
+            }
+            SearchHit::Desc { project_id, .. } => {
+                self.open_project_detail(project_id)?;
+                // Direct assignment; aiming `pd_desc_scroll` at the matched
+                // line is a v2 stretch goal.
+                self.pd_tab = PdTab::Description;
+                self.pd_desc_scroll = 0;
+            }
+        }
+        Ok(())
+    }
+
     // ─── Inline-edit guard ─────────────────────────────────────────────────
 
     fn is_inline_editing(&self) -> bool {
@@ -3227,5 +3489,312 @@ mod tests {
         let order: Vec<&str> = app.tl_groups[0].todos.iter().map(|t| t.title.as_str()).collect();
         assert_eq!(order, ["a1", "a2"],
             "no swap may have been applied: the R view sorts by reminder, not by J/K");
+    }
+
+    // ── Global Search overlay (`F`) ──────────────────────────────────────────
+
+    /// Press `F` and type `query`, one key event per character.
+    fn open_global_search(app: &mut App, query: &str) {
+        app.handle_key(key(KeyCode::Char('F'))).unwrap();
+        for c in query.chars() {
+            app.handle_key(key(KeyCode::Char(c))).unwrap();
+        }
+    }
+
+    /// `(hits.len(), cursor)` of the active search overlay.
+    fn gs_hits_and_cursor(app: &App) -> (usize, usize) {
+        match &app.overlay {
+            Some(Overlay::GlobalSearch { hits, cursor, .. }) => (hits.len(), *cursor),
+            other => panic!("expected the GlobalSearch overlay, got {other:?}"),
+        }
+    }
+
+    fn gs_cursor(app: &App) -> usize {
+        gs_hits_and_cursor(app).1
+    }
+
+    #[test]
+    fn f_opens_a_fresh_search_overlay_every_time() {
+        let mut app = mk_app();
+        repo::create_project(&app.conn, "zebra station").unwrap();
+
+        app.handle_key(key(KeyCode::Char('F'))).unwrap();
+        for c in "zebra".chars() {
+            app.handle_key(key(KeyCode::Char(c))).unwrap();
+        }
+        assert_eq!(gs_hits_and_cursor(&app), (1, GLOBAL_SEARCH_QUERY_FOCUS));
+
+        app.handle_key(key(KeyCode::Esc)).unwrap();
+        assert!(app.overlay.is_none());
+
+        // Nothing is carried over from the previous session.
+        app.handle_key(key(KeyCode::Char('F'))).unwrap();
+        match &app.overlay {
+            Some(Overlay::GlobalSearch { query, hits, cursor }) => {
+                assert!(query.is_empty());
+                assert!(hits.is_empty());
+                assert_eq!(*cursor, GLOBAL_SEARCH_QUERY_FOCUS);
+            }
+            other => panic!("expected a fresh GlobalSearch overlay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enter_on_the_query_box_focuses_the_first_result() {
+        let mut app = mk_app();
+        repo::create_project(&app.conn, "Zebra One").unwrap();
+        repo::create_project(&app.conn, "Zebra Two").unwrap();
+        open_global_search(&mut app, "zebra");
+        let (hits, cursor) = gs_hits_and_cursor(&app);
+        assert_eq!(hits, 2);
+        assert_eq!(cursor, GLOBAL_SEARCH_QUERY_FOCUS);
+
+        app.handle_key(key(KeyCode::Enter)).unwrap();
+        assert_eq!(gs_cursor(&app), 0, "Enter on the query box focuses the first result");
+
+        // The second Enter then deep-links to that first result.
+        app.handle_key(key(KeyCode::Enter)).unwrap();
+        assert!(app.overlay.is_none());
+        assert_eq!(app.screen, Screen::ProjectDetail);
+    }
+
+    /// Focus the first result and open it (Enter on the query box focuses the
+    /// first result; Enter on a result deep-links to the item).
+    fn open_top_result(app: &mut App) {
+        app.handle_key(key(KeyCode::Enter)).unwrap();
+        app.handle_key(key(KeyCode::Enter)).unwrap();
+    }
+
+    #[test]
+    fn j_and_k_move_between_the_query_box_and_the_results() {
+        let mut app = mk_app();
+        repo::create_project(&app.conn, "Zebra One").unwrap();
+        repo::create_project(&app.conn, "Zebra Two").unwrap();
+        open_global_search(&mut app, "zebra");
+
+
+        app.handle_key(key(KeyCode::Char('j'))).unwrap();
+        assert_eq!(gs_cursor(&app), 0);
+        app.handle_key(key(KeyCode::Char('j'))).unwrap();
+        assert_eq!(gs_cursor(&app), 1);
+        app.handle_key(key(KeyCode::Char('k'))).unwrap();
+        assert_eq!(gs_cursor(&app), 0);
+        // `k` from the first result returns to the query box.
+        app.handle_key(key(KeyCode::Char('k'))).unwrap();
+        assert_eq!(gs_cursor(&app), GLOBAL_SEARCH_QUERY_FOCUS);
+    }
+
+    #[test]
+    fn a_project_result_deep_links_to_project_detail() {
+        let mut app = mk_app();
+        let p = repo::create_project(&app.conn, "Nimbus refactoring").unwrap();
+        open_global_search(&mut app, "nimbus");
+        open_top_result(&mut app);
+        assert!(app.overlay.is_none());
+        assert_eq!(app.screen, Screen::ProjectDetail);
+        assert_eq!(app.pd_project.as_ref().unwrap().id, p.id);
+    }
+
+    #[test]
+    fn a_projected_todo_deep_links_to_the_pd_todos_tab() {
+        let mut app = mk_app();
+        let p = repo::create_project(&app.conn, "Alpha").unwrap();
+        let _t1 = repo::create_todo(&app.conn, Some(&p.id), "todo one").unwrap();
+        let t2 = repo::create_todo(&app.conn, Some(&p.id), "todo two").unwrap();
+        open_global_search(&mut app, "two");
+        open_top_result(&mut app);
+        assert!(app.overlay.is_none());
+        assert_eq!(app.screen, Screen::ProjectDetail);
+        assert_eq!(app.pd_tab, PdTab::Todos);
+        assert_eq!(app.pd_todos[app.pd_todo_cursor].id, t2.id);
+    }
+
+    #[test]
+    fn an_inbox_todo_deep_links_to_the_todo_list_with_the_cursor_on_it() {
+        let mut app = mk_app();
+        let b = repo::create_project(&app.conn, "Beta").unwrap();
+        let _b1 = repo::create_todo(&app.conn, Some(&b.id), "b1").unwrap();
+        let _b2 = repo::create_todo(&app.conn, Some(&b.id), "b2").unwrap();
+        let t = repo::create_todo(&app.conn, None, "inbox target").unwrap();
+        open_global_search(&mut app, "inbox target");
+        open_top_result(&mut app);
+        assert!(app.overlay.is_none());
+        assert_eq!(app.screen, Screen::TodoList);
+        assert_eq!(app.tl_todo_at(app.tl_cursor).unwrap().id, t.id);
+    }
+
+    #[test]
+    fn an_update_result_deep_links_to_the_pd_update_viewer() {
+        let mut app = mk_app();
+        let p = repo::create_project(&app.conn, "Kite").unwrap();
+        let u = repo::create_update(&app.conn, &p.id, "label", "a big refactor happened")
+            .unwrap();
+        open_global_search(&mut app, "refactor happened");
+        open_top_result(&mut app);
+        assert!(app.overlay.is_none());
+        assert_eq!(app.screen, Screen::ProjectDetail);
+        assert_eq!(app.pd_project.as_ref().unwrap().id, p.id);
+        // The tab is switched and the viewer is opened *on top of* it —
+        // the deep-link ordering trap (switch_pd_tab closes the viewer).
+        assert_eq!(app.pd_tab, PdTab::Updates);
+        assert_eq!(app.pd_open_update.as_deref(), Some(u.id.as_str()));
+    }
+
+    #[test]
+    fn a_description_result_deep_links_to_the_pd_description_tab() {
+        let mut app = mk_app();
+        let p = repo::create_project(&app.conn, "Delta").unwrap();
+        repo::update_project_description(&app.conn, &p.id, "Line one\nsecond line")
+            .unwrap();
+        open_global_search(&mut app, "second");
+        open_top_result(&mut app);
+        assert!(app.overlay.is_none());
+        assert_eq!(app.screen, Screen::ProjectDetail);
+        assert_eq!(app.pd_tab, PdTab::Description);
+        assert_eq!(app.pd_project.as_ref().unwrap().id, p.id);
+    }
+
+    #[test]
+    fn an_archived_project_warns_when_the_project_list_hides_it() {
+        let mut app = mk_app();
+        let p = repo::create_project(&app.conn, "Archived station").unwrap();
+        repo::toggle_archive_project(&app.conn, &p.id).unwrap();
+        open_global_search(&mut app, "archived station");
+
+        open_top_result(&mut app);
+        match &app.overlay {
+            Some(Overlay::Warn { body, .. }) => {
+                let body = body.as_str();
+                assert!(body.contains("Archived projects are hidden"), "{body:?}");
+                assert!(body.contains("Press A on the Project List"), "{body:?}");
+            }
+            other => panic!("expected a Warn overlay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_archived_todo_warns_with_the_destination_screen() {
+        // PD destination.
+        let mut app = mk_app();
+        let p = repo::create_project(&app.conn, "Gamma").unwrap();
+        let t = repo::create_todo(&app.conn, Some(&p.id), "hidden todo").unwrap();
+        repo::toggle_archive_todo(&app.conn, &t.id).unwrap();
+        open_global_search(&mut app, "hidden todo");
+        open_top_result(&mut app);
+        match &app.overlay {
+            Some(Overlay::Warn { body, .. }) =>
+                assert!(body.contains("Project Detail Todos tab"), "{body:?}"),
+            other => panic!("expected a Warn overlay, got {other:?}"),
+        }
+
+        // TL destination.
+        let mut app = mk_app();
+        let t = repo::create_todo(&app.conn, None, "hidden inbox todo").unwrap();
+        repo::toggle_archive_todo(&app.conn, &t.id).unwrap();
+        open_global_search(&mut app, "hidden inbox todo");
+        open_top_result(&mut app);
+        match &app.overlay {
+            Some(Overlay::Warn { body, .. }) =>
+                assert!(body.contains("on the Todo List"), "{body:?}"),
+            other => panic!("expected a Warn overlay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_done_todo_warns_when_hide_done_is_on() {
+        let mut app = mk_app();
+        let p = repo::create_project(&app.conn, "Gamma").unwrap();
+        let t = repo::create_todo(&app.conn, Some(&p.id), "finished todo").unwrap();
+        repo::cycle_todo_status(&app.conn, &t.id).unwrap();
+        repo::cycle_todo_status(&app.conn, &t.id).unwrap(); // → Done
+        app.hide_done = true;
+        open_global_search(&mut app, "finished todo");
+        open_top_result(&mut app);
+        match &app.overlay {
+            Some(Overlay::Warn { body, .. }) =>
+                assert!(body.contains("Done and canceled todos are hidden"), "{body:?}"),
+            other => panic!("expected a Warn overlay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn grayed_outness_is_evaluated_at_press_time_not_cached() {
+        let mut app = mk_app();
+        let p = repo::create_project(&app.conn, "Archived station").unwrap();
+        repo::toggle_archive_project(&app.conn, &p.id).unwrap();
+        open_global_search(&mut app, "archived station");
+
+        // Hidden while the toggle is off …
+        open_top_result(&mut app);
+        assert!(matches!(app.overlay, Some(Overlay::Warn { .. })));
+
+        // … and openable the moment it is flipped.  The Warn overlay must be
+        // dismissed first: `F` is deliberately not redispatched through it.
+        app.handle_key(key(KeyCode::Esc)).unwrap();
+        assert!(app.overlay.is_none());
+        app.pl_show_archived = true;
+        open_global_search(&mut app, "archived station");
+        open_top_result(&mut app);
+        assert!(app.overlay.is_none());
+        assert_eq!(app.screen, Screen::ProjectDetail);
+    }
+
+
+    #[test]
+    fn a_grayed_hit_renders_dim() {
+        use ratatui::style::Color;
+        let mut app = mk_app();
+        let p = repo::create_project(&app.conn, "zebra archived").unwrap();
+        repo::toggle_archive_project(&app.conn, &p.id).unwrap();
+        repo::create_project(&app.conn, "zebra open").unwrap();
+        open_global_search(&mut app, "zebra");
+
+        let mut term = Terminal::new(TestBackend::new(80, 24)).expect("test terminal");
+        term.draw(|f| crate::ui::render(f, &mut app)).expect("draw");
+        let buf = term.backend().buffer().clone();
+
+        // Per rendered row: the text of the runs of DarkGray-fg cells vs. the
+        // rest (whitespace cells keep their symbol so phrases survive).
+        let mut dim_rows: Vec<String> = Vec::new();
+        let mut plain_rows: Vec<String> = Vec::new();
+        for y in 0..buf.area.height {
+            let mut dim = String::new();
+            let mut plain = String::new();
+            for x in 0..buf.area.width {
+                let cell = &buf[(x, y)];
+                if cell.style().fg == Some(Color::DarkGray) {
+                    dim.push_str(cell.symbol());
+                } else {
+                    plain.push_str(cell.symbol());
+                }
+            }
+            dim_rows.push(dim);
+            plain_rows.push(plain);
+        }
+        // "zebra open" rows stay bright, "zebra archived" is dimmed.
+        assert!(plain_rows.iter().any(|r| r.contains("zebra open")),
+            "the open hit must be bright: {plain_rows:?}");
+        assert!(dim_rows.iter().any(|r| r.contains("zebra archived")),
+            "the hidden hit must be dim: {dim_rows:?}");
+        assert!(!plain_rows.iter().any(|r| r.contains("zebra archived")));
+    }
+
+    #[test]
+    fn the_global_search_overlay_renders_without_panics() {
+        let mut app = mk_app();
+        repo::create_project(&app.conn, "wide 日本 zebra").unwrap();
+        repo::create_project(&app.conn, "zebra two").unwrap();
+        open_global_search(&mut app, "zebra");
+        draw(&mut app, 80, 24);
+        app.handle_key(key(KeyCode::Char('j'))).unwrap();
+        draw(&mut app, 80, 24);
+
+        // An archived hit is rendered grayed out and still does not panic.
+        let p = repo::create_project(&app.conn, "zebra archived").unwrap();
+        repo::toggle_archive_project(&app.conn, &p.id).unwrap();
+        open_global_search(&mut app, "zebra");
+        draw(&mut app, 80, 24);
+        app.handle_key(key(KeyCode::Char('j'))).unwrap();
+        draw(&mut app, 40, 10);
     }
 }

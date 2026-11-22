@@ -109,6 +109,7 @@ ProjectList  ──Enter──▶  ProjectDetail
 |---|---|
 | `i` | Open **Quick Capture** (add todo to Inbox) |
 | `?` | Open **Key Help** overlay |
+| `F` | Open **Global Search** (projects, todos, updates, descriptions) |
 
 ---
 

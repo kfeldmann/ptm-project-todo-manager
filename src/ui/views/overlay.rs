@@ -7,6 +7,7 @@ use ratatui::{
 };
 
 use crate::app::{App, Overlay};
+use crate::data::repo::SearchHit;
 use crate::input::InputState;
 use crate::ui::theme::Theme;
 
@@ -45,6 +46,9 @@ pub fn render_overlay(frame: &mut Frame, area: Rect, app: &App) {
         }
         Some(Overlay::Warn { title, body }) => {
             render_warn(frame, area, title, body);
+        }
+        Some(Overlay::GlobalSearch { query, hits, cursor }) => {
+            render_global_search(frame, area, app, query, hits, *cursor);
         }
         None => {}
     }
@@ -457,8 +461,15 @@ fn key_help_lines(desc_width: usize) -> Vec<Line<'static>> {
     }
 
     section!(" GLOBAL");
+    row!("F",       "Global full-text search");
     row!("i",       "Quick capture todo → Inbox");
     row!("?",       "Show this help");
+    out.push(Line::raw(""));
+    section!(" GLOBAL SEARCH OVERLAY");
+    row!("Type",    "Search (single substring, case-insensitive)");
+    row!("j / k",   "Move through the results (↑ / ↓ too)");
+    row!("Enter",   "On a result: jump to the item — on the query box: first result");
+    row!("ESC",     "Close");
     out.push(Line::raw(""));
     section!(" INLINE EDITING (where active)");
     row!("← / →",    "Move cursor");
@@ -943,6 +954,130 @@ fn render_warn(frame: &mut Frame, area: Rect, title: &str, body: &str) {
 
     let content = Paragraph::new(paragraph_lines).wrap(Wrap { trim: false });
     frame.render_widget(content, inner);
+}
+
+// ─── Global Search ────────────────────────────────────────────────────────────
+
+/// The row text of one [`SearchHit`]: projects and todos show their whole
+/// title; updates and descriptions show the first non-empty raw line of the
+/// body (heading kept) — the update **label** is neither searched nor shown.
+fn search_hit_text(hit: &SearchHit) -> &str {
+    match hit {
+        SearchHit::Project { title, .. }    => title,
+        SearchHit::Todo    { title, .. }    => title,
+        SearchHit::Update  { first_line, .. } => first_line,
+        SearchHit::Desc    { first_line, .. } => first_line,
+    }
+}
+
+/// The two-column type prefix of one [`SearchHit`].
+fn search_hit_prefix(hit: &SearchHit) -> &'static str {
+    match hit {
+        SearchHit::Project { .. } => "p|",
+        SearchHit::Todo    { .. } => "t|",
+        SearchHit::Update  { .. } => "u|",
+        SearchHit::Desc    { .. } => "d|",
+    }
+}
+
+/// The global full-text search overlay: a query line, the results streamed in
+/// one line per item, and a hint bar.
+///
+/// Grayed-outness is evaluated **here, at render time, from the live `App`
+/// toggles** — never from state stored in the hit — because toggles can change
+/// between the query and `Enter`.
+fn render_global_search(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    query: &str,
+    hits: &[SearchHit],
+    cursor: usize,
+) {
+    let theme = Theme::default();
+    let dim = Style::default().fg(Color::DarkGray);
+
+    // At most 15 result rows; the list paginates beyond that.  The popup has
+    // 2 border rows plus the query line and the hint bar around the list.
+    let visible = hits.len().min(15).max(1) as u16;
+    let height  = (visible + 4).min(area.height.saturating_sub(2));
+    let width   = 74u16.min(area.width.saturating_sub(4));
+    let popup   = centered_rect(width, height, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.overlay_border_fg))
+        .title(" Search ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let inner_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // query input
+            Constraint::Min(1),    // results
+            Constraint::Length(1), // hint bar
+        ])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw("Search: "),
+            Span::styled(format!("{query}_"), Style::default().fg(Color::Reset)),
+        ])),
+        inner_chunks[0],
+    );
+
+    // Rows of "  p|text"; the text budget is the indent (2) plus the prefix
+    // (2) fewer than the inner width, and truncation counts **display
+    // columns** — CJK/emoji occupy two.
+    let text_width = inner.width.saturating_sub(4) as usize;
+    let heights = vec![1usize; hits.len()];
+    let list_height = inner_chunks[1].height as usize;
+    let selected = if cursor < hits.len() { Some(cursor) } else { None };
+    let (start, end, rows_used) =
+        super::list_window(&heights, list_height, selected);
+
+    let items: Vec<ListItem> = hits[start..end]
+        .iter()
+        .map(|hit| {
+            let hidden = app.search_hit_is_hidden(hit);
+            let base = if hidden { dim } else { Style::default().fg(Color::Reset) };
+            let text = crate::ui::text::ellipsize(search_hit_text(hit), text_width);
+            ListItem::new(Line::from(vec![
+                Span::styled("  ", base),
+                Span::styled(search_hit_prefix(hit), base),
+                Span::styled(text, base),
+            ]))
+        })
+        .collect();
+
+    // The highlight index is relative to the rendered window.
+    let highlight = selected.filter(|c| *c >= start && *c < end).map(|c| c - start);
+    let mut list_state = ListState::default();
+    list_state.select(highlight);
+
+    let list = List::new(items)
+        .highlight_style(Style::default()
+            .bg(theme.highlight_bg)
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD));
+    let list_area = Rect::new(
+        inner_chunks[1].x, inner_chunks[1].y,
+        inner_chunks[1].width, rows_used as u16,
+    );
+    frame.render_stateful_widget(list, list_area, &mut list_state);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                "  Type:search  j/k:move  Enter:open  ESC:cancel",
+                Style::default().fg(theme.hint_fg),
+            ),
+        ])),
+        inner_chunks[2],
+    );
 }
 
 #[cfg(test)]
