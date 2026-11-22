@@ -60,6 +60,12 @@ Nothing is tied to this machine or to a particular container:
   only for `s3-roundtrip.py`) and `target/` (via `cargo build`).
 - **No network.** Everything is local; `s3-roundtrip.py` talks to a fake
   endpoint on `127.0.0.1`.
+- **The pty is the child's controlling terminal** (in the pty harnesses —
+  `update-viewer.py`, `global-search.py`): the child runs `setsid` +
+  `TIOCSCTTY` so `/dev/tty` resolves to the harness's own pty.  Without this,
+  crossterm's `terminal::size()` — which ratatui's auto-resize queries —
+  reports the size of whatever terminal invoked the harness, and the TUI
+  renders at that size instead of the pty's declared 100×30.
 
 Requirements: `python3` with the stdlib `sqlite3` module, plus `rustc` for
 `panics.py` (it compiles a small snippet to test the byte-slicing behaviour
@@ -84,6 +90,7 @@ the `/etc/hosts` entry, which is host state — `s3-roundtrip.py` will print
 | `search-highlight.py` | 17 | `split_span` index drift under case-folding; phrase queries (`/We the people`); cycling the current match through several matches on one line |
 | `width-display.py` | 16 | wrapping/padding/hint height measured in chars instead of columns |
 | `query-count.py` | 10, 11 | statement counts for `list_projects` / `list_todos_global` (N+1), and `rename_tag` swallowing a failed collision probe |
+| `global-search.py` | — (feature, not a finding) | drives the real TUI in a pty: the `F` overlay's four sources and prefixes, `mtime` ordering, per-keystroke streaming, fresh state, no-label search, update-viewer deep-link, grayed-out `Warn` path |
 | `s3-roundtrip.py` | 2, 3, 1c (partial) | true `--end`/`--start` round trip (needs the hosts entry below) |
 
 ## What the round trip does and does not show

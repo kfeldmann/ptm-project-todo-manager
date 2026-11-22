@@ -21,6 +21,7 @@
    - [Spell Check](#85-spell-check)
    - [Key Help](#86-key-help)
    - [Confirm Delete](#87-confirm-delete)
+   - [Global Search](#88-global-search)
 9. [Tags](#9-tags)
 10. [Todo Statuses](#10-todo-statuses)
 11. [Reminders](#11-reminders)
@@ -665,6 +666,64 @@ Displays a scrollable reference of all keybindings.
 |---|---|
 | `y`, `Y`, or `Enter` | Confirm and permanently delete |
 | `n`, `N`, or `ESC` | Cancel, nothing is deleted |
+
+---
+
+### 8.8 Global Search
+
+**Trigger:** `F` (Shift+f) from any screen (outside overlays and inline-edit modes).
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ Search: refactor_                                        │
+├──────────────────────────────────────────────────────────┤
+│   u|Today we put a lot of time into the project...       │
+│   p|Nimbus refactoring                                   │
+│   t|Do we need to refactor after the recent additions?   │
+│   d|# Project Nimbus...                                  │
+│                                                          │
+│   Type:search  j/k:move  Enter:open  ESC:cancel          │
+└──────────────────────────────────────────────────────────┘
+```
+
+Results stream in as you type, one line per item, newest first, capped at 100.
+Each row is prefixed with the item's type:
+
+| Prefix | Source | Shown text |
+|---|---|---|
+| `p|` | Project title | Whole title |
+| `t|` | Todo title (Inbox todos included) | Whole title |
+| `u|` | Update body | First non-empty line of the body (the update's label is not searched and not shown) |
+| `d|` | Project description | First non-empty line of the body (headings kept as-is) |
+
+| Key | Action |
+|---|---|
+| Type characters | Extend the query; results re-run for every keystroke |
+| `Backspace` | Delete the last character |
+| `j` / `↓` | Move the cursor down (from the query box onto the results) |
+| `k` / `↑` | Move the cursor up |
+| `Enter` (on the query box) | Focus the first result (no-op when there are no matches) |
+| `Enter` (on a result) | Close the search and jump to the item |
+| `ESC` | Close the search — the underlying screen is unchanged |
+
+**Behavior:**
+
+- Every `F` press opens a **fresh** search: the query, results and cursor are
+  empty; nothing carries over from a previous session.
+- The query is matched as a **single substring, case-insensitively** (this
+  folds for non-ASCII too, e.g. `Ä` matches `ä`). The whole query is one
+  substring — multi-word queries are not split into words, so `refactor
+  nimbus` only finds text containing that exact string.
+- Archived projects and archived / done / canceled todos are **included** in
+  the results. If the destination view would currently hide the item (its `A`
+  or `C` toggle is off), the row is grayed out and pressing `Enter` on it
+  shows a warning naming the screen and the toggle to flip, instead of
+  jumping. Fix the toggle first, then search again.
+- Deep-link destinations: a project opens Project Detail; a todo opens
+  Project Detail on the Todos tab (an Inbox todo opens the Global Todo List
+  with the cursor on it); an update opens Project Detail with that update
+  open in the update viewer; a description opens Project Detail on the
+  Description tab.
 
 ---
 

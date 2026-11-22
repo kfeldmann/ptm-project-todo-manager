@@ -27,6 +27,7 @@ HARNESSES = [
     ("search-highlight.py", "finding 17"),
     ("width-display.py", "finding 16 (width-aware wrapping, padding, hint height)"),
     ("query-count.py", "findings 10, 11 (statement counts + swallowed SQL errors)"),
+    ("global-search.py", "the `F` global search: sources, ordering, deep-link, grayed-out warn"),
     ("s3-roundtrip.py", "end-to-end S3 (skips without /etc/hosts)"),
 ]
 

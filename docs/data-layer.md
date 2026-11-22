@@ -39,6 +39,41 @@ The shapes to copy:
 `dev-harness/query-count.py` counts statements with SQLite's
 `SQLITE_TRACE_STMT`; the `repo` tests pin the counts at 1 vs 30 rows.
 
+`global_search` (the `F` overlay's backend, re-run on every keystroke) follows
+the same rule and is pinned the same way — see the section below.
+
+## Global search (`repo::global_search`)
+
+One public function returns `Vec<SearchHit>` — projects (title), todos (title,
+Inbox included), updates (body; the label is neither searched nor displayed)
+and descriptions. The overlay owns no SQL, per the rule at the top of this
+file.
+
+- **Exactly four statements, regardless of row count.** One `SELECT` per
+  source, each pre-sorted and `LIMIT`ed to `GLOBAL_SEARCH_CAP`. The four lists
+  are merged in Rust, re-sorted by `mtime DESC` and trimmed to the cap. That
+  merge is exact, not an approximation: the top-N *overall* under one sort key
+  is always contained in the top-N of *each* source under the same key.
+  `global_search_statement_count_is_independent_of_row_count` pins it the same
+  way `query-count.py` pins the list queries.
+- **Matching happens in Rust, not SQL.** `LIKE` does not case-fold for
+  non-ASCII — the same trap that makes `list_projects` filter in Rust — so
+  each statement selects the raw text and the match is applied on
+  `to_lowercase()` copies of the text and the query.
+- **The `mtime` normalization lives in one constant.** The `updates` table's
+  `updated_at` is `NOT NULL DEFAULT ''` (legacy rows), which would sort after
+  everything in `DESC` order. `MTIME_COL` —
+  `COALESCE(NULLIF(updated_at, ''), created_at)` — is inlined into all four
+  statements, both for the `ORDER BY` and the selected `mtime` value. Do not
+  add a second definition, for the same reason as `SOONEST_REMINDER_COL`
+  above. Note the constant deliberately carries **no aggregate wrapper**: an
+  `ORDER BY MAX(COALESCE(…))` would make SQLite treat the table as one group
+  and collapse every query to a single row.
+- **Display text is extracted here, not in the renderer.** Updates and
+  descriptions carry `first_line`: leading empty lines are skipped, then the
+  text up to the first `\n` — headings (`# …`) kept as-is. Truncation to
+  display width happens in the view layer.
+
 ## Errors are propagated, not defaulted away
 
 A fallible lookup whose failure is collapsed into a "not found" / "no

@@ -22,8 +22,9 @@ python3 dev-harness/check-all.py    # every end-to-end harness
 python3 dev-harness/check-all.py panics merge   # just these
 ```
 
-`dev-harness/check-all.py` exits with the number of failing harnesses. Each
-harness maps to findings from `planning-docs/code-reviews/`; see
+`dev-harness/check-all.py` exits with the number of failing harnesses. Most
+harnesses map to findings from `planning-docs/code-reviews/`; a few cover
+later features (`global-search.py` exercises the `F` global search). See
 `dev-harness/README.md`. `query-count.py` in particular counts SQL statements
 via `SQLITE_TRACE_STMT` and pins the list-query contract (see
 [data-layer.md](data-layer.md)).

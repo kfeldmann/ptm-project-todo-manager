@@ -1,6 +1,6 @@
 # Global Full-Text Search — Plan
 
-Status: approved design, session 1 and 2 implemented, session 3 is next
+Status: approved design and implemented
 Milestone owner: ptm
 Feature hotkey: `F` (Shift+f), available on all three screens
 
@@ -198,7 +198,7 @@ Per `docs/adding-features.md`:
 - Acceptance: manual smoke test of every row of the deep-link and gray-out
   tables; fresh state on every `F`; `Esc` from every state.
 
-### ☐ Session 3 — docs and harness (≈ quarter day)
+### ✔ Session 3 — docs and harness (≈ quarter day)
 
 - `USER_MANUAL.md` section; note the single-substring semantics.
 - `docs/data-layer.md`: one paragraph on `global_search` (four statements,

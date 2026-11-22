@@ -59,9 +59,22 @@ class Tui:
     def __init__(self, argv, env, cols=100, rows=30):
         self.master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+
+        def controlling_tty():
+            """Child-side setup: make the pty the controlling terminal.
+
+            Without this, `/dev/tty` in the child resolves to the *harness
+            process's* terminal.  crossterm's `terminal::size()` — which
+            ratatui's auto-resize uses — opens `/dev/tty` and runs
+            `TIOCGWINSZ` on it, so the child would render at whatever size
+            the invoking terminal happens to be instead of this pty's.
+            """
+            os.setsid()  # detach from the harness's session; become session leader
+            fcntl.ioctl(slave, termios.TIOCSCTTY, 0)  # claim the pty as our tty
+
         self.proc = subprocess.Popen(
             [str(a) for a in argv], stdin=slave, stdout=slave, stderr=slave,
-            env=env, close_fds=True,
+            env=env, close_fds=True, preexec_fn=controlling_tty,
         )
         os.close(slave)
         self.buf = ""
