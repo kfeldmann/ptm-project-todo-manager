@@ -467,7 +467,8 @@ fn key_help_lines(desc_width: usize) -> Vec<Line<'static>> {
     out.push(Line::raw(""));
     section!(" GLOBAL SEARCH OVERLAY");
     row!("Type",    "Search (single substring, case-insensitive)");
-    row!("j / k",   "Move through the results (↑ / ↓ too)");
+    row!("↓ / ↑",  "Move between the query box and the results");
+    row!("j / k",  "Move through the results (once focus is off the query box; while typing they are ordinary characters)");
     row!("Enter",   "On a result: jump to the item — on the query box: first result");
     row!("ESC",     "Close");
     out.push(Line::raw(""));
@@ -1072,7 +1073,7 @@ fn render_global_search(
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
-                "  Type:search  j/k:move  Enter:open  ESC:cancel",
+                "  Type:search  ↓:results  j/k:move  Enter:open  ESC:cancel",
                 Style::default().fg(theme.hint_fg),
             ),
         ])),

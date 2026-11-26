@@ -2429,13 +2429,15 @@ impl App {
 
     /// Handler for [`Overlay::GlobalSearch`].
     ///
-    /// Chars append to the query and re-run the search; `j`/`k`/↑/↓ move the
-    /// cursor between the query box and the result list; `Esc` closes.
-    /// `Enter` on the query box focuses the first result (no-op when there
-    /// are none); `Enter` on a result closes the overlay and deep-links to
-    /// the item — or opens a [`Overlay::Warn`] when the destination view is
-    /// currently hiding it, with the message computed at press time from the
-    /// *live* toggles.
+    /// While the focus rests on the query box, chars append to the query and
+    /// re-run the search — including `j` and `k`, which are ordinary text
+    /// there; `↓`/`↑` move the focus between the query box and the result
+    /// list, and `Esc` closes.  `Enter` on the query box focuses the first
+    /// result (no-op when there are none).  Once the focus is on the result
+    /// list, `j`/`k`/↑/↓ move the cursor between hits.  `Enter` on a result
+    /// closes the overlay and deep-links to the item — or opens a
+    /// [`Overlay::Warn`] when the destination view is currently hiding it,
+    /// with the message computed at press time from the *live* toggles.
     fn handle_global_search(
         &mut self,
         key: KeyEvent,
@@ -2445,17 +2447,32 @@ impl App {
     ) -> Result<Option<Overlay>> {
         match key.code {
             KeyCode::Esc => return Ok(None),
-            KeyCode::Char('j') | KeyCode::Down => {
+            KeyCode::Down => {
                 if cursor == GLOBAL_SEARCH_QUERY_FOCUS {
                     if !hits.is_empty() { cursor = 0; }
                 } else if !hits.is_empty() {
                     cursor = cursor.saturating_add(1).min(hits.len() - 1);
                 }
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            KeyCode::Up => {
                 if cursor == GLOBAL_SEARCH_QUERY_FOCUS {
                     // The query box is the top of the list; nothing above it.
                 } else if cursor == 0 {
+                    cursor = GLOBAL_SEARCH_QUERY_FOCUS;
+                } else {
+                    cursor -= 1;
+                }
+            }
+            // `j`/`k` navigate only once the focus has left the query box;
+            // while text entry is active they are ordinary characters (the
+            // guard makes them fall through to the generic `Char` arm below).
+            KeyCode::Char('j') if cursor != GLOBAL_SEARCH_QUERY_FOCUS => {
+                if !hits.is_empty() {
+                    cursor = cursor.saturating_add(1).min(hits.len() - 1);
+                }
+            }
+            KeyCode::Char('k') if cursor != GLOBAL_SEARCH_QUERY_FOCUS => {
+                if cursor == 0 {
                     cursor = GLOBAL_SEARCH_QUERY_FOCUS;
                 } else {
                     cursor -= 1;
@@ -3572,8 +3589,9 @@ mod tests {
         repo::create_project(&app.conn, "Zebra Two").unwrap();
         open_global_search(&mut app, "zebra");
 
-
-        app.handle_key(key(KeyCode::Char('j'))).unwrap();
+        // `↓` ends text entry and focuses the first result; from there
+        // `j`/`k` walk the result list.
+        app.handle_key(key(KeyCode::Down)).unwrap();
         assert_eq!(gs_cursor(&app), 0);
         app.handle_key(key(KeyCode::Char('j'))).unwrap();
         assert_eq!(gs_cursor(&app), 1);
@@ -3582,6 +3600,28 @@ mod tests {
         // `k` from the first result returns to the query box.
         app.handle_key(key(KeyCode::Char('k'))).unwrap();
         assert_eq!(gs_cursor(&app), GLOBAL_SEARCH_QUERY_FOCUS);
+    }
+
+    #[test]
+    fn j_and_k_are_typed_into_the_query_while_text_entry_is_active() {
+        // Regression: `j`/`k` used to be stolen as navigation keys in the
+        // query box, so they could never be typed into a search string.
+        let mut app = mk_app();
+        repo::create_project(&app.conn, "jk bridge").unwrap();
+        repo::create_project(&app.conn, "zebra").unwrap();
+
+        app.handle_key(key(KeyCode::Char('F'))).unwrap();
+        for c in "jk".chars() {
+            app.handle_key(key(KeyCode::Char(c))).unwrap();
+        }
+        match &app.overlay {
+            Some(Overlay::GlobalSearch { query, hits, cursor }) => {
+                assert_eq!(query, "jk");
+                assert_eq!(hits.len(), 1, "only `jk bridge` matches `jk`");
+                assert_eq!(*cursor, GLOBAL_SEARCH_QUERY_FOCUS);
+            }
+            other => panic!("expected the GlobalSearch overlay, got {other:?}"),
+        }
     }
 
     #[test]

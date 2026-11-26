@@ -682,7 +682,7 @@ Displays a scrollable reference of all keybindings.
 │   t|Do we need to refactor after the recent additions?   │
 │   d|# Project Nimbus...                                  │
 │                                                          │
-│   Type:search  j/k:move  Enter:open  ESC:cancel          │
+│   Type:search  ↓:results  j/k:move  Enter:open  ESC:cancel  │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -698,10 +698,10 @@ Each row is prefixed with the item's type:
 
 | Key | Action |
 |---|---|
-| Type characters | Extend the query; results re-run for every keystroke |
+| Type characters | Extend the query; results re-run for every keystroke. `j` and `k` are ordinary characters here |
 | `Backspace` | Delete the last character |
-| `j` / `↓` | Move the cursor down (from the query box onto the results) |
-| `k` / `↑` | Move the cursor up |
+| `↓` / `↑` | Move the cursor between the query box and the results |
+| `j` / `k` | Move through the results (navigation keys once focus has left the query box) |
 | `Enter` (on the query box) | Focus the first result (no-op when there are no matches) |
 | `Enter` (on a result) | Close the search and jump to the item |
 | `ESC` | Close the search — the underlying screen is unchanged |
